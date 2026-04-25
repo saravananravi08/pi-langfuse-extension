@@ -4,13 +4,7 @@
   "description": "Langfuse observability extension for Pi coding agent - tracks tokens, cost, model, and tool calls",
   "type": "module",
   "main": "index.ts",
-  "keywords": [
-    "pi-package",
-    "langfuse",
-    "observability",
-    "tracing",
-    "monitoring"
-  ],
+  "keywords": "[\"pi-package\",\"langfuse\",\"observability\",\"tracing\",\"monitoring\",\"pi-coding-agent\",\"extension\"]",
   "pi": {
     "extensions": [
       "./index.ts"
