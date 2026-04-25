@@ -1,47 +1,26 @@
 # @ravan08/pi-langfuse
 
-Observability extension for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) that sends traces to [Langfuse](https://langfuse.com) for monitoring tokens, costs, latency, and tool calls.
+Langfuse observability extension for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent). Sends traces to [Langfuse](https://langfuse.com) for monitoring tokens, costs, latency, and tool calls.
 
-## Installation
+## Quick Install
 
+### Via npm (recommended)
 ```bash
 pi install npm:@ravan08/pi-langfuse
 ```
 
-Or from git:
+### Via git
 ```bash
 pi install git:github.com/saravananravi08/pi-langfuse-extension
 ```
 
-## Features
+## Setup
 
-- **Trace Creation**: Captures user prompts and assistant responses
-- **Session Tracking**: Groups traces by pi session
-- **Model Info**: Records model name and provider (e.g., MiniMax-M2.7, anthropic)
-- **Token Usage**: Tracks input/output tokens
-- **Cost Tracking**: Records API costs (input, output, total)
-- **Tool Call Spans**: Records tool calls with input/output
-- **Langfuse Sessions**: Groups traces by conversation session
+### 1. Configure API Keys
 
-## Installation
+Get your keys from [Langfuse Cloud](https://cloud.langfuse.com) → Settings → API Keys.
 
-### 1. Install npm dependencies
-
-```bash
-cd ~/.pi/agent/extensions/langfuse
-npm install
-```
-
-### 2. Configure API keys
-
-Copy the example config and add your keys:
-
-```bash
-cp config.example.json config.json
-# Then edit config.json with your keys
-```
-
-Edit `config.json` with your Langfuse keys:
+Create `config.json` in the extension directory:
 
 ```json
 {
@@ -51,87 +30,112 @@ Edit `config.json` with your Langfuse keys:
 }
 ```
 
-Get your API keys from [Langfuse Cloud](https://cloud.langfuse.com) → Settings → API Keys.
-
-### 3. Run pi with the extension
-
+For npm install, find the extension at:
 ```bash
-pi -e ~/.pi/agent/extensions/langfuse/index.ts "your prompt"
+~/.pi/agent/npm/@ravan08/pi-langfuse/index.ts
 ```
 
-Or for auto-loading (no `-e` flag needed):
+### 2. Run pi
+
+After installation, pi auto-loads the extension. Just run:
 
 ```bash
-cp ~/.pi/agent/extensions/langfuse/index.ts ~/.pi/agent/extensions/langfuse-auto.ts
 pi "your prompt"
 ```
+
+Or use `-e` for specific session:
+```bash
+pi -e npm:@ravan08/pi-langfuse "your prompt"
+```
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Trace Input/Output** | Captures user prompts and assistant responses |
+| **Session Tracking** | Groups traces by pi session ID |
+| **Model Info** | Records model name (e.g., "MiniMax-M2.7") and provider |
+| **Token Usage** | Tracks input/output tokens per generation |
+| **Cost Tracking** | Records API costs (input, output, total in USD) |
+| **Tool Call Spans** | Records tool calls with parameters and results |
+| **Langfuse Sessions** | Traces grouped by conversation session |
 
 ## What Gets Tracked
 
 ### Trace Level
-| Field | Description |
-|-------|-------------|
-| `input` | User prompt |
-| `output` | Assistant response |
-| `sessionId` | Pi session identifier |
-| `metadata.model` | Model name (e.g., "MiniMax-M2.7") |
-| `metadata.provider` | API provider (e.g., "minimax") |
-| `metadata.cwd` | Working directory |
+- `input` - User prompt
+- `output` - Assistant response
+- `sessionId` - Pi session identifier
+- `metadata` - Model, provider, cwd
 
 ### Generation Observations (LLM Calls)
-| Field | Description |
-|-------|-------------|
-| `model` | Model identifier |
-| `usage` | Token counts (input/output/total) |
-| `costDetails` | Cost breakdown (input/output/total in USD) |
+- `model` - Model identifier
+- `usage` - Token counts (input/output/total)
+- `costDetails` - Cost breakdown in USD
 
 ### Span Observations (Tool Calls)
-| Field | Description |
-|-------|-------------|
-| `name` | Tool name (e.g., "tool:bash") |
-| `input` | Tool parameters |
-| `output` | Tool result |
-| `metadata.isError` | Whether tool execution failed |
+- `name` - Tool name (e.g., "tool:bash")
+- `input` - Tool parameters (JSON)
+- `output` - Tool result
+- `metadata.isError` - Whether tool failed
 
 ## Langfuse Dashboard
 
-After running with the extension, you'll see:
+After running, check your Langfuse project for:
 
-1. **Traces**: All pi agent runs
-2. **Sessions**: Grouped by pi session ID
-3. **Observations**: Tool calls and LLM generations
-4. **Scores**: Token counts and costs
-5. **Model Usage**: Usage breakdown by model
+1. **Traces** - All pi agent runs with I/O
+2. **Sessions** - Traces grouped by session ID
+3. **Observations** - Tool calls and LLM generations
+4. **Scores** - Token counts and costs
+5. **Model Usage** - Usage breakdown by model
 
-## Repository Structure
+## Manual Installation (from source)
+
+```bash
+# Clone repo
+git clone https://github.com/saravananravi08/pi-langfuse-extension.git
+cd pi-langfuse-extension
+
+# Install dependencies
+npm install
+
+# Configure
+cp config.example.json config.json
+# Edit config.json with your Langfuse API keys
+
+# Run with extension
+pi -e ./index.ts "your prompt"
+```
+
+## File Structure
 
 ```
 pi-langfuse-extension/
-├── index.ts          # Main extension code
-├── package.json       # Dependencies (langfuse npm package)
-├── config.json        # API keys (create this)
-└── node_modules/      # Installed dependencies
+├── index.ts              # Extension code
+├── package.json          # Dependencies
+├── config.example.json   # API key template
+└── README.md             # This file
 ```
-
-## Troubleshooting
-
-### Extension not loading?
-- Make sure `node_modules` exists (run `npm install`)
-- Check `config.json` has valid API keys
-- Verify Langfuse project is active
-
-### No traces appearing?
-- Check Langfuse dashboard for the correct project
-- Verify API keys have write permissions
-
-### Model/cost not showing?
-- Ensure you're using a model that provides usage/cost info
-- Check Langfuse traces API for observation details
 
 ## Dependencies
 
 - [langfuse](https://www.npmjs.com/package/langfuse) - Langfuse SDK
-- [pi-coding-agent](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) - Pi extension API
+- [@mariozechner/pi-coding-agent](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) - Pi extension API
+
+## Troubleshooting
+
+**No traces appearing?**
+- Verify API keys are correct in `config.json`
+- Check Langfuse project is active
+- Ensure API keys have write permissions
+
+**Extension not loading?**
+- Run `pi list` to check installed packages
+- Try `pi reload` to refresh
+
+**Model/cost not showing?**
+- Not all providers expose cost info
+- Check Langfuse traces API for raw observation data
 
 ## License
 
