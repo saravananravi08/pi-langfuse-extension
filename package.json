@@ -14,7 +14,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/saravananravi08/pi-langfuse-extension/main/screenshot.png"
   },
   "dependencies": {
     "langfuse": "^3.0.0"
