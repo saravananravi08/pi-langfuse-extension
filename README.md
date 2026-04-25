@@ -1,6 +1,17 @@
-# Pi Langfuse Extension
+# @ravan08/pi-langfuse
 
 Observability extension for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) that sends traces to [Langfuse](https://langfuse.com) for monitoring tokens, costs, latency, and tool calls.
+
+## Installation
+
+```bash
+pi install npm:@ravan08/pi-langfuse
+```
+
+Or from git:
+```bash
+pi install git:github.com/saravananravi08/pi-langfuse-extension
+```
 
 ## Features
 
