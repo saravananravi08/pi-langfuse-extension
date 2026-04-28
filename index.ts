@@ -3,6 +3,14 @@
  * 
  * Sends traces to Langfuse for monitoring tokens, costs, latency, and tool calls.
  * Uses dynamic import to load the langfuse SDK properly.
+ * 
+ * Scores tracked:
+ * - tool_call_count: Total number of tool calls
+ * - turn_count: Number of turns in the session
+ * - total_tool_errors: Number of tools that returned errors
+ * - tool_success_rate: Success rate of tool calls (0-1)
+ * - session_had_errors: Boolean indicating if any tool error occurred
+ * - tool_is_error: Per-tool score indicating if that specific tool call errored
  */
 
 import { readFileSync, existsSync } from "node:fs";
@@ -69,7 +77,7 @@ interface LangfuseClient {
   };
   span(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown }): LangfuseSpan;
   generation(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown; output?: unknown; usage?: unknown }): LangfuseGeneration;
-  score(body: { name: string; value: number; traceId?: string }): void;
+  score(body: { name: string; value: number; traceId?: string; observationId?: string }): void;
   shutdownAsync(): Promise<void>;
 }
 
@@ -99,12 +107,48 @@ interface TraceData {
   update?: (body?: { metadata?: Record<string, unknown>; output?: unknown; input?: unknown }) => void;
 }
 
+interface SpanData {
+  span: LangfuseSpan;
+  toolName: string;
+}
+
 let currentTrace: TraceData | null = null;
 let currentUserPrompt: string = "";
 let currentSessionId: string = "";
 let currentModel: string = "";
 let currentProvider: string = "";
-const activeSpans: Map<string, LangfuseSpan> = new Map();
+const activeSpans: Map<string, SpanData> = new Map();
+
+// Evaluation tracking state
+let toolCallCount: number = 0;
+let errorCount: number = 0;
+let turnCount: number = 0;
+
+function resetSessionState() {
+  toolCallCount = 0;
+  errorCount = 0;
+  turnCount = 0;
+  activeSpans.clear();
+  currentTrace = null;
+  currentUserPrompt = "";
+  currentModel = "";
+  currentProvider = "";
+}
+
+function computeEvaluationScores() {
+  const toolSuccessRate = toolCallCount > 0 
+    ? (toolCallCount - errorCount) / toolCallCount 
+    : 1;
+  const sessionHadErrors = errorCount > 0;
+  
+  return {
+    tool_call_count: toolCallCount,
+    turn_count: turnCount,
+    total_tool_errors: errorCount,
+    tool_success_rate: toolSuccessRate,
+    session_had_errors: sessionHadErrors ? 1 : 0, // 1 for true, 0 for false
+  };
+}
 
 // ============================================
 // Extension
@@ -126,6 +170,8 @@ export default async function (pi: ExtensionAPI) {
       const filename = sessionFile.split('/').pop() || '';
       currentSessionId = filename.replace('.jsonl', '');
     }
+    // Reset state for new session
+    resetSessionState();
   });
 
   // Capture model info on model select
@@ -185,31 +231,57 @@ export default async function (pi: ExtensionAPI) {
         if (output.length === 0) output = undefined;
       }
       
+      // Compute evaluation scores
+      const scores = computeEvaluationScores();
+      
       currentTrace.update({ 
         output: output || undefined,
         metadata: { 
           completed: true, 
-          totalTools: activeSpans.size,
+          totalTools: toolCallCount,
           model: currentModel,
-          provider: currentProvider
+          provider: currentProvider,
+          ...scores
         }
       });
+      
+      // Send evaluation scores to Langfuse
+      try {
+        const lf = await getClient();
+        
+        // Trace-level evaluation scores
+        lf.score({ name: "tool_call_count", value: scores.tool_call_count, traceId: currentTrace.id });
+        lf.score({ name: "turn_count", value: scores.turn_count, traceId: currentTrace.id });
+        lf.score({ name: "total_tool_errors", value: scores.total_tool_errors, traceId: currentTrace.id });
+        lf.score({ name: "tool_success_rate", value: scores.tool_success_rate, traceId: currentTrace.id });
+        lf.score({ name: "session_had_errors", value: scores.session_had_errors, traceId: currentTrace.id });
+        
+        console.log("📊 Langfuse: Evaluation scores sent:", scores);
+      } catch (e) {
+        console.warn("📊 Langfuse: Failed to send evaluation scores", e);
+      }
+      
       currentTrace = null;
     }
-    activeSpans.clear();
-    currentUserPrompt = "";
+    
+    // Reset for next session
+    resetSessionState();
+    
     if (client) {
       await client.shutdownAsync();
       client = null;
     }
   });
 
-  // Use tool_call instead of tool_execution_start - it has input
+  // Track tool calls and create spans
   pi.on("tool_call", async (event) => {
     if (!currentTrace) return;
 
     try {
       const lf = await getClient();
+      
+      // Increment tool call counter
+      toolCallCount++;
       
       // Format input nicely
       let inputStr = "";
@@ -226,15 +298,19 @@ export default async function (pi: ExtensionAPI) {
         input: inputStr,
         metadata: { tool: event.toolName }
       });
-      activeSpans.set(event.toolCallId, span);
+      
+      activeSpans.set(event.toolCallId, { span, toolName: event.toolName });
     } catch (e) {
       console.warn("📊 Langfuse: Failed to create span", e);
     }
   });
 
+  // Track tool results and errors
   pi.on("tool_result", async (event) => {
-    const span = activeSpans.get(event.toolCallId);
-    if (span) {
+    const spanData = activeSpans.get(event.toolCallId);
+    if (spanData) {
+      const { span, toolName } = spanData;
+      
       // Format output nicely
       let outputStr = "";
       if (event.content && event.content.length > 0) {
@@ -253,12 +329,33 @@ export default async function (pi: ExtensionAPI) {
         isError: event.isError,
         output: outputStr || undefined
       });
+      
+      // Track errors and send per-tool score
+      if (event.isError) {
+        errorCount++;
+        try {
+          const lf = await getClient();
+          // Per-tool error score (observation level)
+          lf.score({ 
+            name: "tool_is_error", 
+            value: 1, 
+            traceId: currentTrace?.id 
+          });
+        } catch (e) {
+          console.warn("📊 Langfuse: Failed to send tool error score", e);
+        }
+      }
+      
       activeSpans.delete(event.toolCallId);
     }
   });
 
+  // Track turns and generations
   pi.on("turn_end", async (event) => {
     if (!currentTrace) return;
+
+    // Increment turn counter
+    turnCount++;
 
     const eventData = event as unknown as {
       message?: {
@@ -284,7 +381,6 @@ export default async function (pi: ExtensionAPI) {
     const usage = message.usage;
     const modelId = message.model || currentModel;
     const provider = currentProvider;
-    // Cost is inside usage.cost, not message.cost
     const cost = usage?.cost;
 
     if (usage) {
@@ -301,6 +397,7 @@ export default async function (pi: ExtensionAPI) {
         }
         
         // Create generation for the LLM response with model info
+        // Note: usage and costDetails go in the generation observation, NOT as scores
         const gen = lf.generation({
           name: "llm-response",
           traceId: currentTrace.id,
@@ -331,22 +428,10 @@ export default async function (pi: ExtensionAPI) {
       } catch (e) {
         console.warn("📊 Langfuse: Failed to create generation", e);
       }
-
-      // Record token scores
-      if (usage.input) {
-        const lf = await getClient();
-        lf.score({ name: "input_tokens", value: usage.input, traceId: currentTrace.id });
-      }
-      if (usage.output) {
-        const lf = await getClient();
-        lf.score({ name: "output_tokens", value: usage.output, traceId: currentTrace.id });
-      }
       
-      // Record cost if available
-      if (cost?.total) {
-        const lf = await getClient();
-        lf.score({ name: "total_cost", value: cost.total, traceId: currentTrace.id });
-      }
+      // NOTE: We no longer send token counts or cost as scores
+      // Those belong in usage/costDetails on the generation observation
+      // Scores are for EVALUATION metrics (success rates, error counts, etc.)
     }
   });
 
@@ -361,5 +446,6 @@ export default async function (pi: ExtensionAPI) {
       await client.shutdownAsync();
       client = null;
     }
+    resetSessionState();
   });
 }
