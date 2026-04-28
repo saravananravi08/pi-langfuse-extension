@@ -1,6 +1,6 @@
 {
 	"name": "@ravan08/pi-langfuse",
-	"version": "1.0.3",
+	"version": "1.0.4",
 	"description": "Langfuse observability extension for Pi coding agent. Sends traces to Langfuse for monitoring tokens, costs, latency, and tool calls.",
 	"type": "module",
 	"main": "index.ts",
