@@ -144,6 +144,23 @@ interface TraceSnapshot {
   steps: TraceStep[];
 }
 
+interface AgentContentPart {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  arguments?: unknown;
+}
+
+interface ObservedAgentMessage {
+  role: string;
+  content?: AgentContentPart[];
+  toolCallId?: string;
+  toolName?: string;
+  isError?: boolean;
+  timestamp?: number | string;
+}
+
 let currentTrace: TraceData | null = null;
 let currentUserPrompt: string = "";
 let currentSessionId: string = "";
@@ -242,6 +259,62 @@ function firstLine(text: string): string {
   return text.split("\n").map(line => line.trim()).find(Boolean) || "Trace observed";
 }
 
+function messageTimestamp(value: number | string | undefined): string {
+  if (typeof value === "number") return new Date(value).toISOString();
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function contentText(content: AgentContentPart[] | undefined): string {
+  return (content || [])
+    .filter(part => part.type === "text" && part.text)
+    .map(part => part.text)
+    .join("\n");
+}
+
+function buildObservationSteps(messages: ObservedAgentMessage[], existingSteps: TraceStep[]): TraceStep[] {
+  const steps = new Map(existingSteps.map(step => [step.id, { ...step }]));
+
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      for (const part of message.content || []) {
+        if (part.type !== "toolCall" || !part.id || !part.name) continue;
+        const existing = steps.get(part.id);
+        steps.set(part.id, {
+          id: part.id,
+          type: "tool",
+          name: `tool:${part.name}`,
+          timestamp: existing?.timestamp || messageTimestamp(message.timestamp),
+          input: existing?.input ?? part.arguments,
+          output: existing?.output,
+          metadata: { ...(existing?.metadata || {}), tool: part.name, source: "agent_messages" },
+          isError: existing?.isError,
+        });
+      }
+      continue;
+    }
+
+    if (message.role !== "toolResult" || !message.toolCallId) continue;
+    const output = contentText(message.content);
+    const existing = steps.get(message.toolCallId);
+    steps.set(message.toolCallId, {
+      id: message.toolCallId,
+      type: "tool",
+      name: `tool:${message.toolName || existing?.name.replace(/^tool:/, "") || "unknown"}`,
+      timestamp: existing?.timestamp || messageTimestamp(message.timestamp),
+      input: existing?.input,
+      output: output || existing?.output,
+      metadata: { ...(existing?.metadata || {}), tool: message.toolName || existing?.metadata?.tool, source: "agent_messages" },
+      isError: message.isError ?? existing?.isError,
+    });
+  }
+
+  return [...steps.values()];
+}
+
 async function observerComplete(prompt: string): Promise<string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
@@ -298,10 +371,18 @@ function buildTraceTimeline(snapshot: TraceSnapshot) {
   lines.push("", "Steps:");
 
   for (const step of snapshot.steps) {
-    lines.push(`- ${step.timestamp} ${step.type} ${step.name}`);
+    if (step.type === "tool") {
+      const toolName = step.name.replace(/^tool:/, "");
+      lines.push(`- ${step.timestamp} Tool Call ${toolName}`);
+      if (step.input !== undefined) lines.push(`  args: ${clampText(step.input, 2000).replace(/\n/g, "\n  ")}`);
+      if (step.output !== undefined) lines.push(`  Tool Result ${toolName}: ${clampText(step.output, 8000).replace(/\n/g, "\n  ")}`);
+      if (step.isError !== undefined) lines.push(`  isError: ${step.isError}`);
+      continue;
+    }
+
+    lines.push(`- ${step.timestamp} Assistant Generation ${step.name}`);
     if (step.input !== undefined) lines.push(`  input: ${clampText(step.input, 1200).replace(/\n/g, "\n  ")}`);
-    if (step.output !== undefined) lines.push(`  output: ${clampText(step.output, 1600).replace(/\n/g, "\n  ")}`);
-    if (step.isError !== undefined) lines.push(`  isError: ${step.isError}`);
+    if (step.output !== undefined) lines.push(`  output: ${clampText(step.output, 2000).replace(/\n/g, "\n  ")}`);
   }
 
   return lines.join("\n");
@@ -325,6 +406,7 @@ Guidelines:
 - Be specific enough for a future coding agent to act on.
 - Add 1-8 observations for the trace.
 - Use terse dense language.
+- If the agent calls tools, observe what was called, why, and what was learned from the result.
 - Do not list every tool call; group repeated reads/searches/commands by purpose and outcome.
 - Preserve file paths, errors, commands, tests, and line numbers when useful.
 - Do not include suggestedResponse.
@@ -472,10 +554,7 @@ export default async function (pi: ExtensionAPI) {
     if (currentTrace) {
       // Get final response/output
       const eventData = event as unknown as {
-        messages?: Array<{
-          role: string;
-          content: Array<{ type: string; text?: string; thinking?: string }>;
-        }>;
+        messages?: ObservedAgentMessage[];
       };
       const messages = eventData.messages || [];
       const lastAssistant = messages.filter(m => m.role === "assistant").pop();
@@ -526,7 +605,7 @@ export default async function (pi: ExtensionAPI) {
         provider: currentProvider,
         userPrompt: currentUserPrompt,
         output,
-        steps: traceSteps.map(step => ({ ...step })),
+        steps: buildObservationSteps(messages, traceSteps),
       };
       void writeTraceMemoryObservation(memorySnapshot).catch(e => {
         console.warn("📊 Langfuse: Failed to generate trace memory observation", e);
