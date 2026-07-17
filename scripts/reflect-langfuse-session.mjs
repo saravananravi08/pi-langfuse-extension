@@ -3,6 +3,12 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
+import {
+  REFLECTION_PROMPT_VERSION as PROMPT_VERSION,
+  REFLECTION_SYSTEM_PROMPT,
+  REFLECTION_COMPRESSION_GUIDANCE,
+  REQUIRED_REFLECTION_HEADINGS,
+} from '../memory-prompts.js';
 
 const OBSERVATION_SCORE_NAME = 'memory_trace_observation';
 const REFLECTION_SCORE_NAME = 'memory_session_reflection';
@@ -198,33 +204,68 @@ function observerEndpoint() {
   return base.endsWith('/v1') ? `${base}/messages` : `${base}/v1/messages`;
 }
 
-async function complete(prompt) {
+async function complete(system, user) {
   const headers = { Authorization: `Bearer ${observerApiKey}`, 'Content-Type': 'application/json' };
   if (observerApi === 'anthropic') headers['anthropic-version'] = '2023-06-01';
   const body = observerApi === 'openai'
-    ? { model: observerModel, temperature: 0.1, max_tokens: 6000, messages: [{ role: 'user', content: prompt }] }
-    : { model: observerModel, temperature: 0.1, max_tokens: 6000, stream: false, messages: [{ role: 'user', content: prompt }] };
-  const response = await fetch(observerEndpoint(), { method: 'POST', headers, body: JSON.stringify(body) });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Reflector model ${response.status}: ${raw.slice(0, 1000)}`);
-  const data = JSON.parse(raw);
-  const text = observerApi === 'openai'
-    ? data.choices?.[0]?.message?.content
-    : (data.content || []).filter(part => part.type === 'text' && part.text).map(part => part.text).join('\n');
-  if (!text?.trim()) throw new Error('Reflector model returned no text.');
-  return text.trim();
+    ? { model: observerModel, temperature: 0, max_tokens: 6000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }
+    : { model: observerModel, temperature: 0, max_tokens: 6000, stream: false, system, messages: [{ role: 'user', content: user }] };
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let response;
+    try {
+      response = await fetch(observerEndpoint(), { method: 'POST', headers, body: JSON.stringify(body) });
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        console.warn(`reflector connection failed; retrying (${attempt}/3)`);
+        await sleep(attempt * 1000);
+        continue;
+      }
+      break;
+    }
+    const raw = await response.text();
+    if (!response.ok) {
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      if (retryable && attempt < 3) {
+        console.warn(`reflector model ${response.status}; retrying (${attempt}/3)`);
+        await sleep(retryAfterMs(response, raw, attempt));
+        continue;
+      }
+      throw new Error(`Reflector model ${response.status}: ${raw.slice(0, 1000)}`);
+    }
+    const data = JSON.parse(raw);
+    const text = observerApi === 'openai'
+      ? data.choices?.[0]?.message?.content
+      : (data.content || []).filter(part => part.type === 'text' && part.text).map(part => part.text).join('\n');
+    if (!text?.trim()) throw new Error('Reflector model returned no text.');
+    return text.trim();
+  }
+  throw new Error('Reflector model connection failed after 3 attempts', { cause: lastError });
 }
+
+class MemoryOutputValidationError extends Error {}
 
 async function generateReflection(previous, scores, scope) {
   const previousFields = previous ? {
     reflectionMarkdown: metadataString(previous, 'reflectionMarkdown'),
     summary: metadataString(previous, 'summary'),
+    goal: metadataStrings(previous, 'goal'),
+    constraints: metadataStrings(previous, 'constraints'),
     currentTask: metadataString(previous, 'currentTask'),
+    taskStatus: metadataString(previous, 'taskStatus'),
+    completed: metadataStrings(previous, 'completed'),
+    inProgress: metadataStrings(previous, 'inProgress'),
+    openIssues: metadataStrings(previous, 'openIssues'),
+    decisions: metadataStrings(previous, 'decisions'),
+    nextSteps: metadataStrings(previous, 'nextSteps'),
+    criticalContext: metadataStrings(previous, 'criticalContext'),
+    filesRead: metadataStrings(previous, 'filesRead'),
+    filesModified: metadataStrings(previous, 'filesModified'),
+    filesCreated: metadataStrings(previous, 'filesCreated'),
+    filesDeleted: metadataStrings(previous, 'filesDeleted'),
     filesTouched: metadataStrings(previous, 'filesTouched'),
     toolsUsed: metadataStrings(previous, 'toolsUsed'),
-    decisions: metadataStrings(previous, 'decisions'),
-    completed: metadataStrings(previous, 'completed'),
-    openIssues: metadataStrings(previous, 'openIssues'),
   } : null;
   const observationFields = scores.map(score => ({
     scoreId: score.id,
@@ -232,50 +273,95 @@ async function generateReflection(previous, scores, scope) {
     generatedAt: generatedAt(score),
     observationsMarkdown: metadataString(score, 'observationsMarkdown'),
     summary: metadataString(score, 'summary'),
+    goal: metadataStrings(score, 'goal'),
+    constraints: metadataStrings(score, 'constraints'),
     currentTask: metadataString(score, 'currentTask'),
+    taskStatus: metadataString(score, 'taskStatus'),
+    completed: metadataStrings(score, 'completed'),
+    inProgress: metadataStrings(score, 'inProgress'),
+    openIssues: metadataStrings(score, 'openIssues'),
+    decisions: metadataStrings(score, 'decisions'),
+    nextSteps: metadataStrings(score, 'nextSteps'),
+    criticalContext: metadataStrings(score, 'criticalContext'),
+    filesRead: metadataStrings(score, 'filesRead'),
+    filesModified: metadataStrings(score, 'filesModified'),
+    filesCreated: metadataStrings(score, 'filesCreated'),
+    filesDeleted: metadataStrings(score, 'filesDeleted'),
     filesTouched: metadataStrings(score, 'filesTouched'),
     toolsUsed: metadataStrings(score, 'toolsUsed'),
-    decisions: metadataStrings(score, 'decisions'),
-    completed: metadataStrings(score, 'completed'),
-    openIssues: metadataStrings(score, 'openIssues'),
   }));
-  const prompt = `You are the reflector for an AI coding assistant's append-only observational memory.
+  const inputTokens = estimateTokens(`${metadataString(previous, 'reflectionMarkdown')}\n\n${scores.map(score => metadataString(score, 'observationsMarkdown')).join('\n\n')}`);
+  const targetTokens = Math.max(2_000, Math.min(8_000, Math.floor(inputTokens * 0.5)));
+  const user = `Consolidate the delimited memory into one updated coding checkpoint.
 
-Consolidate the previous reflection and new observations into dense, accurate session memory. This may become the ONLY context retained from the covered work.
+<previous-reflection>
+${JSON.stringify(previousFields, null, 2)}
+</previous-reflection>
 
-Rules:
-- Preserve exact user goals, current status, file paths, commands, errors, ports, URLs, IDs, tests, and decisions when useful.
-- Carry forward unresolved work and still-valid facts.
-- Remove duplicate or superseded details.
-- Move clearly resolved open issues into completed outcomes.
-- Keep filesTouched and toolsUsed comprehensive and deduplicated.
-- Do not invent completion or resolution.
-- Keep reflectionMarkdown concise but actionable and chronological where timing matters.
+<new-observations>
+${JSON.stringify(observationFields, null, 2)}
+</new-observations>
 
 Return ONLY valid JSON:
 {
-  "reflectionMarkdown": "dense human-readable session memory",
+  "reflectionMarkdown": "Pi checkpoint using the required headings",
   "summary": "short session summary",
+  "goal": ["current user goal"],
+  "constraints": ["requirement or preference"],
   "currentTask": "current unresolved task/status",
-  "filesTouched": ["path/or/file.ts"],
-  "toolsUsed": ["bash", "read"],
-  "decisions": ["decision/rationale"],
-  "completed": ["concrete completed outcome"],
-  "openIssues": ["still-open issue"]
+  "taskStatus": "active | waiting_for_user | blocked | complete",
+  "completed": ["verified completed outcome"],
+  "inProgress": ["unfinished work"],
+  "openIssues": ["remaining issue or blocker"],
+  "decisions": ["decision and rationale"],
+  "nextSteps": ["ordered next action"],
+  "criticalContext": ["detail required to continue"],
+  "filesRead": ["path inspected"],
+  "filesModified": ["path changed"],
+  "filesCreated": ["path created"],
+  "filesDeleted": ["path deleted"],
+  "toolsUsed": ["tool name"]
 }
 
-Previous reflection:
-${JSON.stringify(previousFields, null, 2)}
-
-New observations ordered by generatedAt:
-${JSON.stringify(observationFields, null, 2)}`;
-  const parsed = JSON.parse(extractJson(await complete(prompt)));
+Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
+  const compressionGuidance = REFLECTION_COMPRESSION_GUIDANCE;
+  let parsed;
+  let compressionAttempt = 0;
+  let lastError;
+  for (let attempt = 1; attempt <= compressionGuidance.length; attempt++) {
+    compressionAttempt = attempt;
+    try {
+      const text = await complete(REFLECTION_SYSTEM_PROMPT, `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1]}`);
+      if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError('Reflector output contains degenerate repetition');
+      let candidate;
+      try {
+        candidate = JSON.parse(extractJson(text));
+      } catch (error) {
+        throw new MemoryOutputValidationError(`Reflector returned invalid JSON: ${error instanceof Error ? error.message : error}`);
+      }
+      if (!String(candidate.reflectionMarkdown || '').trim() || !String(candidate.summary || '').trim()) {
+        throw new MemoryOutputValidationError('Reflector output missing reflectionMarkdown or summary');
+      }
+      const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !String(candidate.reflectionMarkdown).includes(heading));
+      if (missingHeading) throw new MemoryOutputValidationError(`Reflector output missing ${missingHeading}`);
+      const outputTokens = estimateTokens(candidate.reflectionMarkdown);
+      if (outputTokens > targetTokens) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
+      parsed = candidate;
+      break;
+    } catch (error) {
+      if (!(error instanceof MemoryOutputValidationError) && !(error instanceof SyntaxError)) throw error;
+      lastError = error;
+      if (attempt < compressionGuidance.length) console.warn(`reflection validation failed; retrying compression (${attempt}/${compressionGuidance.length})`);
+    }
+  }
+  if (!parsed) throw lastError;
   const generation = Number(previous?.metadata?.generation || 0) + 1;
   const sourceObservationScoreIds = scores.map(score => score.id);
   const sourceTraceIds = unique(scores.map(score => score.traceId || metadataString(score, 'traceId')));
   const generated = new Date().toISOString();
   const metadata = {
     version: VERSION,
+    promptVersion: PROMPT_VERSION,
     scope: 'session',
     source: 'pi-langfuse-memory',
     reflectorApi: observerApi,
@@ -284,14 +370,28 @@ ${JSON.stringify(observationFields, null, 2)}`;
     sessionId: scope.sessionId,
     cwd: scope.pathKey || null,
     pathKey: scope.pathKey || null,
-    reflectionMarkdown: clamp(String(parsed.reflectionMarkdown || ''), 24_000),
-    summary: clamp(String(parsed.summary || ''), 3_000),
-    currentTask: clamp(String(parsed.currentTask || ''), 2_000),
-    filesTouched: unique([...metadataStrings(previous, 'filesTouched'), ...observationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesTouched)]),
-    toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...observationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
-    decisions: arrayOfStrings(parsed.decisions),
+    reflectionMarkdown: String(parsed.reflectionMarkdown).trim(),
+    summary: String(parsed.summary).trim(),
+    goal: arrayOfStrings(parsed.goal),
+    constraints: arrayOfStrings(parsed.constraints),
+    currentTask: String(parsed.currentTask || '').trim(),
+    taskStatus: normalizeTaskStatus(parsed.taskStatus),
     completed: arrayOfStrings(parsed.completed),
+    inProgress: arrayOfStrings(parsed.inProgress),
     openIssues: arrayOfStrings(parsed.openIssues),
+    decisions: arrayOfStrings(parsed.decisions),
+    nextSteps: arrayOfStrings(parsed.nextSteps),
+    criticalContext: arrayOfStrings(parsed.criticalContext),
+    filesRead: unique([...metadataStrings(previous, 'filesRead'), ...observationFields.flatMap(item => item.filesRead), ...arrayOfStrings(parsed.filesRead)]),
+    filesModified: unique([...metadataStrings(previous, 'filesModified'), ...observationFields.flatMap(item => item.filesModified), ...arrayOfStrings(parsed.filesModified)]),
+    filesCreated: unique([...metadataStrings(previous, 'filesCreated'), ...observationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(parsed.filesCreated)]),
+    filesDeleted: unique([...metadataStrings(previous, 'filesDeleted'), ...observationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(parsed.filesDeleted)]),
+    filesTouched: unique([...metadataStrings(previous, 'filesTouched'), ...observationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
+    toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...observationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
+    inputTokensEstimated: inputTokens,
+    outputTokensEstimated: estimateTokens(parsed.reflectionMarkdown),
+    compressionRatio: Number((estimateTokens(parsed.reflectionMarkdown) / inputTokens).toFixed(3)),
+    compressionAttempt,
     sourceTraceIds,
     sourceObservationScoreIds,
     sourceReflectionScoreIds: previous ? [previous.id] : [],
@@ -327,6 +427,41 @@ function extractJson(text) {
   const end = text.lastIndexOf('}');
   if (start === -1 || end <= start) throw new Error(`No JSON object in reflector output: ${text.slice(0, 1000)}`);
   return text.slice(start, end + 1);
+}
+
+function normalizeTaskStatus(value) {
+  return ['active', 'waiting_for_user', 'blocked', 'complete'].includes(String(value)) ? String(value) : 'active';
+}
+
+function detectDegenerateRepetition(text) {
+  if (text.length < 2000) return false;
+  const windows = new Map();
+  const size = 200;
+  const step = Math.max(1, Math.floor(text.length / 50));
+  let duplicates = 0;
+  let total = 0;
+  for (let i = 0; i + size <= text.length; i += step) {
+    const window = text.slice(i, i + size);
+    const count = (windows.get(window) || 0) + 1;
+    windows.set(window, count);
+    if (count > 1) duplicates++;
+    total++;
+  }
+  return (total > 5 && duplicates / total > 0.4) || text.split('\n').some(line => line.length > 50_000);
+}
+
+function retryAfterMs(response, raw, attempt) {
+  const seconds = Number(response.headers.get('retry-after'));
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 30) * 1000;
+  try {
+    const providerSeconds = Number(JSON.parse(raw)?.details?.retryAfterSeconds);
+    if (Number.isFinite(providerSeconds) && providerSeconds > 0) return Math.min(providerSeconds, 30) * 1000;
+  } catch {}
+  return attempt * 1000;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function arrayOfStrings(value) {

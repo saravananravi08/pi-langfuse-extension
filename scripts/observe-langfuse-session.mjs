@@ -3,6 +3,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
+import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory-prompts.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
@@ -12,41 +13,6 @@ let OBSERVER_ENABLED = true;
 let OBSERVER_MODEL = '';
 let OBSERVER_BASE_URL = '';
 let OBSERVER_API_KEY = '';
-const OBSERVER_PROMPT = `You are the memory consciousness of an AI coding assistant. Your observations may become the ONLY information the assistant has about this trace later.
-
-Extract dense trace-level observations from a coding-agent trace. Preserve what matters for continuing work after raw tool calls are removed.
-
-Use priority levels inside observationsMarkdown:
-- 🔴 High: explicit user request, unresolved goal, critical context, important decision
-- 🟡 Medium: project details, tool results, files inspected/changed, learned information
-- 🟢 Low: minor detail or uncertainty
-- ✅ Completed: concrete task/question/subtask resolved
-
-Guidelines adapted from Mastra Observational Memory:
-- Be specific enough for a future coding agent to act on.
-- Add 1-8 observations for the trace.
-- Use terse dense language.
-- Do not list every tool call. Group repeated reads/searches/commands by purpose and outcome.
-- If tools were called, observe what was called, why, and what was learned.
-- Preserve file paths and line numbers when available.
-- Capture user words closely when important.
-- Track completion explicitly with ✅ when a concrete outcome is done.
-- Capture state changes: if later evidence supersedes earlier info in the same trace, state the latest state.
-- Keep exact errors, commands, file paths, and tests when useful.
-
-Return ONLY valid JSON. No markdown fence. Shape:
-{
-  "observationsMarkdown": "Date: Jul 17, 2026\\n* 🔴 (14:30) ...\\n* 🟡 (14:31) ...\\n* ✅ ...",
-  "currentTask": "short current task/status after this trace",
-  "summary": "one short paragraph",
-  "filesTouched": ["path/or/file.ts"],
-  "toolsUsed": ["bash", "read", "edit"],
-  "decisions": ["decision/rationale"],
-  "completed": ["completed outcome"],
-  "openIssues": ["remaining issue/blocker"]
-}
-
-Do not include suggestedResponse.`;
 const LANGFUSE_CONFIG = process.env.LANGFUSE_CONFIG || join(homedir(), '.pi', 'agent', 'extensions', 'langfuse', 'config.json');
 
 const args = parseArgs(process.argv.slice(2));
@@ -202,26 +168,36 @@ function buildTimeline(trace, observations) {
   lines.push(`Time: ${trace.timestamp || ''}`);
   lines.push(`CWD: ${trace.metadata?.cwd || ''}`);
   lines.push(`Model: ${trace.metadata?.provider || ''}/${trace.metadata?.model || ''}`);
-  lines.push(`User: ${stringifyValue(trace.input, 2000)}`);
-  if (trace.output) lines.push(`Final assistant output: ${stringifyValue(trace.output, 2000)}`);
+  lines.push(`User: ${stringifyValue(trace.input, 8000)}`);
+  if (trace.output) lines.push(`Final assistant output: ${stringifyValue(trace.output, 8000)}`);
   lines.push('');
   lines.push('Steps:');
   for (const o of observations) {
     const time = o.startTime ? new Date(o.startTime).toISOString() : '';
     const label = `${o.type || ''} ${o.name || ''}`.trim();
     lines.push(`- ${time} ${label}`);
-    if (o.input != null) lines.push(`  input: ${stringifyValue(o.input, 1200).replace(/\n/g, '\n  ')}`);
-    if (o.output != null) lines.push(`  output: ${stringifyValue(o.output, 1600).replace(/\n/g, '\n  ')}`);
+    if (o.input != null) lines.push(`  input: ${stringifyValue(o.input, 8000).replace(/\n/g, '\n  ')}`);
+    if (o.output != null) lines.push(`  output: ${stringifyValue(o.output, 40000).replace(/\n/g, '\n  ')}`);
     if (o.metadata && Object.keys(o.metadata).length) lines.push(`  metadata: ${stringifyValue(o.metadata, 600)}`);
   }
   return lines.join('\n');
 }
 
 async function observeTrace(trace, observations, timeline) {
-  const system = OBSERVER_PROMPT;
-  const user = `## New Message History to Observe\n\n${timeline}\n\n---\n\nExtract trace-level memory observations. Do not include <suggested-response>. Output only valid JSON with keys: observationsMarkdown, currentTask, summary, filesTouched, toolsUsed, decisions, completed, openIssues.`;
-  const text = await observerComplete(system, user);
-  return parseObserverJson(text);
+  const system = OBSERVER_SYSTEM_PROMPT;
+  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract trace-level memory and return ONLY valid JSON with keys: observationsMarkdown, summary, goal, constraints, currentTask, taskStatus, completed, inProgress, openIssues, decisions, nextSteps, criticalContext, filesRead, filesModified, filesCreated, filesDeleted, toolsUsed.`;
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const text = await observerComplete(system, user);
+    try {
+      if (detectDegenerateRepetition(text)) throw new Error('Observer output contains degenerate repetition');
+      return parseObserverJson(text);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) console.warn('invalid observer output; retrying once');
+    }
+  }
+  throw lastError;
 }
 
 async function observerComplete(system, user) {
@@ -266,15 +242,27 @@ async function observerComplete(system, user) {
 function parseObserverJson(text) {
   const jsonText = extractJson(text);
   const parsed = JSON.parse(jsonText);
+  if (!String(parsed.observationsMarkdown || '').trim() || !String(parsed.summary || '').trim()) {
+    throw new Error('Observer output missing observationsMarkdown or summary');
+  }
   return {
-    observationsMarkdown: String(parsed.observationsMarkdown || '').trim(),
+    observationsMarkdown: String(parsed.observationsMarkdown).trim(),
+    summary: String(parsed.summary).trim(),
+    goal: arrayOfStrings(parsed.goal),
+    constraints: arrayOfStrings(parsed.constraints),
     currentTask: String(parsed.currentTask || '').trim(),
-    summary: String(parsed.summary || '').trim(),
-    filesTouched: arrayOfStrings(parsed.filesTouched),
-    toolsUsed: arrayOfStrings(parsed.toolsUsed),
-    decisions: arrayOfStrings(parsed.decisions),
+    taskStatus: normalizeTaskStatus(parsed.taskStatus),
     completed: arrayOfStrings(parsed.completed),
+    inProgress: arrayOfStrings(parsed.inProgress),
     openIssues: arrayOfStrings(parsed.openIssues),
+    decisions: arrayOfStrings(parsed.decisions),
+    nextSteps: arrayOfStrings(parsed.nextSteps),
+    criticalContext: arrayOfStrings(parsed.criticalContext),
+    filesRead: arrayOfStrings(parsed.filesRead),
+    filesModified: arrayOfStrings(parsed.filesModified),
+    filesCreated: arrayOfStrings(parsed.filesCreated),
+    filesDeleted: arrayOfStrings(parsed.filesDeleted),
+    toolsUsed: arrayOfStrings(parsed.toolsUsed),
     rawModelOutput: text,
   };
 }
@@ -290,8 +278,19 @@ function extractJson(text) {
 
 async function fetchTextWithRetry(url, options, label, attempts = 5) {
   let lastText = '';
+  let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const res = await fetch(url, options);
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await sleep(Math.min(attempt * 2, 10) * 1000);
+        continue;
+      }
+      break;
+    }
     const text = await res.text();
     lastText = text;
     if (res.ok) return text;
@@ -302,7 +301,7 @@ async function fetchTextWithRetry(url, options, label, attempts = 5) {
     }
     throw new Error(`${label} ${res.status}: ${text.slice(0, 1000)}`);
   }
-  throw new Error(`${label} failed: ${lastText.slice(0, 1000)}`);
+  throw new Error(`${label} failed after ${attempts} attempts: ${lastText.slice(0, 1000)}`, { cause: lastError });
 }
 
 function parseRetryAfter(text) {
@@ -314,8 +313,12 @@ function sleep(ms) {
 }
 
 function buildScoreMetadata(trace, observations, memory, timeline) {
+  const derivedFiles = deriveFileOperations(observations);
+  const filesRead = unique([...derivedFiles.filesRead, ...memory.filesRead]);
+  const filesModified = unique([...derivedFiles.filesModified, ...memory.filesModified]);
   return trimMetadata({
     version: VERSION,
+    promptVersion: PROMPT_VERSION,
     scope: 'trace',
     source: 'pi-langfuse-memory',
     observerApi: OBSERVER_API,
@@ -328,18 +331,45 @@ function buildScoreMetadata(trace, observations, memory, timeline) {
     model: trace.metadata?.model || null,
     provider: trace.metadata?.provider || null,
     observationsMarkdown: memory.observationsMarkdown,
-    currentTask: memory.currentTask,
     summary: memory.summary,
-    filesTouched: memory.filesTouched,
-    toolsUsed: memory.toolsUsed.length ? memory.toolsUsed : unique(observations.map(o => o.metadata?.tool || (String(o.name || '').startsWith('tool:') ? String(o.name).slice(5) : '')).filter(Boolean)),
-    decisions: memory.decisions,
+    goal: memory.goal,
+    constraints: memory.constraints,
+    currentTask: memory.currentTask,
+    taskStatus: memory.taskStatus,
     completed: memory.completed,
+    inProgress: memory.inProgress,
     openIssues: memory.openIssues,
+    decisions: memory.decisions,
+    nextSteps: memory.nextSteps,
+    criticalContext: memory.criticalContext,
+    filesRead,
+    filesModified,
+    filesCreated: memory.filesCreated,
+    filesDeleted: memory.filesDeleted,
+    filesTouched: unique([...filesRead, ...filesModified, ...memory.filesCreated, ...memory.filesDeleted]),
+    toolsUsed: memory.toolsUsed.length ? memory.toolsUsed : unique(observations.map(o => o.metadata?.tool || (String(o.name || '').startsWith('tool:') ? String(o.name).slice(5) : '')).filter(Boolean)),
     sourceObservationIds: observations.map(o => o.id).filter(Boolean),
     sourceObservationCount: observations.length,
     timelinePreview: clamp(timeline, 6000),
     generatedAt: new Date().toISOString(),
   });
+}
+
+function deriveFileOperations(observations) {
+  const filesRead = [];
+  const filesModified = [];
+  for (const observation of observations) {
+    const tool = observation.metadata?.tool || String(observation.name || '').replace(/^tool:/, '');
+    let input = observation.input;
+    if (typeof input === 'string') {
+      try { input = JSON.parse(input); } catch {}
+    }
+    const path = input && typeof input === 'object' ? input.path : undefined;
+    if (typeof path !== 'string' || !path) continue;
+    if (tool === 'read') filesRead.push(path);
+    if (tool === 'edit' || tool === 'write') filesModified.push(path);
+  }
+  return { filesRead: unique(filesRead), filesModified: unique(filesModified) };
 }
 
 function trimMetadata(metadata) {
@@ -371,6 +401,27 @@ function stripXml(s) {
 
 function firstLine(s) {
   return String(s || '').split('\n').map(x => x.trim()).find(Boolean) || 'Trace observed';
+}
+
+function normalizeTaskStatus(value) {
+  return ['active', 'waiting_for_user', 'blocked', 'complete'].includes(String(value)) ? String(value) : 'active';
+}
+
+function detectDegenerateRepetition(text) {
+  if (text.length < 2000) return false;
+  const windows = new Map();
+  const size = 200;
+  const step = Math.max(1, Math.floor(text.length / 50));
+  let duplicates = 0;
+  let total = 0;
+  for (let i = 0; i + size <= text.length; i += step) {
+    const window = text.slice(i, i + size);
+    const count = (windows.get(window) || 0) + 1;
+    windows.set(window, count);
+    if (count > 1) duplicates++;
+    total++;
+  }
+  return (total > 5 && duplicates / total > 0.4) || text.split('\n').some(line => line.length > 50_000);
 }
 
 function arrayOfStrings(v) {

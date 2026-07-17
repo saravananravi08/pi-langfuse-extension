@@ -18,6 +18,14 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+  OBSERVER_PROMPT_VERSION,
+  REFLECTION_PROMPT_VERSION,
+  OBSERVER_SYSTEM_PROMPT,
+  REFLECTION_SYSTEM_PROMPT,
+  REFLECTION_COMPRESSION_GUIDANCE,
+  REQUIRED_REFLECTION_HEADINGS,
+} from "./memory-prompts.js";
 
 // ============================================
 // Configuration
@@ -146,6 +154,7 @@ interface TraceStep {
 
 interface TraceSnapshot {
   traceId: string;
+  traceTimestamp: string;
   sessionId: string;
   cwd: string;
   model: string;
@@ -173,6 +182,7 @@ interface ObservedAgentMessage {
 }
 
 let currentTrace: TraceData | null = null;
+let currentTraceTimestamp: string = "";
 let currentUserPrompt: string = "";
 let currentSessionId: string = "";
 let currentModel: string = "";
@@ -196,6 +206,7 @@ function resetSessionState() {
   turnCount = 0;
   activeSpans.clear();
   currentTrace = null;
+  currentTraceTimestamp = "";
   currentUserPrompt = "";
   currentModel = "";
   currentProvider = "";
@@ -288,6 +299,59 @@ function unique(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
 }
 
+class MemoryOutputValidationError extends Error {}
+
+function taskStatus(value: unknown): "active" | "waiting_for_user" | "blocked" | "complete" {
+  return ["active", "waiting_for_user", "blocked", "complete"].includes(String(value))
+    ? String(value) as "active" | "waiting_for_user" | "blocked" | "complete"
+    : "active";
+}
+
+function detectDegenerateRepetition(text: string): boolean {
+  if (text.length < 2000) return false;
+  const windows = new Map<string, number>();
+  const size = 200;
+  const step = Math.max(1, Math.floor(text.length / 50));
+  let duplicates = 0;
+  let total = 0;
+  for (let i = 0; i + size <= text.length; i += step) {
+    const window = text.slice(i, i + size);
+    const count = (windows.get(window) || 0) + 1;
+    windows.set(window, count);
+    if (count > 1) duplicates++;
+    total++;
+  }
+  return (total > 5 && duplicates / total > 0.4) || text.split("\n").some(line => line.length > 50_000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function retryAfterMs(response: Response, raw: string, attempt: number): number {
+  const seconds = Number(response.headers.get("retry-after"));
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 30) * 1000;
+  try {
+    const providerSeconds = Number(JSON.parse(raw)?.details?.retryAfterSeconds);
+    if (Number.isFinite(providerSeconds) && providerSeconds > 0) return Math.min(providerSeconds, 30) * 1000;
+  } catch {}
+  return attempt * 1000;
+}
+
+function deriveFileOperations(steps: TraceStep[]) {
+  const filesRead: string[] = [];
+  const filesModified: string[] = [];
+  for (const step of steps) {
+    if (step.type !== "tool" || !step.input || typeof step.input !== "object") continue;
+    const path = (step.input as Record<string, unknown>).path;
+    if (typeof path !== "string" || !path) continue;
+    const tool = step.name.replace(/^tool:/, "");
+    if (tool === "read") filesRead.push(path);
+    if (tool === "edit" || tool === "write") filesModified.push(path);
+  }
+  return { filesRead: unique(filesRead), filesModified: unique(filesModified) };
+}
+
 function extractJsonObject(text: string): string {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced?.[1]) return fenced[1].trim();
@@ -358,74 +422,97 @@ function buildObservationSteps(messages: ObservedAgentMessage[], existingSteps: 
   return [...steps.values()];
 }
 
-async function observerComplete(prompt: string, maxTokens = 4000, label = "Observer"): Promise<string> {
+async function observerComplete(system: string, user: string, maxTokens = 4000, label = "Observer", temperature = 0.1): Promise<string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
     "Content-Type": "application/json",
   };
+  if (OBSERVER_API === "anthropic") headers["anthropic-version"] = "2023-06-01";
+
   const body = OBSERVER_API === "openai"
     ? {
         model: OBSERVER_MODEL,
-        temperature: 0.1,
+        temperature,
         max_tokens: maxTokens,
-        messages: [{ role: "user", content: prompt }],
+        messages: [{ role: "system", content: system }, { role: "user", content: user }],
       }
     : {
         model: OBSERVER_MODEL,
         max_tokens: maxTokens,
-        temperature: 0.1,
+        temperature,
         stream: false,
-        messages: [{ role: "user", content: prompt }],
+        system,
+        messages: [{ role: "user", content: user }],
       };
 
-  if (OBSERVER_API === "anthropic") headers["anthropic-version"] = "2023-06-01";
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(observerEndpoint(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt === 3) break;
+      console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/3)`);
+      await sleep(attempt * 1000);
+      continue;
+    }
 
-  const response = await fetch(observerEndpoint(), {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
+    const raw = await response.text();
+    if (!response.ok) {
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      if (retryable && attempt < 3) {
+        console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/3)`);
+        await sleep(retryAfterMs(response, raw, attempt));
+        continue;
+      }
+      throw new Error(`${label} model ${response.status}: ${raw.slice(0, 500)}`);
+    }
 
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`${label} model ${response.status}: ${raw.slice(0, 500)}`);
+    const data = JSON.parse(raw);
+    const text = OBSERVER_API === "openai"
+      ? data.choices?.[0]?.message?.content
+      : (data.content || [])
+          .filter((part: { type?: string; text?: string }) => part.type === "text" && part.text)
+          .map((part: { text: string }) => part.text)
+          .join("\n");
+    if (!text?.trim()) throw new Error(`${label} model returned no text`);
+    return text.trim();
+  }
 
-  const data = JSON.parse(raw);
-  const text = OBSERVER_API === "openai"
-    ? data.choices?.[0]?.message?.content
-    : (data.content || [])
-        .filter((part: { type?: string; text?: string }) => part.type === "text" && part.text)
-        .map((part: { text: string }) => part.text)
-        .join("\n");
-
-  if (!text?.trim()) throw new Error(`${label} model returned no text`);
-  return text.trim();
+  throw new Error(`${label} model connection failed after 3 attempts`, { cause: lastError });
 }
 
 function buildTraceTimeline(snapshot: TraceSnapshot) {
   const lines = [
     `Trace ${snapshot.traceId}`,
     `Session: ${snapshot.sessionId}`,
+    `Trace time: ${snapshot.traceTimestamp}`,
     `CWD: ${snapshot.cwd}`,
     `Model: ${snapshot.provider}/${snapshot.model}`,
-    `User: ${clampText(snapshot.userPrompt, 2000)}`,
+    `User: ${clampText(snapshot.userPrompt, 8000)}`,
   ];
 
-  if (snapshot.output) lines.push(`Final assistant output: ${clampText(snapshot.output, 2000)}`);
+  if (snapshot.output) lines.push(`Final assistant output: ${clampText(snapshot.output, 8000)}`);
   lines.push("", "Steps:");
 
   for (const step of snapshot.steps) {
     if (step.type === "tool") {
       const toolName = step.name.replace(/^tool:/, "");
       lines.push(`- ${step.timestamp} Tool Call ${toolName}`);
-      if (step.input !== undefined) lines.push(`  args: ${clampText(step.input, 2000).replace(/\n/g, "\n  ")}`);
-      if (step.output !== undefined) lines.push(`  Tool Result ${toolName}: ${clampText(step.output, 8000).replace(/\n/g, "\n  ")}`);
+      if (step.input !== undefined) lines.push(`  args: ${clampText(step.input, 8000).replace(/\n/g, "\n  ")}`);
+      if (step.output !== undefined) lines.push(`  Tool Result ${toolName}: ${clampText(step.output, 40_000).replace(/\n/g, "\n  ")}`);
       if (step.isError !== undefined) lines.push(`  isError: ${step.isError}`);
       continue;
     }
 
     lines.push(`- ${step.timestamp} Assistant Generation ${step.name}`);
-    if (step.input !== undefined) lines.push(`  input: ${clampText(step.input, 1200).replace(/\n/g, "\n  ")}`);
-    if (step.output !== undefined) lines.push(`  output: ${clampText(step.output, 2000).replace(/\n/g, "\n  ")}`);
+    if (step.input !== undefined) lines.push(`  input: ${clampText(step.input, 4000).replace(/\n/g, "\n  ")}`);
+    if (step.output !== undefined) lines.push(`  output: ${clampText(step.output, 8000).replace(/\n/g, "\n  ")}`);
   }
 
   return lines.join("\n");
@@ -435,44 +522,53 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
   if (!OBSERVER_ENABLED || !OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
 
   const timeline = buildTraceTimeline(snapshot);
-  const prompt = `You are the memory consciousness of an AI coding assistant. Your observations may become the ONLY information the assistant has about this trace later.
-
-Extract dense trace-level observations from this coding-agent trace. Preserve what matters for continuing work after raw tool calls are removed.
-
-Priority markers for observationsMarkdown:
-- 🔴 High: explicit user request, unresolved goal, critical context, important decision
-- 🟡 Medium: project details, tool results, files inspected/changed, learned information
-- 🟢 Low: minor detail or uncertainty
-- ✅ Completed: concrete task/question/subtask resolved
-
-Guidelines:
-- Be specific enough for a future coding agent to act on.
-- Add 1-8 observations for the trace.
-- Use terse dense language.
-- If the agent calls tools, observe what was called, why, and what was learned from the result.
-- Do not list every tool call; group repeated reads/searches/commands by purpose and outcome.
-- Preserve file paths, errors, commands, tests, and line numbers when useful.
-- Do not include suggestedResponse.
-
-Return ONLY valid JSON:
+  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract trace-level memory and return ONLY valid JSON with this shape:
 {
-  "observationsMarkdown": "Date: Jul 17, 2026\\n* 🔴 ...",
-  "currentTask": "short current task/status after this trace",
+  "observationsMarkdown": "Date: <date from trace>\\n* 🔴 (<time>) ...",
   "summary": "one short paragraph",
-  "filesTouched": ["path/or/file.ts"],
-  "toolsUsed": ["bash", "read", "edit"],
-  "decisions": ["decision/rationale"],
-  "completed": ["completed outcome"],
-  "openIssues": ["remaining issue/blocker"]
-}
+  "goal": ["user goal"],
+  "constraints": ["requirement or preference"],
+  "currentTask": "current task/status after this trace",
+  "taskStatus": "active | waiting_for_user | blocked | complete",
+  "completed": ["verified completed outcome"],
+  "inProgress": ["unfinished work"],
+  "openIssues": ["remaining issue or blocker"],
+  "decisions": ["decision and rationale"],
+  "nextSteps": ["next action"],
+  "criticalContext": ["detail required to continue"],
+  "filesRead": ["path inspected"],
+  "filesModified": ["path changed"],
+  "filesCreated": ["path created"],
+  "filesDeleted": ["path deleted"],
+  "toolsUsed": ["tool name"]
+}`;
 
-## Trace timeline
+  let parsed: Record<string, unknown> | undefined;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const text = await observerComplete(OBSERVER_SYSTEM_PROMPT, user, 6000, "Observer", 0.1);
+    try {
+      if (detectDegenerateRepetition(text)) throw new Error("Observer output contains degenerate repetition");
+      const candidate = JSON.parse(extractJsonObject(text)) as Record<string, unknown>;
+      if (!String(candidate.observationsMarkdown || "").trim() || !String(candidate.summary || "").trim()) {
+        throw new Error("Observer output missing observationsMarkdown or summary");
+      }
+      parsed = candidate;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) throw error;
+      console.warn("📊 Langfuse: Invalid observer output; retrying once");
+    }
+  }
+  if (!parsed) throw lastError;
 
-${timeline}`;
-
-  const text = await observerComplete(prompt);
-
-  const parsed = JSON.parse(extractJsonObject(text));
+  const derivedFiles = deriveFileOperations(snapshot.steps);
+  const filesRead = unique([...derivedFiles.filesRead, ...arrayOfStrings(parsed.filesRead)]);
+  const filesModified = unique([...derivedFiles.filesModified, ...arrayOfStrings(parsed.filesModified)]);
+  const filesCreated = arrayOfStrings(parsed.filesCreated);
+  const filesDeleted = arrayOfStrings(parsed.filesDeleted);
+  const filesTouched = unique([...filesRead, ...filesModified, ...filesCreated, ...filesDeleted]);
   const toolsUsed = unique([
     ...arrayOfStrings(parsed.toolsUsed),
     ...snapshot.steps.filter(step => step.type === "tool").map(step => step.name.replace(/^tool:/, "")),
@@ -487,24 +583,36 @@ ${timeline}`;
     comment: clampText(parsed.summary || firstLine(String(parsed.observationsMarkdown || "")), 1000),
     metadata: {
       version: MEMORY_SCORE_VERSION,
+      promptVersion: OBSERVER_PROMPT_VERSION,
       scope: "trace",
       source: "pi-langfuse-memory",
       observerApi: OBSERVER_API,
       observerModel: OBSERVER_MODEL,
       traceId: snapshot.traceId,
       sessionId: snapshot.sessionId || null,
+      traceTimestamp: snapshot.traceTimestamp,
       cwd: snapshot.cwd || null,
       pathKey: snapshot.cwd || null,
       model: snapshot.model || null,
       provider: snapshot.provider || null,
-      observationsMarkdown: String(parsed.observationsMarkdown || "").trim(),
+      observationsMarkdown: String(parsed.observationsMarkdown).trim(),
+      summary: String(parsed.summary).trim(),
+      goal: arrayOfStrings(parsed.goal),
+      constraints: arrayOfStrings(parsed.constraints),
       currentTask: String(parsed.currentTask || "").trim(),
-      summary: String(parsed.summary || "").trim(),
-      filesTouched: arrayOfStrings(parsed.filesTouched),
-      toolsUsed,
-      decisions: arrayOfStrings(parsed.decisions),
+      taskStatus: taskStatus(parsed.taskStatus),
       completed: arrayOfStrings(parsed.completed),
+      inProgress: arrayOfStrings(parsed.inProgress),
       openIssues: arrayOfStrings(parsed.openIssues),
+      decisions: arrayOfStrings(parsed.decisions),
+      nextSteps: arrayOfStrings(parsed.nextSteps),
+      criticalContext: arrayOfStrings(parsed.criticalContext),
+      filesRead,
+      filesModified,
+      filesCreated,
+      filesDeleted,
+      filesTouched,
+      toolsUsed,
       sourceStepIds: snapshot.steps.map(step => step.id),
       sourceStepCount: snapshot.steps.length,
       generatedAt: new Date().toISOString(),
@@ -624,12 +732,22 @@ async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSes
   const previousFields = previous ? {
     reflectionMarkdown: metadataString(previous, "reflectionMarkdown"),
     summary: metadataString(previous, "summary"),
+    goal: metadataStrings(previous, "goal"),
+    constraints: metadataStrings(previous, "constraints"),
     currentTask: metadataString(previous, "currentTask"),
+    taskStatus: metadataString(previous, "taskStatus"),
+    completed: metadataStrings(previous, "completed"),
+    inProgress: metadataStrings(previous, "inProgress"),
+    openIssues: metadataStrings(previous, "openIssues"),
+    decisions: metadataStrings(previous, "decisions"),
+    nextSteps: metadataStrings(previous, "nextSteps"),
+    criticalContext: metadataStrings(previous, "criticalContext"),
+    filesRead: metadataStrings(previous, "filesRead"),
+    filesModified: metadataStrings(previous, "filesModified"),
+    filesCreated: metadataStrings(previous, "filesCreated"),
+    filesDeleted: metadataStrings(previous, "filesDeleted"),
     filesTouched: metadataStrings(previous, "filesTouched"),
     toolsUsed: metadataStrings(previous, "toolsUsed"),
-    decisions: metadataStrings(previous, "decisions"),
-    completed: metadataStrings(previous, "completed"),
-    openIssues: metadataStrings(previous, "openIssues"),
   } : null;
   const observationFields = memory.newObservations.map(score => ({
     scoreId: score.id,
@@ -637,46 +755,95 @@ async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSes
     generatedAt: generatedAt(score),
     observationsMarkdown: metadataString(score, "observationsMarkdown"),
     summary: metadataString(score, "summary"),
+    goal: metadataStrings(score, "goal"),
+    constraints: metadataStrings(score, "constraints"),
     currentTask: metadataString(score, "currentTask"),
+    taskStatus: metadataString(score, "taskStatus"),
+    completed: metadataStrings(score, "completed"),
+    inProgress: metadataStrings(score, "inProgress"),
+    openIssues: metadataStrings(score, "openIssues"),
+    decisions: metadataStrings(score, "decisions"),
+    nextSteps: metadataStrings(score, "nextSteps"),
+    criticalContext: metadataStrings(score, "criticalContext"),
+    filesRead: metadataStrings(score, "filesRead"),
+    filesModified: metadataStrings(score, "filesModified"),
+    filesCreated: metadataStrings(score, "filesCreated"),
+    filesDeleted: metadataStrings(score, "filesDeleted"),
     filesTouched: metadataStrings(score, "filesTouched"),
     toolsUsed: metadataStrings(score, "toolsUsed"),
-    decisions: metadataStrings(score, "decisions"),
-    completed: metadataStrings(score, "completed"),
-    openIssues: metadataStrings(score, "openIssues"),
   }));
-  const prompt = `You are the reflector for an AI coding assistant's append-only observational memory.
+  const targetTokens = Math.max(2_000, Math.min(8_000, Math.floor(memory.activeTokens * 0.5)));
+  const user = `Consolidate the delimited memory into one updated coding checkpoint.
 
-Consolidate the previous reflection and new observations into dense, accurate session memory. This may become the ONLY context retained from the covered work.
+<previous-reflection>
+${JSON.stringify(previousFields, null, 2)}
+</previous-reflection>
 
-Rules:
-- Preserve exact user goals, current status, file paths, commands, errors, ports, URLs, IDs, tests, and decisions when useful.
-- Carry forward unresolved work and still-valid facts.
-- Remove duplicate or superseded details.
-- Move clearly resolved open issues into completed outcomes.
-- Keep filesTouched and toolsUsed comprehensive and deduplicated.
-- Do not invent completion or resolution.
-- Keep reflectionMarkdown concise but actionable and chronological where timing matters.
+<new-observations>
+${JSON.stringify(observationFields, null, 2)}
+</new-observations>
 
 Return ONLY valid JSON:
 {
-  "reflectionMarkdown": "dense human-readable session memory",
+  "reflectionMarkdown": "Pi checkpoint using the required headings",
   "summary": "short session summary",
+  "goal": ["current user goal"],
+  "constraints": ["requirement or preference"],
   "currentTask": "current unresolved task/status",
-  "filesTouched": ["path/or/file.ts"],
-  "toolsUsed": ["bash", "read"],
-  "decisions": ["decision/rationale"],
-  "completed": ["concrete completed outcome"],
-  "openIssues": ["still-open issue"]
+  "taskStatus": "active | waiting_for_user | blocked | complete",
+  "completed": ["verified completed outcome"],
+  "inProgress": ["unfinished work"],
+  "openIssues": ["remaining issue or blocker"],
+  "decisions": ["decision and rationale"],
+  "nextSteps": ["ordered next action"],
+  "criticalContext": ["detail required to continue"],
+  "filesRead": ["path inspected"],
+  "filesModified": ["path changed"],
+  "filesCreated": ["path created"],
+  "filesDeleted": ["path deleted"],
+  "toolsUsed": ["tool name"]
 }
 
-Previous reflection:
-${JSON.stringify(previousFields, null, 2)}
-
-New observations ordered by generatedAt:
-${JSON.stringify(observationFields, null, 2)}`;
-
-  const text = await observerComplete(prompt, 6000, "Reflector");
-  const parsed = JSON.parse(extractJsonObject(text));
+Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
+  const compressionGuidance = REFLECTION_COMPRESSION_GUIDANCE;
+  let parsed: Record<string, unknown> | undefined;
+  let compressionAttempt = 0;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= compressionGuidance.length; attempt++) {
+    compressionAttempt = attempt;
+    try {
+      const text = await observerComplete(
+        REFLECTION_SYSTEM_PROMPT,
+        `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1] || "Use concise, dense language."}`,
+        6000,
+        "Reflector",
+        0,
+      );
+      if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError("Reflector output contains degenerate repetition");
+      let candidate: Record<string, unknown>;
+      try {
+        candidate = JSON.parse(extractJsonObject(text)) as Record<string, unknown>;
+      } catch (error) {
+        throw new MemoryOutputValidationError(`Reflector returned invalid JSON: ${error instanceof Error ? error.message : error}`);
+      }
+      if (!String(candidate.reflectionMarkdown || "").trim() || !String(candidate.summary || "").trim()) {
+        throw new MemoryOutputValidationError("Reflector output missing reflectionMarkdown or summary");
+      }
+      const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !String(candidate.reflectionMarkdown).includes(heading));
+      if (missingHeading) throw new MemoryOutputValidationError(`Reflector output missing ${missingHeading}`);
+      const outputTokens = estimateTokens(candidate.reflectionMarkdown);
+      if (outputTokens > targetTokens) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
+      parsed = candidate;
+      break;
+    } catch (error) {
+      if (!(error instanceof MemoryOutputValidationError) && !(error instanceof SyntaxError)) throw error;
+      lastError = error;
+      if (attempt < compressionGuidance.length) {
+        console.warn(`📊 Langfuse: Reflection validation failed; retrying compression (${attempt}/${compressionGuidance.length})`);
+      }
+    }
+  }
+  if (!parsed) throw lastError;
   const generation = Number(previous?.metadata?.generation || 0) + 1;
   const sourceObservationScoreIds = memory.newObservations.map(score => score.id);
   const sourceTraceIds = unique(memory.newObservations.map(score => score.traceId || metadataString(score, "traceId")));
@@ -684,6 +851,7 @@ ${JSON.stringify(observationFields, null, 2)}`;
   const generated = new Date().toISOString();
   const metadata = {
     version: MEMORY_SCORE_VERSION,
+    promptVersion: REFLECTION_PROMPT_VERSION,
     scope: "session",
     source: "pi-langfuse-memory",
     reflectorApi: OBSERVER_API,
@@ -692,14 +860,28 @@ ${JSON.stringify(observationFields, null, 2)}`;
     sessionId: snapshot.sessionId,
     cwd: snapshot.cwd || null,
     pathKey: snapshot.cwd || null,
-    reflectionMarkdown: clampText(parsed.reflectionMarkdown || "", 24_000),
-    summary: clampText(parsed.summary || "", 3_000),
-    currentTask: clampText(parsed.currentTask || "", 2_000),
-    filesTouched: unique([...metadataStrings(previous, "filesTouched"), ...observationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesTouched)]),
-    toolsUsed: unique([...metadataStrings(previous, "toolsUsed"), ...observationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
-    decisions: arrayOfStrings(parsed.decisions),
+    reflectionMarkdown: String(parsed.reflectionMarkdown).trim(),
+    summary: String(parsed.summary).trim(),
+    goal: arrayOfStrings(parsed.goal),
+    constraints: arrayOfStrings(parsed.constraints),
+    currentTask: String(parsed.currentTask || "").trim(),
+    taskStatus: taskStatus(parsed.taskStatus),
     completed: arrayOfStrings(parsed.completed),
+    inProgress: arrayOfStrings(parsed.inProgress),
     openIssues: arrayOfStrings(parsed.openIssues),
+    decisions: arrayOfStrings(parsed.decisions),
+    nextSteps: arrayOfStrings(parsed.nextSteps),
+    criticalContext: arrayOfStrings(parsed.criticalContext),
+    filesRead: unique([...metadataStrings(previous, "filesRead"), ...observationFields.flatMap(item => item.filesRead), ...arrayOfStrings(parsed.filesRead)]),
+    filesModified: unique([...metadataStrings(previous, "filesModified"), ...observationFields.flatMap(item => item.filesModified), ...arrayOfStrings(parsed.filesModified)]),
+    filesCreated: unique([...metadataStrings(previous, "filesCreated"), ...observationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(parsed.filesCreated)]),
+    filesDeleted: unique([...metadataStrings(previous, "filesDeleted"), ...observationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(parsed.filesDeleted)]),
+    filesTouched: unique([...metadataStrings(previous, "filesTouched"), ...observationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
+    toolsUsed: unique([...metadataStrings(previous, "toolsUsed"), ...observationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
+    inputTokensEstimated: memory.activeTokens,
+    outputTokensEstimated: estimateTokens(parsed.reflectionMarkdown),
+    compressionRatio: Number((estimateTokens(parsed.reflectionMarkdown) / memory.activeTokens).toFixed(3)),
+    compressionAttempt,
     sourceTraceIds,
     sourceObservationScoreIds,
     sourceReflectionScoreIds: previous ? [previous.id] : [],
@@ -815,6 +997,7 @@ export default async function (pi: ExtensionAPI) {
       const lf = await getClient();
       const cwd = event.systemPromptOptions?.cwd || process.cwd();
       currentUserPrompt = event.prompt;
+      currentTraceTimestamp = new Date().toISOString();
       currentCwd = cwd;
       traceSteps.length = 0;
       
@@ -889,6 +1072,7 @@ export default async function (pi: ExtensionAPI) {
 
       const memorySnapshot: TraceSnapshot = {
         traceId: currentTrace.id,
+        traceTimestamp: currentTraceTimestamp,
         sessionId: currentSessionId,
         cwd: currentCwd,
         model: currentModel,

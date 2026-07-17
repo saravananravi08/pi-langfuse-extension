@@ -21,6 +21,7 @@ Langfuse provides open-source observability for LLM applications. This extension
 - **Token Usage**: Tracks input and output tokens per turn.
 - **Trace Memory Scores**: Optionally generates compact Mastra-style trace observations and writes them back as Langfuse score metadata.
 - **Session Reflections**: Asynchronously consolidates large observation logs into append-only session scores while retaining exact source score/trace IDs.
+- **Resilient Memory Calls**: Retries connection failures, rate limits, and server errors; validates malformed/repetitive observer and reflector output.
 
 ## Quick Install
 
@@ -92,6 +93,8 @@ PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
 
 Reflection reuses the observer API/model. It triggers only when active memory reaches 20,000 estimated tokens, with at least 8,000 tokens and five observations added since the latest reflection. Each `memory_session_reflection` is append-only. `coveredUntil` identifies observations already incorporated; newer observations remain available for append/retrieval.
 
+Observer and reflector system prompts are centralized in [`memory-prompts.js`](./memory-prompts.js). Live and batch paths use the same prompt versions.
+
 For npm install, find the extension at:
 ```
 ~/.pi/agent/npm/@ravan08/pi-langfuse/index.ts
@@ -156,12 +159,13 @@ Session score (name: "memory_session_reflection")
 - `value` - `observed`
 - `comment` - Short summary
 - `metadata.observationsMarkdown` - Dense observation bullets using 🔴/🟡/🟢/✅ markers
-- `metadata.currentTask` - Current task/status after the trace
-- `metadata.filesTouched` - Important files/paths
+- `metadata.currentTask` / `taskStatus` - Current task and active/waiting/blocked/complete state
+- `metadata.goal` / `constraints` - User goals, requirements, and preferences
+- `metadata.completed` / `inProgress` / `openIssues` - Verified progress state
+- `metadata.decisions` / `nextSteps` / `criticalContext` - Continuation checkpoint
+- `metadata.filesRead` / `filesModified` / `filesCreated` / `filesDeleted` - Classified file operations
+- `metadata.filesTouched` - Backward-compatible union of file paths
 - `metadata.toolsUsed` - Tool names used in the trace
-- `metadata.decisions` - Key decisions/rationale
-- `metadata.completed` - Finished outcomes
-- `metadata.openIssues` - Remaining issues/blockers
 
 ### Session Reflection Score
 - `name` - `memory_session_reflection`
@@ -171,7 +175,9 @@ Session score (name: "memory_session_reflection")
 - `metadata.reflectionMarkdown` - Consolidated active session memory
 - `metadata.sourceObservationScoreIds` - Newly incorporated observation scores
 - `metadata.sourceReflectionScoreIds` - Previous reflection in the append-only chain
-- `metadata.sourceTraceIds` - Exact source traces for future recall
+- `metadata.sourceTraceIds` - Source traces for future recall
+- `metadata.inputTokensEstimated` / `outputTokensEstimated` / `compressionRatio` - Reflection compression metrics
+- `metadata.compressionAttempt` / `promptVersion` - Validation and prompt version details
 
 ## Langfuse Dashboard
 

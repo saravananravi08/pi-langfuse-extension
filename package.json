@@ -1,6 +1,6 @@
 {
 	"name": "@ravan08/pi-langfuse",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"description": "Langfuse observability extension for Pi coding agent with tracing and optional observational memory reflections.",
 	"type": "module",
 	"main": "index.ts",
@@ -52,6 +52,8 @@
 	"files": [
 		"README.md",
 		"index.ts",
+		"memory-prompts.js",
+		"memory-prompts.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts"
