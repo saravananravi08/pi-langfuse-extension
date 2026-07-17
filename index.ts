@@ -133,6 +133,17 @@ interface TraceStep {
   isError?: boolean;
 }
 
+interface TraceSnapshot {
+  traceId: string;
+  sessionId: string;
+  cwd: string;
+  model: string;
+  provider: string;
+  userPrompt: string;
+  output?: string;
+  steps: TraceStep[];
+}
+
 let currentTrace: TraceData | null = null;
 let currentUserPrompt: string = "";
 let currentSessionId: string = "";
@@ -274,19 +285,19 @@ async function observerComplete(prompt: string): Promise<string> {
   return text.trim();
 }
 
-function buildTraceTimeline(traceId: string, output: string | undefined, steps: TraceStep[]) {
+function buildTraceTimeline(snapshot: TraceSnapshot) {
   const lines = [
-    `Trace ${traceId}`,
-    `Session: ${currentSessionId}`,
-    `CWD: ${currentCwd}`,
-    `Model: ${currentProvider}/${currentModel}`,
-    `User: ${clampText(currentUserPrompt, 2000)}`,
+    `Trace ${snapshot.traceId}`,
+    `Session: ${snapshot.sessionId}`,
+    `CWD: ${snapshot.cwd}`,
+    `Model: ${snapshot.provider}/${snapshot.model}`,
+    `User: ${clampText(snapshot.userPrompt, 2000)}`,
   ];
 
-  if (output) lines.push(`Final assistant output: ${clampText(output, 2000)}`);
+  if (snapshot.output) lines.push(`Final assistant output: ${clampText(snapshot.output, 2000)}`);
   lines.push("", "Steps:");
 
-  for (const step of steps) {
+  for (const step of snapshot.steps) {
     lines.push(`- ${step.timestamp} ${step.type} ${step.name}`);
     if (step.input !== undefined) lines.push(`  input: ${clampText(step.input, 1200).replace(/\n/g, "\n  ")}`);
     if (step.output !== undefined) lines.push(`  output: ${clampText(step.output, 1600).replace(/\n/g, "\n  ")}`);
@@ -296,10 +307,10 @@ function buildTraceTimeline(traceId: string, output: string | undefined, steps: 
   return lines.join("\n");
 }
 
-async function generateTraceMemoryObservation(traceId: string, output: string | undefined, steps: TraceStep[]) {
+async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
   if (!OBSERVER_ENABLED || !OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
 
-  const timeline = buildTraceTimeline(traceId, output, steps);
+  const timeline = buildTraceTimeline(snapshot);
   const prompt = `You are the memory consciousness of an AI coding assistant. Your observations may become the ONLY information the assistant has about this trace later.
 
 Extract dense trace-level observations from this coding-agent trace. Preserve what matters for continuing work after raw tool calls are removed.
@@ -339,14 +350,14 @@ ${timeline}`;
   const parsed = JSON.parse(extractJsonObject(text));
   const toolsUsed = unique([
     ...arrayOfStrings(parsed.toolsUsed),
-    ...steps.filter(step => step.type === "tool").map(step => step.name.replace(/^tool:/, "")),
+    ...snapshot.steps.filter(step => step.type === "tool").map(step => step.name.replace(/^tool:/, "")),
   ]);
 
   return {
-    id: deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${traceId}`),
+    id: deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.traceId}`),
     name: MEMORY_SCORE_NAME,
     value: "observed",
-    traceId,
+    traceId: snapshot.traceId,
     dataType: "CATEGORICAL" as const,
     comment: clampText(parsed.summary || firstLine(String(parsed.observationsMarkdown || "")), 1000),
     metadata: {
@@ -355,12 +366,12 @@ ${timeline}`;
       source: "pi-langfuse-memory",
       observerApi: OBSERVER_API,
       observerModel: OBSERVER_MODEL,
-      traceId,
-      sessionId: currentSessionId || null,
-      cwd: currentCwd || null,
-      pathKey: currentCwd || null,
-      model: currentModel || null,
-      provider: currentProvider || null,
+      traceId: snapshot.traceId,
+      sessionId: snapshot.sessionId || null,
+      cwd: snapshot.cwd || null,
+      pathKey: snapshot.cwd || null,
+      model: snapshot.model || null,
+      provider: snapshot.provider || null,
       observationsMarkdown: String(parsed.observationsMarkdown || "").trim(),
       currentTask: String(parsed.currentTask || "").trim(),
       summary: String(parsed.summary || "").trim(),
@@ -369,11 +380,31 @@ ${timeline}`;
       decisions: arrayOfStrings(parsed.decisions),
       completed: arrayOfStrings(parsed.completed),
       openIssues: arrayOfStrings(parsed.openIssues),
-      sourceStepIds: steps.map(step => step.id),
-      sourceStepCount: steps.length,
+      sourceStepIds: snapshot.steps.map(step => step.id),
+      sourceStepCount: snapshot.steps.length,
       generatedAt: new Date().toISOString(),
     },
   };
+}
+
+async function writeTraceMemoryObservation(snapshot: TraceSnapshot) {
+  const score = await generateTraceMemoryObservation(snapshot);
+  if (!score) return;
+
+  const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
+  const response = await fetch(`${config.host}/api/public/scores`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(score),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Langfuse memory score ${response.status}: ${text.slice(0, 500)}`);
+  }
 }
 
 // ============================================
@@ -487,13 +518,19 @@ export default async function (pi: ExtensionAPI) {
         console.warn("📊 Langfuse: Failed to send evaluation scores", e);
       }
 
-      try {
-        const lf = await getClient();
-        const memoryScore = await generateTraceMemoryObservation(currentTrace.id, output, [...traceSteps]);
-        if (memoryScore) lf.score(memoryScore);
-      } catch (e) {
+      const memorySnapshot: TraceSnapshot = {
+        traceId: currentTrace.id,
+        sessionId: currentSessionId,
+        cwd: currentCwd,
+        model: currentModel,
+        provider: currentProvider,
+        userPrompt: currentUserPrompt,
+        output,
+        steps: traceSteps.map(step => ({ ...step })),
+      };
+      void writeTraceMemoryObservation(memorySnapshot).catch(e => {
         console.warn("📊 Langfuse: Failed to generate trace memory observation", e);
-      }
+      });
       
       currentTrace = null;
     }
