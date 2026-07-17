@@ -24,6 +24,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 // ============================================
 
 interface ObserverConfig {
+  enabled?: boolean;
   api?: "anthropic" | "openai";
   baseUrl?: string;
   apiKey?: string;
@@ -95,8 +96,7 @@ let client: LangfuseClient | null = null;
 
 async function getClient(): Promise<LangfuseClient> {
   if (!client) {
-    const extDir = resolve(dirname(fileURLToPath(import.meta.url)));
-    const lib = await import(`${extDir}/node_modules/langfuse/lib/index.mjs`) as {
+    const lib = await import("langfuse") as {
       Langfuse: new (options: { publicKey: string; secretKey?: string; baseUrl?: string }) => LangfuseClient;
     };
     client = new lib.Langfuse({
@@ -184,6 +184,7 @@ const MEMORY_SCORE_VERSION = "v1";
 type ObserverApi = "anthropic" | "openai";
 const configuredObserverApi = process.env.PI_LANGFUSE_OBSERVER_API || config.observer?.api || (process.env.OPENAI_API_KEY ? "openai" : "anthropic");
 const OBSERVER_API = (configuredObserverApi.toLowerCase() === "openai" ? "openai" : "anthropic") as ObserverApi;
+const OBSERVER_ENABLED = process.env.PI_LANGFUSE_OBSERVER_ENABLED === "false" ? false : config.observer?.enabled !== false;
 const OBSERVER_MODEL = process.env.PI_LANGFUSE_OBSERVER_MODEL || config.observer?.model || "";
 const OBSERVER_BASE_URL = process.env.PI_LANGFUSE_OBSERVER_BASE_URL || config.observer?.baseUrl || (OBSERVER_API === "openai" ? "https://api.openai.com" : "https://api.anthropic.com");
 const OBSERVER_API_KEY = process.env.PI_LANGFUSE_OBSERVER_API_KEY || config.observer?.apiKey || (OBSERVER_API === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || "";
@@ -296,7 +297,7 @@ function buildTraceTimeline(traceId: string, output: string | undefined, steps: 
 }
 
 async function generateTraceMemoryObservation(traceId: string, output: string | undefined, steps: TraceStep[]) {
-  if (!OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
+  if (!OBSERVER_ENABLED || !OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
 
   const timeline = buildTraceTimeline(traceId, output, steps);
   const prompt = `You are the memory consciousness of an AI coding assistant. Your observations may become the ONLY information the assistant has about this trace later.

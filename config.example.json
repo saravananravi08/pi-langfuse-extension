@@ -3,6 +3,7 @@
   "secretKey": "sk-lf-YOUR-KEY-HERE",
   "host": "https://cloud.langfuse.com",
   "observer": {
+    "enabled": true,
     "api": "anthropic",
     "baseUrl": "https://api.example.com/anthropic",
     "apiKey": "YOUR-OBSERVER-API-KEY",

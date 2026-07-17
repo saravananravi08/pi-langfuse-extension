@@ -8,6 +8,7 @@ const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e
 const SCORE_NAME = 'memory_trace_observation';
 const VERSION = 'v1';
 let OBSERVER_API = 'anthropic';
+let OBSERVER_ENABLED = true;
 let OBSERVER_MODEL = '';
 let OBSERVER_BASE_URL = '';
 let OBSERVER_API_KEY = '';
@@ -58,9 +59,11 @@ if (!sessionId) fail('Missing session id');
 
 const langfuse = loadLangfuseConfig();
 OBSERVER_API = ((process.env.OBSERVER_API || process.env.PI_LANGFUSE_OBSERVER_API || langfuse.observer?.api || (process.env.OPENAI_API_KEY ? 'openai' : 'anthropic')).toLowerCase() === 'openai') ? 'openai' : 'anthropic';
+OBSERVER_ENABLED = process.env.OBSERVER_ENABLED === 'false' || process.env.PI_LANGFUSE_OBSERVER_ENABLED === 'false' ? false : langfuse.observer?.enabled !== false;
 OBSERVER_MODEL = process.env.OBSERVER_MODEL || process.env.PI_LANGFUSE_OBSERVER_MODEL || langfuse.observer?.model || '';
 OBSERVER_BASE_URL = process.env.OBSERVER_BASE_URL || process.env.PI_LANGFUSE_OBSERVER_BASE_URL || langfuse.observer?.baseUrl || (OBSERVER_API === 'openai' ? 'https://api.openai.com' : 'https://api.anthropic.com');
 OBSERVER_API_KEY = process.env.OBSERVER_API_KEY || process.env.PI_LANGFUSE_OBSERVER_API_KEY || langfuse.observer?.apiKey || (OBSERVER_API === 'openai' ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || '';
+if (!OBSERVER_ENABLED) fail('Observer disabled. Set observer.enabled=true or remove observer.enabled=false.');
 if (!OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
 if (!OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
 

@@ -45,6 +45,7 @@ Create `config.json` in the extension directory:
   "secretKey": "sk-lf-xxxx",
   "host": "https://cloud.langfuse.com",
   "observer": {
+    "enabled": true,
     "api": "anthropic",
     "baseUrl": "https://api.example.com/anthropic",
     "apiKey": "observer-api-key",
@@ -53,7 +54,7 @@ Create `config.json` in the extension directory:
 }
 ```
 
-`observer` is optional. When set, the extension creates a `memory_trace_observation` score for each completed trace. The observer endpoint can be Anthropic-compatible or OpenAI-compatible:
+`observer` is optional. When enabled, the extension creates a `memory_trace_observation` score for each completed trace. Set `"enabled": false` or omit `observer.model`/`observer.apiKey` to disable trace memory scoring. The observer endpoint can be Anthropic-compatible or OpenAI-compatible:
 
 ```json
 {
@@ -69,6 +70,7 @@ Create `config.json` in the extension directory:
 Environment variables override config values:
 
 ```bash
+PI_LANGFUSE_OBSERVER_ENABLED=false
 PI_LANGFUSE_OBSERVER_API=anthropic
 PI_LANGFUSE_OBSERVER_BASE_URL=https://api.example.com/anthropic
 PI_LANGFUSE_OBSERVER_API_KEY=...
