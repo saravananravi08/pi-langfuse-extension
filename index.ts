@@ -31,11 +31,21 @@ interface ObserverConfig {
   model?: string;
 }
 
+interface ReflectionConfig {
+  enabled?: boolean;
+  thresholdTokens?: number;
+  minNewObservationTokens?: number;
+  minNewObservations?: number;
+}
+
 interface Config {
   publicKey: string;
   secretKey: string;
   host: string;
   observer?: ObserverConfig;
+  memory?: {
+    reflection?: ReflectionConfig;
+  };
 }
 
 function loadConfig(): Config {
@@ -51,6 +61,7 @@ function loadConfig(): Config {
           secretKey: config.secretKey,
           host: config.host || "https://cloud.langfuse.com",
           observer: config.observer,
+          memory: config.memory,
         };
       }
     } catch (e) {
@@ -169,6 +180,10 @@ let currentProvider: string = "";
 let currentCwd: string = "";
 const activeSpans: Map<string, SpanData> = new Map();
 const traceSteps: TraceStep[] = [];
+const memoryQueues = new Map<string, Promise<void>>();
+// Langfuse score reads can lag writes; these caches only bridge indexing delay.
+const recentObservations = new Map<string, Map<string, MemoryScore>>();
+const recentReflections = new Map<string, MemoryScore>();
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -208,6 +223,7 @@ function computeEvaluationScores() {
 // ============================================
 
 const MEMORY_SCORE_NAME = "memory_trace_observation";
+const REFLECTION_SCORE_NAME = "memory_session_reflection";
 const MEMORY_SCORE_VERSION = "v1";
 type ObserverApi = "anthropic" | "openai";
 const configuredObserverApi = process.env.PI_LANGFUSE_OBSERVER_API || config.observer?.api || (process.env.OPENAI_API_KEY ? "openai" : "anthropic");
@@ -216,6 +232,33 @@ const OBSERVER_ENABLED = process.env.PI_LANGFUSE_OBSERVER_ENABLED === "false" ? 
 const OBSERVER_MODEL = process.env.PI_LANGFUSE_OBSERVER_MODEL || config.observer?.model || "";
 const OBSERVER_BASE_URL = process.env.PI_LANGFUSE_OBSERVER_BASE_URL || config.observer?.baseUrl || (OBSERVER_API === "openai" ? "https://api.openai.com" : "https://api.anthropic.com");
 const OBSERVER_API_KEY = process.env.PI_LANGFUSE_OBSERVER_API_KEY || config.observer?.apiKey || (OBSERVER_API === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || "";
+const reflectionConfig = config.memory?.reflection;
+const REFLECTION_ENABLED = process.env.PI_LANGFUSE_REFLECTION_ENABLED
+  ? process.env.PI_LANGFUSE_REFLECTION_ENABLED !== "false"
+  : reflectionConfig?.enabled === true;
+const REFLECTION_THRESHOLD_TOKENS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_THRESHOLD_TOKENS || reflectionConfig?.thresholdTokens, 20_000);
+const REFLECTION_MIN_NEW_TOKENS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS || reflectionConfig?.minNewObservationTokens, 8_000);
+const REFLECTION_MIN_NEW_OBSERVATIONS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS || reflectionConfig?.minNewObservations, 5);
+
+interface MemoryScore {
+  id: string;
+  traceId?: string | null;
+  sessionId?: string | null;
+  createdAt?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface ActiveSessionMemory {
+  latestReflection?: MemoryScore;
+  newObservations: MemoryScore[];
+  activeTokens: number;
+  newObservationTokens: number;
+}
+
+function positiveInteger(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
 
 function observerEndpoint(): string {
   const base = OBSERVER_BASE_URL.replace(/\/+$/, "");
@@ -315,7 +358,7 @@ function buildObservationSteps(messages: ObservedAgentMessage[], existingSteps: 
   return [...steps.values()];
 }
 
-async function observerComplete(prompt: string): Promise<string> {
+async function observerComplete(prompt: string, maxTokens = 4000, label = "Observer"): Promise<string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
     "Content-Type": "application/json",
@@ -324,12 +367,12 @@ async function observerComplete(prompt: string): Promise<string> {
     ? {
         model: OBSERVER_MODEL,
         temperature: 0.1,
-        max_tokens: 4000,
+        max_tokens: maxTokens,
         messages: [{ role: "user", content: prompt }],
       }
     : {
         model: OBSERVER_MODEL,
-        max_tokens: 4000,
+        max_tokens: maxTokens,
         temperature: 0.1,
         stream: false,
         messages: [{ role: "user", content: prompt }],
@@ -344,7 +387,7 @@ async function observerComplete(prompt: string): Promise<string> {
   });
 
   const raw = await response.text();
-  if (!response.ok) throw new Error(`Observer model ${response.status}: ${raw.slice(0, 500)}`);
+  if (!response.ok) throw new Error(`${label} model ${response.status}: ${raw.slice(0, 500)}`);
 
   const data = JSON.parse(raw);
   const text = OBSERVER_API === "openai"
@@ -354,7 +397,7 @@ async function observerComplete(prompt: string): Promise<string> {
         .map((part: { text: string }) => part.text)
         .join("\n");
 
-  if (!text?.trim()) throw new Error("Observer model returned no text");
+  if (!text?.trim()) throw new Error(`${label} model returned no text`);
   return text.trim();
 }
 
@@ -469,10 +512,234 @@ ${timeline}`;
   };
 }
 
-async function writeTraceMemoryObservation(snapshot: TraceSnapshot) {
-  const score = await generateTraceMemoryObservation(snapshot);
-  if (!score) return;
+function estimateTokens(value: unknown): number {
+  return Math.ceil(clampText(value, Number.MAX_SAFE_INTEGER).length / 4);
+}
 
+function metadataString(score: MemoryScore | undefined, key: string): string {
+  const value = score?.metadata?.[key];
+  return typeof value === "string" ? value : "";
+}
+
+function metadataStrings(score: MemoryScore | undefined, key: string): string[] {
+  return arrayOfStrings(score?.metadata?.[key]);
+}
+
+function generatedAt(score: MemoryScore): string {
+  return metadataString(score, "generatedAt") || score.createdAt || "";
+}
+
+function memoryScopeKey(sessionId: string, pathKey: string): string {
+  return `${sessionId}:${pathKey}`;
+}
+
+function sameMemoryScope(score: MemoryScore, sessionId: string, pathKey: string): boolean {
+  return metadataString(score, "version") === MEMORY_SCORE_VERSION
+    && metadataString(score, "sessionId") === sessionId
+    && (!pathKey || metadataString(score, "pathKey") === pathKey);
+}
+
+function latestReflection(scores: MemoryScore[]): MemoryScore | undefined {
+  return [...scores].sort((a, b) => {
+    const generationDiff = Number(b.metadata?.generation || 0) - Number(a.metadata?.generation || 0);
+    return generationDiff || generatedAt(b).localeCompare(generatedAt(a));
+  })[0];
+}
+
+async function langfuseGet(path: string): Promise<Record<string, unknown>> {
+  const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
+  const response = await fetch(`${config.host}${path}`, { headers: { Authorization: `Basic ${auth}` } });
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Langfuse GET ${response.status}: ${raw.slice(0, 500)}`);
+  return raw ? JSON.parse(raw) : {};
+}
+
+async function fetchScoreIdsForSession(sessionId: string): Promise<string[]> {
+  const ids: string[] = [];
+  for (let page = 1; ; page++) {
+    const params = new URLSearchParams({ sessionId, page: String(page), limit: "100", fields: "core,scores" });
+    const response = await langfuseGet(`/api/public/traces?${params}`) as { data?: Array<{ scores?: string[] }>; meta?: { totalPages?: number } };
+    for (const trace of response.data || []) ids.push(...(trace.scores || []));
+    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
+  }
+  return unique(ids);
+}
+
+async function fetchScoresByIds(ids: string[], name: string): Promise<MemoryScore[]> {
+  const scores: MemoryScore[] = [];
+  for (let offset = 0; offset < ids.length; offset += 50) {
+    const params = new URLSearchParams({ name, dataType: "CATEGORICAL", limit: "100", scoreIds: ids.slice(offset, offset + 50).join(",") });
+    const response = await langfuseGet(`/api/public/v2/scores?${params}`) as { data?: MemoryScore[] };
+    scores.push(...(response.data || []));
+  }
+  return scores;
+}
+
+async function fetchScoresByName(name: string): Promise<MemoryScore[]> {
+  const scores: MemoryScore[] = [];
+  for (let page = 1; ; page++) {
+    const params = new URLSearchParams({ name, dataType: "CATEGORICAL", page: String(page), limit: "100" });
+    const response = await langfuseGet(`/api/public/v2/scores?${params}`) as { data?: MemoryScore[]; meta?: { totalPages?: number } };
+    scores.push(...(response.data || []));
+    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
+  }
+  return scores;
+}
+
+async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<ActiveSessionMemory> {
+  const scoreIds = await fetchScoreIdsForSession(snapshot.sessionId);
+  const [observations, reflections] = await Promise.all([
+    fetchScoresByIds(scoreIds, MEMORY_SCORE_NAME),
+    fetchScoresByName(REFLECTION_SCORE_NAME),
+  ]);
+
+  const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
+  const cachedObservations = [...(recentObservations.get(scopeKey)?.values() || [])];
+  const cachedReflection = recentReflections.get(scopeKey);
+  const scopedObservations = [...observations, ...cachedObservations, currentObservation]
+    .filter((score, index, all) => all.findIndex(item => item.id === score.id) === index)
+    .filter(score => sameMemoryScope(score, snapshot.sessionId, snapshot.cwd))
+    .sort((a, b) => generatedAt(a).localeCompare(generatedAt(b)));
+  const scopedReflections = [...reflections, ...(cachedReflection ? [cachedReflection] : [])]
+    .filter((score, index, all) => all.findIndex(item => item.id === score.id) === index)
+    .filter(score => sameMemoryScope(score, snapshot.sessionId, snapshot.cwd));
+  const latest = latestReflection(scopedReflections);
+  const coveredUntil = metadataString(latest, "coveredUntil");
+  const newObservations = coveredUntil
+    ? scopedObservations.filter(score => generatedAt(score) > coveredUntil)
+    : scopedObservations;
+  const reflectionMarkdown = metadataString(latest, "reflectionMarkdown");
+  const newMarkdown = newObservations.map(score => metadataString(score, "observationsMarkdown")).join("\n\n");
+
+  return {
+    latestReflection: latest,
+    newObservations,
+    activeTokens: estimateTokens(`${reflectionMarkdown}\n\n${newMarkdown}`),
+    newObservationTokens: estimateTokens(newMarkdown),
+  };
+}
+
+async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSessionMemory): Promise<void> {
+  const previous = memory.latestReflection;
+  const previousFields = previous ? {
+    reflectionMarkdown: metadataString(previous, "reflectionMarkdown"),
+    summary: metadataString(previous, "summary"),
+    currentTask: metadataString(previous, "currentTask"),
+    filesTouched: metadataStrings(previous, "filesTouched"),
+    toolsUsed: metadataStrings(previous, "toolsUsed"),
+    decisions: metadataStrings(previous, "decisions"),
+    completed: metadataStrings(previous, "completed"),
+    openIssues: metadataStrings(previous, "openIssues"),
+  } : null;
+  const observationFields = memory.newObservations.map(score => ({
+    scoreId: score.id,
+    traceId: score.traceId || metadataString(score, "traceId"),
+    generatedAt: generatedAt(score),
+    observationsMarkdown: metadataString(score, "observationsMarkdown"),
+    summary: metadataString(score, "summary"),
+    currentTask: metadataString(score, "currentTask"),
+    filesTouched: metadataStrings(score, "filesTouched"),
+    toolsUsed: metadataStrings(score, "toolsUsed"),
+    decisions: metadataStrings(score, "decisions"),
+    completed: metadataStrings(score, "completed"),
+    openIssues: metadataStrings(score, "openIssues"),
+  }));
+  const prompt = `You are the reflector for an AI coding assistant's append-only observational memory.
+
+Consolidate the previous reflection and new observations into dense, accurate session memory. This may become the ONLY context retained from the covered work.
+
+Rules:
+- Preserve exact user goals, current status, file paths, commands, errors, ports, URLs, IDs, tests, and decisions when useful.
+- Carry forward unresolved work and still-valid facts.
+- Remove duplicate or superseded details.
+- Move clearly resolved open issues into completed outcomes.
+- Keep filesTouched and toolsUsed comprehensive and deduplicated.
+- Do not invent completion or resolution.
+- Keep reflectionMarkdown concise but actionable and chronological where timing matters.
+
+Return ONLY valid JSON:
+{
+  "reflectionMarkdown": "dense human-readable session memory",
+  "summary": "short session summary",
+  "currentTask": "current unresolved task/status",
+  "filesTouched": ["path/or/file.ts"],
+  "toolsUsed": ["bash", "read"],
+  "decisions": ["decision/rationale"],
+  "completed": ["concrete completed outcome"],
+  "openIssues": ["still-open issue"]
+}
+
+Previous reflection:
+${JSON.stringify(previousFields, null, 2)}
+
+New observations ordered by generatedAt:
+${JSON.stringify(observationFields, null, 2)}`;
+
+  const text = await observerComplete(prompt, 6000, "Reflector");
+  const parsed = JSON.parse(extractJsonObject(text));
+  const generation = Number(previous?.metadata?.generation || 0) + 1;
+  const sourceObservationScoreIds = memory.newObservations.map(score => score.id);
+  const sourceTraceIds = unique(memory.newObservations.map(score => score.traceId || metadataString(score, "traceId")));
+  const coveredUntil = generatedAt(memory.newObservations[memory.newObservations.length - 1]!);
+  const generated = new Date().toISOString();
+  const metadata = {
+    version: MEMORY_SCORE_VERSION,
+    scope: "session",
+    source: "pi-langfuse-memory",
+    reflectorApi: OBSERVER_API,
+    reflectorModel: OBSERVER_MODEL,
+    generation,
+    sessionId: snapshot.sessionId,
+    cwd: snapshot.cwd || null,
+    pathKey: snapshot.cwd || null,
+    reflectionMarkdown: clampText(parsed.reflectionMarkdown || "", 24_000),
+    summary: clampText(parsed.summary || "", 3_000),
+    currentTask: clampText(parsed.currentTask || "", 2_000),
+    filesTouched: unique([...metadataStrings(previous, "filesTouched"), ...observationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesTouched)]),
+    toolsUsed: unique([...metadataStrings(previous, "toolsUsed"), ...observationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
+    decisions: arrayOfStrings(parsed.decisions),
+    completed: arrayOfStrings(parsed.completed),
+    openIssues: arrayOfStrings(parsed.openIssues),
+    sourceTraceIds,
+    sourceObservationScoreIds,
+    sourceReflectionScoreIds: previous ? [previous.id] : [],
+    sourceObservationCount: sourceObservationScoreIds.length,
+    coveredUntil,
+    generatedAt: generated,
+  };
+  const score = {
+    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.sessionId}:${snapshot.cwd}:${generation}`),
+    name: REFLECTION_SCORE_NAME,
+    value: "reflected",
+    sessionId: snapshot.sessionId,
+    dataType: "CATEGORICAL",
+    comment: clampText(parsed.summary || firstLine(String(parsed.reflectionMarkdown || "")), 1000),
+    metadata,
+  };
+
+  await writeMemoryScore(score);
+  const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
+  recentReflections.set(scopeKey, score);
+  const cachedObservations = recentObservations.get(scopeKey);
+  if (cachedObservations) {
+    for (const [id, observation] of cachedObservations) {
+      if (generatedAt(observation) <= coveredUntil) cachedObservations.delete(id);
+    }
+  }
+  console.log(`📊 Langfuse: Created session reflection generation ${generation} covering ${sourceObservationScoreIds.length} observations`);
+}
+
+async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<void> {
+  if (!REFLECTION_ENABLED || !snapshot.sessionId) return;
+  const memory = await getActiveSessionMemory(snapshot, currentObservation);
+  if (!memory.newObservations.length
+    || memory.activeTokens < REFLECTION_THRESHOLD_TOKENS
+    || memory.newObservationTokens < REFLECTION_MIN_NEW_TOKENS
+    || memory.newObservations.length < REFLECTION_MIN_NEW_OBSERVATIONS) return;
+  await writeSessionReflection(snapshot, memory);
+}
+
+async function writeMemoryScore(score: Record<string, unknown>): Promise<void> {
   const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
   const response = await fetch(`${config.host}/api/public/scores`, {
     method: "POST",
@@ -487,6 +754,29 @@ async function writeTraceMemoryObservation(snapshot: TraceSnapshot) {
     const text = await response.text();
     throw new Error(`Langfuse memory score ${response.status}: ${text.slice(0, 500)}`);
   }
+}
+
+async function writeTraceMemoryObservation(snapshot: TraceSnapshot): Promise<void> {
+  const score = await generateTraceMemoryObservation(snapshot);
+  if (!score) return;
+  await writeMemoryScore(score);
+  const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
+  const cachedObservations = recentObservations.get(scopeKey) || new Map<string, MemoryScore>();
+  cachedObservations.set(score.id, score);
+  recentObservations.set(scopeKey, cachedObservations);
+  await maybeWriteSessionReflection(snapshot, score);
+}
+
+function enqueueTraceMemoryObservation(snapshot: TraceSnapshot): void {
+  const key = `${snapshot.sessionId}:${snapshot.cwd}`;
+  const previous = memoryQueues.get(key) || Promise.resolve();
+  const task = previous.catch(() => undefined).then(() => writeTraceMemoryObservation(snapshot));
+  memoryQueues.set(key, task);
+  void task.catch(e => {
+    console.warn("📊 Langfuse: Failed to update observational memory", e);
+  }).finally(() => {
+    if (memoryQueues.get(key) === task) memoryQueues.delete(key);
+  });
 }
 
 // ============================================
@@ -607,9 +897,7 @@ export default async function (pi: ExtensionAPI) {
         output,
         steps: buildObservationSteps(messages, traceSteps),
       };
-      void writeTraceMemoryObservation(memorySnapshot).catch(e => {
-        console.warn("📊 Langfuse: Failed to generate trace memory observation", e);
-      });
+      enqueueTraceMemoryObservation(memorySnapshot);
       
       currentTrace = null;
     }

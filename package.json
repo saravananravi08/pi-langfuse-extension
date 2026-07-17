@@ -1,7 +1,7 @@
 {
 	"name": "@ravan08/pi-langfuse",
-	"version": "1.1.4",
-	"description": "Langfuse observability extension for Pi coding agent with tracing, scores, and optional trace memory observations.",
+	"version": "1.2.0",
+	"description": "Langfuse observability extension for Pi coding agent with tracing and optional observational memory reflections.",
 	"type": "module",
 	"main": "index.ts",
 	"keywords": [
@@ -15,6 +15,7 @@
 		"memory",
 		"observations",
 		"trace-memory",
+		"reflections",
 		"scores"
 	],
 	"author": "Saravanan Ravi (@saravananravi08)",

@@ -20,6 +20,7 @@ Langfuse provides open-source observability for LLM applications. This extension
 - **Cost Tracking**: Records input/output/total costs in USD per generation.
 - **Token Usage**: Tracks input and output tokens per turn.
 - **Trace Memory Scores**: Optionally generates compact Mastra-style trace observations and writes them back as Langfuse score metadata.
+- **Session Reflections**: Asynchronously consolidates large observation logs into append-only session scores while retaining exact source score/trace IDs.
 
 ## Quick Install
 
@@ -50,6 +51,14 @@ Create `config.json` in the extension directory:
     "baseUrl": "https://api.example.com/anthropic",
     "apiKey": "observer-api-key",
     "model": "observer-model-id"
+  },
+  "memory": {
+    "reflection": {
+      "enabled": false,
+      "thresholdTokens": 20000,
+      "minNewObservationTokens": 8000,
+      "minNewObservations": 5
+    }
   }
 }
 ```
@@ -75,7 +84,13 @@ PI_LANGFUSE_OBSERVER_API=anthropic
 PI_LANGFUSE_OBSERVER_BASE_URL=https://api.example.com/anthropic
 PI_LANGFUSE_OBSERVER_API_KEY=...
 PI_LANGFUSE_OBSERVER_MODEL=...
+PI_LANGFUSE_REFLECTION_ENABLED=true
+PI_LANGFUSE_REFLECTION_THRESHOLD_TOKENS=20000
+PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS=8000
+PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
 ```
+
+Reflection reuses the observer API/model. It triggers only when active memory reaches 20,000 estimated tokens, with at least 8,000 tokens and five observations added since the latest reflection. Each `memory_session_reflection` is append-only. `coveredUntil` identifies observations already incorporated; newer observations remain available for append/retrieval.
 
 For npm install, find the extension at:
 ```
@@ -110,6 +125,11 @@ Score (name: "memory_trace_observation")
 ├── Value: observed
 ├── Comment: short memory summary
 └── Metadata: observations, files, tools, decisions, completed work, open issues
+
+Session score (name: "memory_session_reflection")
+├── Value: reflected
+├── Session ID: <pi-session-id>
+└── Metadata: generation, coveredUntil, merged memory, source score/trace IDs
 ```
 
 ## What Gets Tracked
@@ -121,7 +141,7 @@ Score (name: "memory_trace_observation")
 - `metadata` - Model, provider, cwd
 
 ### Generation Observations (LLM Calls)
-- `model` - Model identifier (e.g., "MiniMax-M2.7")
+- `model` - Active model identifier
 - `usage` - Token counts (input/output/total)
 - `costDetails` - Cost breakdown in USD
 
@@ -142,6 +162,16 @@ Score (name: "memory_trace_observation")
 - `metadata.decisions` - Key decisions/rationale
 - `metadata.completed` - Finished outcomes
 - `metadata.openIssues` - Remaining issues/blockers
+
+### Session Reflection Score
+- `name` - `memory_session_reflection`
+- `sessionId` - Pi session identifier; no source trace required
+- `metadata.generation` - Monotonic reflection generation
+- `metadata.coveredUntil` - Latest observation timestamp incorporated
+- `metadata.reflectionMarkdown` - Consolidated active session memory
+- `metadata.sourceObservationScoreIds` - Newly incorporated observation scores
+- `metadata.sourceReflectionScoreIds` - Previous reflection in the append-only chain
+- `metadata.sourceTraceIds` - Exact source traces for future recall
 
 ## Langfuse Dashboard
 
@@ -168,7 +198,18 @@ node scripts/observe-langfuse-session.mjs <session-id> --dry-run --limit 1
 node scripts/observe-langfuse-session.mjs <session-id> --force
 ```
 
-The script reads the same `config.json`. Short env aliases are also supported for one-off runs:
+Create or inspect the next session reflection:
+
+```bash
+node scripts/reflect-langfuse-session.mjs <session-id>
+node scripts/reflect-langfuse-session.mjs <session-id> --dry-run
+node scripts/reflect-langfuse-session.mjs <session-id> --force --dry-run
+node scripts/reflect-langfuse-session.mjs <session-id> --path /project/cwd --limit 10
+```
+
+Without `--force`, the script uses the configured token/count thresholds. `--dry-run` calls the reflector only when thresholds pass (or when combined with `--force`) and does not write the score.
+
+The scripts read the same `config.json`. Short env aliases are also supported for one-off runs:
 
 ```bash
 OBSERVER_API=openai OBSERVER_BASE_URL=https://api.openai.com OBSERVER_API_KEY=... OBSERVER_MODEL=... \
@@ -198,6 +239,11 @@ For a deep dive into the tracing model and data flow, see [docs/architecture.md]
 - Add `observer` config or set `PI_LANGFUSE_OBSERVER_*` environment variables
 - Reload pi after changing config
 - Check logs for observer API errors
+
+**No memory_session_reflection score?**
+- Set `memory.reflection.enabled=true`
+- Check whether all three reflection thresholds are met
+- Run `scripts/reflect-langfuse-session.mjs <session-id>` for a status report
 
 ## Dependencies
 

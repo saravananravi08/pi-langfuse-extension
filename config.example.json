@@ -8,5 +8,13 @@
     "baseUrl": "https://api.example.com/anthropic",
     "apiKey": "YOUR-OBSERVER-API-KEY",
     "model": "your-observer-model"
+  },
+  "memory": {
+    "reflection": {
+      "enabled": false,
+      "thresholdTokens": 20000,
+      "minNewObservationTokens": 8000,
+      "minNewObservations": 5
+    }
   }
 }
