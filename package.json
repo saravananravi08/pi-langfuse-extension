@@ -1,7 +1,7 @@
 {
 	"name": "@ravan08/pi-langfuse",
-	"version": "1.0.4",
-	"description": "Langfuse observability extension for Pi coding agent. Sends traces to Langfuse for monitoring tokens, costs, latency, and tool calls.",
+	"version": "1.1.0",
+	"description": "Langfuse observability extension for Pi coding agent with tracing, scores, and optional trace memory observations.",
 	"type": "module",
 	"main": "index.ts",
 	"keywords": [
@@ -11,7 +11,11 @@
 		"tracing",
 		"monitoring",
 		"pi-coding-agent",
-		"extension"
+		"extension",
+		"memory",
+		"observations",
+		"trace-memory",
+		"scores"
 	],
 	"author": "Saravanan Ravi (@saravananravi08)",
 	"contributors": [

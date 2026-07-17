@@ -19,6 +19,7 @@ Langfuse provides open-source observability for LLM applications. This extension
 - **Session Correlation**: Groups all prompts from the same Pi session into a single Langfuse session.
 - **Cost Tracking**: Records input/output/total costs in USD per generation.
 - **Token Usage**: Tracks input and output tokens per turn.
+- **Trace Memory Scores**: Optionally generates compact Mastra-style trace observations and writes them back as Langfuse score metadata.
 
 ## Quick Install
 
@@ -42,8 +43,36 @@ Create `config.json` in the extension directory:
 {
   "publicKey": "pk-lf-xxxx",
   "secretKey": "sk-lf-xxxx",
-  "host": "https://cloud.langfuse.com"
+  "host": "https://cloud.langfuse.com",
+  "observer": {
+    "api": "anthropic",
+    "baseUrl": "https://api.example.com/anthropic",
+    "apiKey": "observer-api-key",
+    "model": "observer-model-id"
+  }
 }
+```
+
+`observer` is optional. When set, the extension creates a `memory_trace_observation` score for each completed trace. The observer endpoint can be Anthropic-compatible or OpenAI-compatible:
+
+```json
+{
+  "observer": {
+    "api": "openai",
+    "baseUrl": "https://api.openai.com",
+    "apiKey": "sk-...",
+    "model": "gpt-4.1-mini"
+  }
+}
+```
+
+Environment variables override config values:
+
+```bash
+PI_LANGFUSE_OBSERVER_API=anthropic
+PI_LANGFUSE_OBSERVER_BASE_URL=https://api.example.com/anthropic
+PI_LANGFUSE_OBSERVER_API_KEY=...
+PI_LANGFUSE_OBSERVER_MODEL=...
 ```
 
 For npm install, find the extension at:
@@ -71,9 +100,14 @@ Trace (name: "pi-agent")
     └── Input/Output logs
 
 Generation (name: "llm-response")
-├── Model: MiniMax-M2.7
+├── Model: active pi model
 ├── Usage: input/output tokens
 └── Cost: input/output/total USD
+
+Score (name: "memory_trace_observation")
+├── Value: observed
+├── Comment: short memory summary
+└── Metadata: observations, files, tools, decisions, completed work, open issues
 ```
 
 ## What Gets Tracked
@@ -95,6 +129,18 @@ Generation (name: "llm-response")
 - `output` - Tool result
 - `metadata.isError` - Whether tool failed
 
+### Memory Trace Score
+- `name` - `memory_trace_observation`
+- `value` - `observed`
+- `comment` - Short summary
+- `metadata.observationsMarkdown` - Dense observation bullets using 🔴/🟡/🟢/✅ markers
+- `metadata.currentTask` - Current task/status after the trace
+- `metadata.filesTouched` - Important files/paths
+- `metadata.toolsUsed` - Tool names used in the trace
+- `metadata.decisions` - Key decisions/rationale
+- `metadata.completed` - Finished outcomes
+- `metadata.openIssues` - Remaining issues/blockers
+
 ## Langfuse Dashboard
 
 After running, check your Langfuse project for:
@@ -102,8 +148,30 @@ After running, check your Langfuse project for:
 1. **Traces** - All pi agent runs with I/O
 2. **Sessions** - Traces grouped by session ID
 3. **Observations** - Tool calls and LLM generations
-4. **Scores** - Token counts and costs
+4. **Scores** - Evaluation metrics and trace memory observations
 5. **Model Usage** - Usage breakdown by model
+
+## Backfill Existing Sessions
+
+Use the included script to generate memory scores for older traces:
+
+```bash
+node scripts/observe-langfuse-session.mjs 2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7
+```
+
+Useful flags:
+
+```bash
+node scripts/observe-langfuse-session.mjs <session-id> --dry-run --limit 1
+node scripts/observe-langfuse-session.mjs <session-id> --force
+```
+
+The script reads the same `config.json`. Short env aliases are also supported for one-off runs:
+
+```bash
+OBSERVER_API=openai OBSERVER_BASE_URL=https://api.openai.com OBSERVER_API_KEY=... OBSERVER_MODEL=... \
+  node scripts/observe-langfuse-session.mjs <session-id>
+```
 
 ## Architecture
 
@@ -123,6 +191,11 @@ For a deep dive into the tracing model and data flow, see [docs/architecture.md]
 **Model/cost not showing?**
 - Not all providers expose cost info
 - Check Langfuse traces API for raw observation data
+
+**No memory_trace_observation score?**
+- Add `observer` config or set `PI_LANGFUSE_OBSERVER_*` environment variables
+- Reload pi after changing config
+- Check logs for observer API errors
 
 ## Dependencies
 

@@ -16,16 +16,25 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 // ============================================
 // Configuration
 // ============================================
 
+interface ObserverConfig {
+  api?: "anthropic" | "openai";
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+}
+
 interface Config {
   publicKey: string;
   secretKey: string;
   host: string;
+  observer?: ObserverConfig;
 }
 
 function loadConfig(): Config {
@@ -40,6 +49,7 @@ function loadConfig(): Config {
           publicKey: config.publicKey,
           secretKey: config.secretKey,
           host: config.host || "https://cloud.langfuse.com",
+          observer: config.observer,
         };
       }
     } catch (e) {
@@ -67,7 +77,7 @@ interface LangfuseSpan {
 
 interface LangfuseGeneration {
   id: string;
-  end(body?: { metadata?: Record<string, unknown>; usage?: unknown; output?: unknown }): void;
+  end(body?: { metadata?: Record<string, unknown>; usage?: unknown; output?: unknown; costDetails?: unknown }): void;
 }
 
 interface LangfuseClient {
@@ -76,8 +86,8 @@ interface LangfuseClient {
     update(body?: { metadata?: Record<string, unknown>; output?: unknown; input?: unknown }): void;
   };
   span(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown }): LangfuseSpan;
-  generation(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown; output?: unknown; usage?: unknown }): LangfuseGeneration;
-  score(body: { name: string; value: number; traceId?: string; observationId?: string }): void;
+  generation(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown; output?: unknown; usage?: unknown; model?: string; costDetails?: unknown }): LangfuseGeneration;
+  score(body: { id?: string; name: string; value: number | string; traceId?: string; observationId?: string; dataType?: "NUMERIC" | "BOOLEAN" | "CATEGORICAL"; comment?: string; metadata?: Record<string, unknown> }): void;
   shutdownAsync(): Promise<void>;
 }
 
@@ -112,12 +122,25 @@ interface SpanData {
   toolName: string;
 }
 
+interface TraceStep {
+  id: string;
+  type: "tool" | "generation";
+  name: string;
+  timestamp: string;
+  input?: unknown;
+  output?: unknown;
+  metadata?: Record<string, unknown>;
+  isError?: boolean;
+}
+
 let currentTrace: TraceData | null = null;
 let currentUserPrompt: string = "";
 let currentSessionId: string = "";
 let currentModel: string = "";
 let currentProvider: string = "";
+let currentCwd: string = "";
 const activeSpans: Map<string, SpanData> = new Map();
+const traceSteps: TraceStep[] = [];
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -133,6 +156,8 @@ function resetSessionState() {
   currentUserPrompt = "";
   currentModel = "";
   currentProvider = "";
+  currentCwd = "";
+  traceSteps.length = 0;
 }
 
 function computeEvaluationScores() {
@@ -147,6 +172,206 @@ function computeEvaluationScores() {
     total_tool_errors: errorCount,
     tool_success_rate: toolSuccessRate,
     session_had_errors: sessionHadErrors ? 1 : 0, // 1 for true, 0 for false
+  };
+}
+
+// ============================================
+// Trace Memory Observation
+// ============================================
+
+const MEMORY_SCORE_NAME = "memory_trace_observation";
+const MEMORY_SCORE_VERSION = "v1";
+type ObserverApi = "anthropic" | "openai";
+const configuredObserverApi = process.env.PI_LANGFUSE_OBSERVER_API || config.observer?.api || (process.env.OPENAI_API_KEY ? "openai" : "anthropic");
+const OBSERVER_API = (configuredObserverApi.toLowerCase() === "openai" ? "openai" : "anthropic") as ObserverApi;
+const OBSERVER_MODEL = process.env.PI_LANGFUSE_OBSERVER_MODEL || config.observer?.model || "";
+const OBSERVER_BASE_URL = process.env.PI_LANGFUSE_OBSERVER_BASE_URL || config.observer?.baseUrl || (OBSERVER_API === "openai" ? "https://api.openai.com" : "https://api.anthropic.com");
+const OBSERVER_API_KEY = process.env.PI_LANGFUSE_OBSERVER_API_KEY || config.observer?.apiKey || (OBSERVER_API === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || "";
+
+function observerEndpoint(): string {
+  const base = OBSERVER_BASE_URL.replace(/\/+$/, "");
+  if (OBSERVER_API === "openai") return base.endsWith("/v1") ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+  return base.endsWith("/v1") ? `${base}/messages` : `${base}/v1/messages`;
+}
+
+function deterministicUuid(input: string): string {
+  const chars = createHash("sha256").update(input).digest("hex").slice(0, 32).split("");
+  chars[12] = "4";
+  chars[16] = ((parseInt(chars[16]!, 16) & 0x3) | 0x8).toString(16);
+  const value = chars.join("");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+}
+
+function clampText(value: unknown, max: number): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, max)}\n...[truncated ${text.length - max} chars]` : text;
+}
+
+function arrayOfStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(item => String(item).trim()).filter(Boolean) : [];
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function extractJsonObject(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) return fenced[1].trim();
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) throw new Error("No JSON object in observer output");
+  return text.slice(start, end + 1);
+}
+
+function firstLine(text: string): string {
+  return text.split("\n").map(line => line.trim()).find(Boolean) || "Trace observed";
+}
+
+async function observerComplete(prompt: string): Promise<string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${OBSERVER_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+  const body = OBSERVER_API === "openai"
+    ? {
+        model: OBSERVER_MODEL,
+        temperature: 0.1,
+        max_tokens: 4000,
+        messages: [{ role: "user", content: prompt }],
+      }
+    : {
+        model: OBSERVER_MODEL,
+        max_tokens: 4000,
+        temperature: 0.1,
+        stream: false,
+        messages: [{ role: "user", content: prompt }],
+      };
+
+  if (OBSERVER_API === "anthropic") headers["anthropic-version"] = "2023-06-01";
+
+  const response = await fetch(observerEndpoint(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`Observer model ${response.status}: ${raw.slice(0, 500)}`);
+
+  const data = JSON.parse(raw);
+  const text = OBSERVER_API === "openai"
+    ? data.choices?.[0]?.message?.content
+    : (data.content || [])
+        .filter((part: { type?: string; text?: string }) => part.type === "text" && part.text)
+        .map((part: { text: string }) => part.text)
+        .join("\n");
+
+  if (!text?.trim()) throw new Error("Observer model returned no text");
+  return text.trim();
+}
+
+function buildTraceTimeline(traceId: string, output: string | undefined, steps: TraceStep[]) {
+  const lines = [
+    `Trace ${traceId}`,
+    `Session: ${currentSessionId}`,
+    `CWD: ${currentCwd}`,
+    `Model: ${currentProvider}/${currentModel}`,
+    `User: ${clampText(currentUserPrompt, 2000)}`,
+  ];
+
+  if (output) lines.push(`Final assistant output: ${clampText(output, 2000)}`);
+  lines.push("", "Steps:");
+
+  for (const step of steps) {
+    lines.push(`- ${step.timestamp} ${step.type} ${step.name}`);
+    if (step.input !== undefined) lines.push(`  input: ${clampText(step.input, 1200).replace(/\n/g, "\n  ")}`);
+    if (step.output !== undefined) lines.push(`  output: ${clampText(step.output, 1600).replace(/\n/g, "\n  ")}`);
+    if (step.isError !== undefined) lines.push(`  isError: ${step.isError}`);
+  }
+
+  return lines.join("\n");
+}
+
+async function generateTraceMemoryObservation(traceId: string, output: string | undefined, steps: TraceStep[]) {
+  if (!OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
+
+  const timeline = buildTraceTimeline(traceId, output, steps);
+  const prompt = `You are the memory consciousness of an AI coding assistant. Your observations may become the ONLY information the assistant has about this trace later.
+
+Extract dense trace-level observations from this coding-agent trace. Preserve what matters for continuing work after raw tool calls are removed.
+
+Priority markers for observationsMarkdown:
+- 🔴 High: explicit user request, unresolved goal, critical context, important decision
+- 🟡 Medium: project details, tool results, files inspected/changed, learned information
+- 🟢 Low: minor detail or uncertainty
+- ✅ Completed: concrete task/question/subtask resolved
+
+Guidelines:
+- Be specific enough for a future coding agent to act on.
+- Add 1-8 observations for the trace.
+- Use terse dense language.
+- Do not list every tool call; group repeated reads/searches/commands by purpose and outcome.
+- Preserve file paths, errors, commands, tests, and line numbers when useful.
+- Do not include suggestedResponse.
+
+Return ONLY valid JSON:
+{
+  "observationsMarkdown": "Date: Jul 17, 2026\\n* 🔴 ...",
+  "currentTask": "short current task/status after this trace",
+  "summary": "one short paragraph",
+  "filesTouched": ["path/or/file.ts"],
+  "toolsUsed": ["bash", "read", "edit"],
+  "decisions": ["decision/rationale"],
+  "completed": ["completed outcome"],
+  "openIssues": ["remaining issue/blocker"]
+}
+
+## Trace timeline
+
+${timeline}`;
+
+  const text = await observerComplete(prompt);
+
+  const parsed = JSON.parse(extractJsonObject(text));
+  const toolsUsed = unique([
+    ...arrayOfStrings(parsed.toolsUsed),
+    ...steps.filter(step => step.type === "tool").map(step => step.name.replace(/^tool:/, "")),
+  ]);
+
+  return {
+    id: deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${traceId}`),
+    name: MEMORY_SCORE_NAME,
+    value: "observed",
+    traceId,
+    dataType: "CATEGORICAL" as const,
+    comment: clampText(parsed.summary || firstLine(String(parsed.observationsMarkdown || "")), 1000),
+    metadata: {
+      version: MEMORY_SCORE_VERSION,
+      scope: "trace",
+      source: "pi-langfuse-memory",
+      observerApi: OBSERVER_API,
+      observerModel: OBSERVER_MODEL,
+      traceId,
+      sessionId: currentSessionId || null,
+      cwd: currentCwd || null,
+      pathKey: currentCwd || null,
+      model: currentModel || null,
+      provider: currentProvider || null,
+      observationsMarkdown: String(parsed.observationsMarkdown || "").trim(),
+      currentTask: String(parsed.currentTask || "").trim(),
+      summary: String(parsed.summary || "").trim(),
+      filesTouched: arrayOfStrings(parsed.filesTouched),
+      toolsUsed,
+      decisions: arrayOfStrings(parsed.decisions),
+      completed: arrayOfStrings(parsed.completed),
+      openIssues: arrayOfStrings(parsed.openIssues),
+      sourceStepIds: steps.map(step => step.id),
+      sourceStepCount: steps.length,
+      generatedAt: new Date().toISOString(),
+    },
   };
 }
 
@@ -186,6 +411,8 @@ export default async function (pi: ExtensionAPI) {
       const lf = await getClient();
       const cwd = event.systemPromptOptions?.cwd || process.cwd();
       currentUserPrompt = event.prompt;
+      currentCwd = cwd;
+      traceSteps.length = 0;
       
       // Fallback to ctx.model if not captured via model_select
       if (!currentModel && ctx.model) {
@@ -234,7 +461,7 @@ export default async function (pi: ExtensionAPI) {
       // Compute evaluation scores
       const scores = computeEvaluationScores();
       
-      currentTrace.update({ 
+      currentTrace.update?.({ 
         output: output || undefined,
         metadata: { 
           completed: true, 
@@ -255,10 +482,16 @@ export default async function (pi: ExtensionAPI) {
         lf.score({ name: "total_tool_errors", value: scores.total_tool_errors, traceId: currentTrace.id });
         lf.score({ name: "tool_success_rate", value: scores.tool_success_rate, traceId: currentTrace.id });
         lf.score({ name: "session_had_errors", value: scores.session_had_errors, traceId: currentTrace.id });
-        
-        console.log("📊 Langfuse: Evaluation scores sent:", scores);
       } catch (e) {
         console.warn("📊 Langfuse: Failed to send evaluation scores", e);
+      }
+
+      try {
+        const lf = await getClient();
+        const memoryScore = await generateTraceMemoryObservation(currentTrace.id, output, [...traceSteps]);
+        if (memoryScore) lf.score(memoryScore);
+      } catch (e) {
+        console.warn("📊 Langfuse: Failed to generate trace memory observation", e);
       }
       
       currentTrace = null;
@@ -300,6 +533,14 @@ export default async function (pi: ExtensionAPI) {
       });
       
       activeSpans.set(event.toolCallId, { span, toolName: event.toolName });
+      traceSteps.push({
+        id: event.toolCallId,
+        type: "tool",
+        name: `tool:${event.toolName}`,
+        timestamp: new Date().toISOString(),
+        input: event.input,
+        metadata: { tool: event.toolName },
+      });
     } catch (e) {
       console.warn("📊 Langfuse: Failed to create span", e);
     }
@@ -329,6 +570,12 @@ export default async function (pi: ExtensionAPI) {
         isError: event.isError,
         output: outputStr || undefined
       });
+
+      const step = traceSteps.find(step => step.id === event.toolCallId);
+      if (step) {
+        step.output = outputStr || undefined;
+        step.isError = event.isError;
+      }
       
       // Track errors and send per-tool score
       if (event.isError) {
@@ -424,6 +671,21 @@ export default async function (pi: ExtensionAPI) {
             output: usage.output || 0,
             total: usage.totalTokens || (usage.input || 0) + (usage.output || 0)
           }
+        });
+        traceSteps.push({
+          id: gen.id,
+          type: "generation",
+          name: "llm-response",
+          timestamp: new Date().toISOString(),
+          input: currentUserPrompt.slice(0, 500),
+          output: outputText.slice(0, 1000) || undefined,
+          metadata: {
+            provider,
+            model: modelId,
+            inputTokens: usage.input || 0,
+            outputTokens: usage.output || 0,
+            cachedTokens: usage.cacheRead || 0,
+          },
         });
       } catch (e) {
         console.warn("📊 Langfuse: Failed to create generation", e);
