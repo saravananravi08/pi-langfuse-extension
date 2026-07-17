@@ -41,8 +41,8 @@ Create `config.json` in the extension directory:
 
 ```json
 {
-  "publicKey": "pk-lf-xxxx",
-  "secretKey": "sk-lf-xxxx",
+  "publicKey": "YOUR_LANGFUSE_PUBLIC_KEY",
+  "secretKey": "YOUR_LANGFUSE_SECRET_KEY",
   "host": "https://cloud.langfuse.com",
   "observer": {
     "enabled": true,
@@ -61,7 +61,7 @@ Create `config.json` in the extension directory:
   "observer": {
     "api": "openai",
     "baseUrl": "https://api.openai.com",
-    "apiKey": "sk-...",
+    "apiKey": "YOUR_OBSERVER_API_KEY",
     "model": "gpt-4.1-mini"
   }
 }
