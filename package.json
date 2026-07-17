@@ -47,5 +47,12 @@
 	"license": "MIT",
 	"engines": {
 		"node": ">=18"
-	}
+	},
+	"files": [
+		"README.md",
+		"index.ts",
+		"config.example.json",
+		"docs",
+		"scripts"
+	]
 }
