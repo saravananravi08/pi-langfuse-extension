@@ -35,7 +35,7 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/saravananravi08/pi-langfuse-extension.git"
+		"url": "git+https://github.com/saravananravi08/pi-langfuse-extension.git"
 	},
 	"homepage": "https://github.com/saravananravi08/pi-langfuse-extension#readme",
 	"bugs": {
