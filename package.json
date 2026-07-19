@@ -65,6 +65,8 @@
 		"memory-cache.d.ts",
 		"memory-reflection.js",
 		"memory-reflection.d.ts",
+		"memory-audit.js",
+		"memory-audit.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",

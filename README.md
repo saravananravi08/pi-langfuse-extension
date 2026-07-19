@@ -200,9 +200,15 @@ node scripts/observe-langfuse-session.mjs 2026-07-17T05-14-22-976Z_019f6e7f-477f
 Useful flags:
 
 ```bash
+node scripts/observe-langfuse-session.mjs <session-id> --audit
+node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill --dry-run
+node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill
+node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill --include-pre-coverage
 node scripts/observe-langfuse-session.mjs <session-id> --dry-run --limit 1
 node scripts/observe-langfuse-session.mjs <session-id> --force
 ```
+
+`--audit` is read-only. It reports observed traces, gaps after observation coverage began, historical pre-coverage traces, incomplete/skipped traces, duplicates, deterministic-ID mismatches, prompt versions, and path totals. `--backfill` writes only eligible gaps; add `--include-pre-coverage` to include older historical traces.
 
 Create or inspect the next session reflection:
 

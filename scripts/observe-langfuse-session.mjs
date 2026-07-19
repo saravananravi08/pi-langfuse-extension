@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import crypto from 'node:crypto';
 import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory-prompts.js';
 import { validateMemoryOutput } from '../memory-validation.js';
+import { auditObservationCoverage } from '../memory-audit.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
@@ -20,6 +21,9 @@ const args = parseArgs(process.argv.slice(2));
 const sessionId = normalizeSessionId(args.session || args._[0] || DEFAULT_SESSION_ID);
 const dryRun = Boolean(args['dry-run']);
 const force = Boolean(args.force);
+const backfill = Boolean(args.backfill);
+const includePreCoverage = Boolean(args['include-pre-coverage']);
+const auditMode = Boolean(args.audit) || backfill;
 const limit = args.limit ? Number(args.limit) : Infinity;
 
 if (!sessionId) fail('Missing session id');
@@ -30,19 +34,37 @@ OBSERVER_ENABLED = process.env.OBSERVER_ENABLED === 'false' || process.env.PI_LA
 OBSERVER_MODEL = process.env.OBSERVER_MODEL || process.env.PI_LANGFUSE_OBSERVER_MODEL || langfuse.observer?.model || '';
 OBSERVER_BASE_URL = process.env.OBSERVER_BASE_URL || process.env.PI_LANGFUSE_OBSERVER_BASE_URL || langfuse.observer?.baseUrl || (OBSERVER_API === 'openai' ? 'https://api.openai.com' : 'https://api.anthropic.com');
 OBSERVER_API_KEY = process.env.OBSERVER_API_KEY || process.env.PI_LANGFUSE_OBSERVER_API_KEY || langfuse.observer?.apiKey || (OBSERVER_API === 'openai' ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || '';
-if (!OBSERVER_ENABLED) fail('Observer disabled. Set observer.enabled=true or remove observer.enabled=false.');
-if (!OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
-if (!OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
+if ((!auditMode || backfill) && !OBSERVER_ENABLED) fail('Observer disabled. Set observer.enabled=true or remove observer.enabled=false.');
+if ((!auditMode || backfill) && !OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
+if ((!auditMode || backfill) && !OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
 
 const langfuseAuth = `Basic ${Buffer.from(`${langfuse.publicKey}:${langfuse.secretKey}`).toString('base64')}`;
 
 console.log(`session=${sessionId}`);
 console.log(`observerApi=${OBSERVER_API}`);
 console.log(`model=${OBSERVER_MODEL}`);
-console.log(`dryRun=${dryRun} force=${force}`);
+console.log(`dryRun=${dryRun} force=${force} audit=${auditMode} backfill=${backfill} includePreCoverage=${includePreCoverage}`);
 
-const traces = await fetchAllTraces(sessionId);
+let traces = await fetchAllTraces(sessionId);
 console.log(`traces=${traces.length}`);
+
+if (auditMode) {
+  const traceIds = new Set(traces.map(trace => trace.id));
+  const observationScores = (await fetchScoresByName(SCORE_NAME)).filter(score => traceIds.has(score.traceId || score.metadata?.traceId));
+  const audit = auditObservationCoverage(traces, observationScores, {
+    scoreName: SCORE_NAME,
+    version: VERSION,
+    expectedScoreId: traceId => deterministicUuid(`${SCORE_NAME}:${VERSION}:${traceId}`),
+  });
+  console.log(JSON.stringify({ sessionId, ...audit }, null, 2));
+  if (!backfill) process.exit(0);
+  const missing = new Set([
+    ...audit.eligibleMissingTraceIds,
+    ...(includePreCoverage ? audit.preCoverageTraceIds : []),
+  ]);
+  traces = traces.filter(trace => missing.has(trace.id));
+  console.log(`backfillEligible=${traces.length}`);
+}
 
 let processed = 0;
 let skipped = 0;
@@ -93,7 +115,7 @@ function parseArgs(argv) {
       out[k] = v.join('=');
     } else {
       const k = a.slice(2);
-      if (['dry-run', 'force'].includes(k)) out[k] = true;
+      if (['dry-run', 'force', 'audit', 'backfill', 'include-pre-coverage'].includes(k)) out[k] = true;
       else out[k] = argv[++i];
     }
   }
@@ -127,6 +149,17 @@ async function fetchAllTraces(sessionId) {
     if (!res.meta || page >= res.meta.totalPages) break;
   }
   return all.filter(t => t.name !== 'memory:session-state');
+}
+
+async function fetchScoresByName(name) {
+  const scores = [];
+  for (let page = 1; ; page++) {
+    const params = new URLSearchParams({ name, dataType: 'CATEGORICAL', page: String(page), limit: '100' });
+    const response = await lfGet(`/api/public/v2/scores?${params}`);
+    scores.push(...(response.data || []));
+    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
+  }
+  return scores;
 }
 
 async function fetchAllObservations(traceId) {
