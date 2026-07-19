@@ -62,10 +62,10 @@ const coveredUntil = metadataString(previous, 'coveredUntil');
 let newObservations = coveredUntil ? observations.filter(score => generatedAt(score) > coveredUntil) : observations;
 if (Number.isFinite(limit)) newObservations = newObservations.slice(0, limit);
 
-const previousMarkdown = metadataString(previous, 'reflectionMarkdown');
-const newMarkdown = newObservations.map(score => metadataString(score, 'observationsMarkdown')).join('\n\n');
-const activeTokens = estimateTokens(`${previousMarkdown}\n\n${newMarkdown}`);
-const newObservationTokens = estimateTokens(newMarkdown);
+const previousPayload = JSON.stringify(reflectionFields(previous), null, 2);
+const newObservationPayload = JSON.stringify(newObservations.map(observationFields), null, 2);
+const activeTokens = estimateTokens(`${previousPayload}\n\n${newObservationPayload}`);
+const newObservationTokens = estimateTokens(newObservationPayload);
 const thresholdMet = newObservations.length > 0
   && activeTokens >= thresholdTokens
   && newObservationTokens >= minNewObservationTokens
@@ -146,6 +146,55 @@ function metadataStrings(score, key) {
 
 function generatedAt(score) {
   return metadataString(score, 'generatedAt') || score.createdAt || '';
+}
+
+function reflectionFields(score) {
+  return score ? {
+    reflectionMarkdown: metadataString(score, 'reflectionMarkdown'),
+    summary: metadataString(score, 'summary'),
+    goal: metadataStrings(score, 'goal'),
+    constraints: metadataStrings(score, 'constraints'),
+    currentTask: metadataString(score, 'currentTask'),
+    taskStatus: metadataString(score, 'taskStatus'),
+    completed: metadataStrings(score, 'completed'),
+    inProgress: metadataStrings(score, 'inProgress'),
+    openIssues: metadataStrings(score, 'openIssues'),
+    decisions: metadataStrings(score, 'decisions'),
+    nextSteps: metadataStrings(score, 'nextSteps'),
+    criticalContext: metadataStrings(score, 'criticalContext'),
+    filesRead: metadataStrings(score, 'filesRead'),
+    filesModified: metadataStrings(score, 'filesModified'),
+    filesCreated: metadataStrings(score, 'filesCreated'),
+    filesDeleted: metadataStrings(score, 'filesDeleted'),
+    filesTouched: metadataStrings(score, 'filesTouched'),
+    toolsUsed: metadataStrings(score, 'toolsUsed'),
+  } : null;
+}
+
+function observationFields(score) {
+  return {
+    scoreId: score.id,
+    traceId: score.traceId || metadataString(score, 'traceId'),
+    generatedAt: generatedAt(score),
+    observationsMarkdown: metadataString(score, 'observationsMarkdown'),
+    summary: metadataString(score, 'summary'),
+    goal: metadataStrings(score, 'goal'),
+    constraints: metadataStrings(score, 'constraints'),
+    currentTask: metadataString(score, 'currentTask'),
+    taskStatus: metadataString(score, 'taskStatus'),
+    completed: metadataStrings(score, 'completed'),
+    inProgress: metadataStrings(score, 'inProgress'),
+    openIssues: metadataStrings(score, 'openIssues'),
+    decisions: metadataStrings(score, 'decisions'),
+    nextSteps: metadataStrings(score, 'nextSteps'),
+    criticalContext: metadataStrings(score, 'criticalContext'),
+    filesRead: metadataStrings(score, 'filesRead'),
+    filesModified: metadataStrings(score, 'filesModified'),
+    filesCreated: metadataStrings(score, 'filesCreated'),
+    filesDeleted: metadataStrings(score, 'filesDeleted'),
+    filesTouched: metadataStrings(score, 'filesTouched'),
+    toolsUsed: metadataStrings(score, 'toolsUsed'),
+  };
 }
 
 function latestReflection(scores) {
@@ -247,50 +296,9 @@ async function complete(system, user) {
 class MemoryOutputValidationError extends Error {}
 
 async function generateReflection(previous, scores, scope) {
-  const previousFields = previous ? {
-    reflectionMarkdown: metadataString(previous, 'reflectionMarkdown'),
-    summary: metadataString(previous, 'summary'),
-    goal: metadataStrings(previous, 'goal'),
-    constraints: metadataStrings(previous, 'constraints'),
-    currentTask: metadataString(previous, 'currentTask'),
-    taskStatus: metadataString(previous, 'taskStatus'),
-    completed: metadataStrings(previous, 'completed'),
-    inProgress: metadataStrings(previous, 'inProgress'),
-    openIssues: metadataStrings(previous, 'openIssues'),
-    decisions: metadataStrings(previous, 'decisions'),
-    nextSteps: metadataStrings(previous, 'nextSteps'),
-    criticalContext: metadataStrings(previous, 'criticalContext'),
-    filesRead: metadataStrings(previous, 'filesRead'),
-    filesModified: metadataStrings(previous, 'filesModified'),
-    filesCreated: metadataStrings(previous, 'filesCreated'),
-    filesDeleted: metadataStrings(previous, 'filesDeleted'),
-    filesTouched: metadataStrings(previous, 'filesTouched'),
-    toolsUsed: metadataStrings(previous, 'toolsUsed'),
-  } : null;
-  const observationFields = scores.map(score => ({
-    scoreId: score.id,
-    traceId: score.traceId || metadataString(score, 'traceId'),
-    generatedAt: generatedAt(score),
-    observationsMarkdown: metadataString(score, 'observationsMarkdown'),
-    summary: metadataString(score, 'summary'),
-    goal: metadataStrings(score, 'goal'),
-    constraints: metadataStrings(score, 'constraints'),
-    currentTask: metadataString(score, 'currentTask'),
-    taskStatus: metadataString(score, 'taskStatus'),
-    completed: metadataStrings(score, 'completed'),
-    inProgress: metadataStrings(score, 'inProgress'),
-    openIssues: metadataStrings(score, 'openIssues'),
-    decisions: metadataStrings(score, 'decisions'),
-    nextSteps: metadataStrings(score, 'nextSteps'),
-    criticalContext: metadataStrings(score, 'criticalContext'),
-    filesRead: metadataStrings(score, 'filesRead'),
-    filesModified: metadataStrings(score, 'filesModified'),
-    filesCreated: metadataStrings(score, 'filesCreated'),
-    filesDeleted: metadataStrings(score, 'filesDeleted'),
-    filesTouched: metadataStrings(score, 'filesTouched'),
-    toolsUsed: metadataStrings(score, 'toolsUsed'),
-  }));
-  const inputTokens = estimateTokens(`${metadataString(previous, 'reflectionMarkdown')}\n\n${scores.map(score => metadataString(score, 'observationsMarkdown')).join('\n\n')}`);
+  const previousFields = reflectionFields(previous);
+  const newObservationFields = scores.map(observationFields);
+  const inputTokens = estimateTokens(`${JSON.stringify(previousFields, null, 2)}\n\n${JSON.stringify(newObservationFields, null, 2)}`);
   const targetTokens = Math.max(2_000, Math.min(8_000, Math.floor(inputTokens * 0.5)));
   const user = `Consolidate the delimited memory into one updated coding checkpoint.
 
@@ -299,7 +307,7 @@ ${JSON.stringify(previousFields, null, 2)}
 </previous-reflection>
 
 <new-observations>
-${JSON.stringify(observationFields, null, 2)}
+${JSON.stringify(newObservationFields, null, 2)}
 </new-observations>
 
 Return ONLY valid JSON:
@@ -382,12 +390,12 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
     decisions: arrayOfStrings(parsed.decisions),
     nextSteps: arrayOfStrings(parsed.nextSteps),
     criticalContext: arrayOfStrings(parsed.criticalContext),
-    filesRead: unique([...metadataStrings(previous, 'filesRead'), ...observationFields.flatMap(item => item.filesRead), ...arrayOfStrings(parsed.filesRead)]),
-    filesModified: unique([...metadataStrings(previous, 'filesModified'), ...observationFields.flatMap(item => item.filesModified), ...arrayOfStrings(parsed.filesModified)]),
-    filesCreated: unique([...metadataStrings(previous, 'filesCreated'), ...observationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(parsed.filesCreated)]),
-    filesDeleted: unique([...metadataStrings(previous, 'filesDeleted'), ...observationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(parsed.filesDeleted)]),
-    filesTouched: unique([...metadataStrings(previous, 'filesTouched'), ...observationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
-    toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...observationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
+    filesRead: unique([...metadataStrings(previous, 'filesRead'), ...newObservationFields.flatMap(item => item.filesRead), ...arrayOfStrings(parsed.filesRead)]),
+    filesModified: unique([...metadataStrings(previous, 'filesModified'), ...newObservationFields.flatMap(item => item.filesModified), ...arrayOfStrings(parsed.filesModified)]),
+    filesCreated: unique([...metadataStrings(previous, 'filesCreated'), ...newObservationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(parsed.filesCreated)]),
+    filesDeleted: unique([...metadataStrings(previous, 'filesDeleted'), ...newObservationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(parsed.filesDeleted)]),
+    filesTouched: unique([...metadataStrings(previous, 'filesTouched'), ...newObservationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
+    toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
     inputTokensEstimated: inputTokens,
     outputTokensEstimated: estimateTokens(parsed.reflectionMarkdown),
     compressionRatio: Number((estimateTokens(parsed.reflectionMarkdown) / inputTokens).toFixed(3)),
