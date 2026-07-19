@@ -97,6 +97,8 @@ Observer and reflector system prompts are centralized in [`memory-prompts.js`](.
 
 The `langfuse_memory_lookup` tool searches observations and reflections. It defaults to the current session and cwd, supports exact trace/score IDs and broader path/all scopes, caches score reads for five minutes, returns score/trace provenance, redacts secret-like values, and can include bounded source details for up to two traces.
 
+Model-visible history replacement is disabled by default. Use `/memory-context on` to replace older model context with the latest scoped reflection, uncovered observations, and the two most recent complete user turns. Use `/memory-context off` to restore full Pi context or `/memory-context status` to inspect the session setting. The setting persists in the Pi session; stored history is never deleted.
+
 For npm install, find the extension at:
 ```
 ~/.pi/agent/npm/@ravan08/pi-langfuse/index.ts

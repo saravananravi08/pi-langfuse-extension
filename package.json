@@ -70,6 +70,8 @@
 		"memory-audit.d.ts",
 		"memory-lookup.js",
 		"memory-lookup.d.ts",
+		"memory-context.js",
+		"memory-context.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",

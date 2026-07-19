@@ -31,6 +31,7 @@ import { validateMemoryOutput } from "./memory-validation.js";
 import { createMemoryCache } from "./memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
+import { buildMemoryContextText, replaceWithMemoryContext } from "./memory-context.js";
 import {
   buildActiveMemory,
   estimateTokens,
@@ -210,6 +211,8 @@ const memoryQueues = new Map<string, Promise<void>>();
 const sessionMemoryCache = createMemoryCache(300_000);
 let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
 const lookupTraceCache = new Map<string, { value: Record<string, unknown>; loadedAt: number }>();
+let memoryContextEnabled = false;
+let lastMemoryContextErrorAt = 0;
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -973,6 +976,33 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
   return scores;
 }
 
+function buildContextMemoryPayload(scores: MemoryScore[], sessionId: string, pathKey: string) {
+  const memory = buildActiveMemory(
+    scores.filter(score => score.name === MEMORY_SCORE_NAME),
+    scores.filter(score => score.name === REFLECTION_SCORE_NAME),
+    sessionId,
+    pathKey,
+    MEMORY_SCORE_VERSION,
+  );
+  return {
+    reflection: memory.latestReflection ? {
+      scoreId: memory.latestReflection.id,
+      generation: memory.latestReflection.metadata?.generation || null,
+      generatedAt: generatedAt(memory.latestReflection),
+      coveredUntil: metadataString(memory.latestReflection, "coveredUntil") || null,
+      sourceObservationScoreIds: metadataStrings(memory.latestReflection, "sourceObservationScoreIds"),
+      sourceTraceIds: metadataStrings(memory.latestReflection, "sourceTraceIds"),
+      fields: reflectionFields(memory.latestReflection),
+    } : undefined,
+    observations: memory.newObservations.map(score => ({
+      scoreId: score.id,
+      traceId: score.traceId || metadataString(score, "traceId") || null,
+      generatedAt: generatedAt(score),
+      fields: observationFields(score),
+    })),
+  };
+}
+
 function boundedLookupValue(value: unknown, max: number): string {
   return clampText(redactSecrets(value), max);
 }
@@ -1038,6 +1068,29 @@ export default async function (pi: ExtensionAPI) {
 
   console.log("📊 Langfuse: Tracing enabled →", config.host);
 
+  pi.registerCommand("memory-context", {
+    description: "Toggle Langfuse memory-based context replacement",
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase();
+      if (action === "status") {
+        ctx.ui.notify(`Langfuse memory context replacement is ${memoryContextEnabled ? "on" : "off"}.`, "info");
+        return;
+      }
+      if (action && action !== "on" && action !== "off") {
+        ctx.ui.notify("Usage: /memory-context [on|off|status]", "warning");
+        return;
+      }
+      memoryContextEnabled = action === "on" || (action === "" && !memoryContextEnabled);
+      pi.appendEntry("langfuse-memory-context-state", { enabled: memoryContextEnabled });
+      ctx.ui.notify(
+        memoryContextEnabled
+          ? "Langfuse memory context replacement enabled. Latest memory plus two recent user turns will be sent to the model."
+          : "Langfuse memory context replacement disabled. Full Pi context will be sent to the model.",
+        "info",
+      );
+    },
+  });
+
   pi.registerTool({
     name: "langfuse_memory_lookup",
     label: "Langfuse Memory Lookup",
@@ -1097,6 +1150,7 @@ export default async function (pi: ExtensionAPI) {
 
   // Capture session ID on session start
   pi.on("session_start", async (_event, ctx) => {
+    currentSessionId = "";
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (sessionFile) {
       // Extract session ID from file path (format: 2026-04-25T13-23-54-756Z_<uuid>.jsonl)
@@ -1105,6 +1159,29 @@ export default async function (pi: ExtensionAPI) {
     }
     // Reset state for new session
     resetSessionState();
+    memoryContextEnabled = false;
+    lastMemoryContextErrorAt = 0;
+    for (const entry of ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: { enabled?: boolean } }>) {
+      if (entry.type === "custom" && entry.customType === "langfuse-memory-context-state") {
+        memoryContextEnabled = entry.data?.enabled === true;
+      }
+    }
+  });
+
+  pi.on("context", async (event, ctx) => {
+    if (!memoryContextEnabled || !currentSessionId) return;
+    try {
+      const scores = await getLookupScores(false, ctx.signal);
+      const memoryText = buildMemoryContextText(buildContextMemoryPayload(scores, currentSessionId, ctx.cwd));
+      if (!memoryText) return;
+      return { messages: replaceWithMemoryContext(event.messages, memoryText, 2) };
+    } catch (error) {
+      if (Date.now() - lastMemoryContextErrorAt > 60_000) {
+        console.warn("📊 Langfuse: Memory context replacement skipped", error);
+        lastMemoryContextErrorAt = Date.now();
+      }
+      return;
+    }
   });
 
   // Capture model info on model select
