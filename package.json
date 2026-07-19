@@ -59,6 +59,8 @@
 		"memory-prompts.d.ts",
 		"memory-validation.js",
 		"memory-validation.d.ts",
+		"memory-state.js",
+		"memory-state.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",

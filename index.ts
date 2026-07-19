@@ -27,6 +27,16 @@ import {
   REQUIRED_REFLECTION_HEADINGS,
 } from "./memory-prompts.js";
 import { validateMemoryOutput } from "./memory-validation.js";
+import {
+  buildActiveMemory,
+  estimateTokens,
+  generatedAt,
+  metadataString,
+  metadataStrings,
+  observationFields,
+  reflectionFields,
+  reflectionThresholdMet,
+} from "./memory-state.js";
 
 // ============================================
 // Configuration
@@ -620,87 +630,8 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
   };
 }
 
-function estimateTokens(value: unknown): number {
-  return Math.ceil(clampText(value, Number.MAX_SAFE_INTEGER).length / 4);
-}
-
-function metadataString(score: MemoryScore | undefined, key: string): string {
-  const value = score?.metadata?.[key];
-  return typeof value === "string" ? value : "";
-}
-
-function metadataStrings(score: MemoryScore | undefined, key: string): string[] {
-  return arrayOfStrings(score?.metadata?.[key]);
-}
-
-function generatedAt(score: MemoryScore): string {
-  return metadataString(score, "generatedAt") || score.createdAt || "";
-}
-
-function reflectionFields(score: MemoryScore | undefined) {
-  return score ? {
-    reflectionMarkdown: metadataString(score, "reflectionMarkdown"),
-    summary: metadataString(score, "summary"),
-    goal: metadataStrings(score, "goal"),
-    constraints: metadataStrings(score, "constraints"),
-    currentTask: metadataString(score, "currentTask"),
-    taskStatus: metadataString(score, "taskStatus"),
-    completed: metadataStrings(score, "completed"),
-    inProgress: metadataStrings(score, "inProgress"),
-    openIssues: metadataStrings(score, "openIssues"),
-    decisions: metadataStrings(score, "decisions"),
-    nextSteps: metadataStrings(score, "nextSteps"),
-    criticalContext: metadataStrings(score, "criticalContext"),
-    filesRead: metadataStrings(score, "filesRead"),
-    filesModified: metadataStrings(score, "filesModified"),
-    filesCreated: metadataStrings(score, "filesCreated"),
-    filesDeleted: metadataStrings(score, "filesDeleted"),
-    filesTouched: metadataStrings(score, "filesTouched"),
-    toolsUsed: metadataStrings(score, "toolsUsed"),
-  } : null;
-}
-
-function observationFields(score: MemoryScore) {
-  return {
-    scoreId: score.id,
-    traceId: score.traceId || metadataString(score, "traceId"),
-    generatedAt: generatedAt(score),
-    observationsMarkdown: metadataString(score, "observationsMarkdown"),
-    summary: metadataString(score, "summary"),
-    goal: metadataStrings(score, "goal"),
-    constraints: metadataStrings(score, "constraints"),
-    currentTask: metadataString(score, "currentTask"),
-    taskStatus: metadataString(score, "taskStatus"),
-    completed: metadataStrings(score, "completed"),
-    inProgress: metadataStrings(score, "inProgress"),
-    openIssues: metadataStrings(score, "openIssues"),
-    decisions: metadataStrings(score, "decisions"),
-    nextSteps: metadataStrings(score, "nextSteps"),
-    criticalContext: metadataStrings(score, "criticalContext"),
-    filesRead: metadataStrings(score, "filesRead"),
-    filesModified: metadataStrings(score, "filesModified"),
-    filesCreated: metadataStrings(score, "filesCreated"),
-    filesDeleted: metadataStrings(score, "filesDeleted"),
-    filesTouched: metadataStrings(score, "filesTouched"),
-    toolsUsed: metadataStrings(score, "toolsUsed"),
-  };
-}
-
 function memoryScopeKey(sessionId: string, pathKey: string): string {
   return `${sessionId}:${pathKey}`;
-}
-
-function sameMemoryScope(score: MemoryScore, sessionId: string, pathKey: string): boolean {
-  return metadataString(score, "version") === MEMORY_SCORE_VERSION
-    && metadataString(score, "sessionId") === sessionId
-    && (!pathKey || metadataString(score, "pathKey") === pathKey);
-}
-
-function latestReflection(scores: MemoryScore[]): MemoryScore | undefined {
-  return [...scores].sort((a, b) => {
-    const generationDiff = Number(b.metadata?.generation || 0) - Number(a.metadata?.generation || 0);
-    return generationDiff || generatedAt(b).localeCompare(generatedAt(a));
-  })[0];
 }
 
 let langfuseRequestQueue = Promise.resolve();
@@ -798,29 +729,13 @@ async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservatio
   const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
   const cachedObservations = [...(recentObservations.get(scopeKey)?.values() || [])];
   const cachedReflection = recentReflections.get(scopeKey);
-  const scopedObservations = [...observations, ...cachedObservations, currentObservation]
-    .filter((score, index, all) => all.findIndex(item => item.id === score.id) === index)
-    .filter(score => sameMemoryScope(score, snapshot.sessionId, snapshot.cwd))
-    .sort((a, b) => generatedAt(a).localeCompare(generatedAt(b)));
-  const scopedReflections = [...reflections, ...(cachedReflection ? [cachedReflection] : [])]
-    .filter((score, index, all) => all.findIndex(item => item.id === score.id) === index)
-    .filter(score => sameMemoryScope(score, snapshot.sessionId, snapshot.cwd));
-  const latest = latestReflection(scopedReflections);
-  const coveredUntil = metadataString(latest, "coveredUntil");
-  const newObservations = coveredUntil
-    ? scopedObservations.filter(score => generatedAt(score) > coveredUntil)
-    : scopedObservations;
-  const previousFields = reflectionFields(latest);
-  const newObservationFields = newObservations.map(observationFields);
-  const previousPayload = JSON.stringify(previousFields, null, 2);
-  const newObservationPayload = JSON.stringify(newObservationFields, null, 2);
-
-  return {
-    latestReflection: latest,
-    newObservations,
-    activeTokens: estimateTokens(`${previousPayload}\n\n${newObservationPayload}`),
-    newObservationTokens: estimateTokens(newObservationPayload),
-  };
+  return buildActiveMemory(
+    [...observations, ...cachedObservations, currentObservation],
+    [...reflections, ...(cachedReflection ? [cachedReflection] : [])],
+    snapshot.sessionId,
+    snapshot.cwd,
+    MEMORY_SCORE_VERSION,
+  );
 }
 
 async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSessionMemory): Promise<void> {
@@ -967,10 +882,11 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
 async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<void> {
   if (!REFLECTION_ENABLED || !snapshot.sessionId) return;
   const memory = await getActiveSessionMemory(snapshot, currentObservation);
-  if (!memory.newObservations.length
-    || memory.activeTokens < REFLECTION_THRESHOLD_TOKENS
-    || memory.newObservationTokens < REFLECTION_MIN_NEW_TOKENS
-    || memory.newObservations.length < REFLECTION_MIN_NEW_OBSERVATIONS) return;
+  if (!reflectionThresholdMet(memory, {
+    activeTokens: REFLECTION_THRESHOLD_TOKENS,
+    newObservationTokens: REFLECTION_MIN_NEW_TOKENS,
+    newObservations: REFLECTION_MIN_NEW_OBSERVATIONS,
+  })) return;
   await writeSessionReflection(snapshot, memory);
 }
 

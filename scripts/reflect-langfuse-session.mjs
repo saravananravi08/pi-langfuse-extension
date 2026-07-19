@@ -10,6 +10,16 @@ import {
   REQUIRED_REFLECTION_HEADINGS,
 } from '../memory-prompts.js';
 import { validateMemoryOutput } from '../memory-validation.js';
+import {
+  estimateTokens,
+  generatedAt,
+  latestReflection,
+  metadataString,
+  metadataStrings,
+  observationFields,
+  reflectionFields,
+  reflectionThresholdMet,
+} from '../memory-state.js';
 
 const OBSERVATION_SCORE_NAME = 'memory_trace_observation';
 const REFLECTION_SCORE_NAME = 'memory_session_reflection';
@@ -67,11 +77,12 @@ if (Number.isFinite(limit)) newObservations = newObservations.slice(0, limit);
 const previousPayload = JSON.stringify(reflectionFields(previous), null, 2);
 const newObservationPayload = JSON.stringify(newObservations.map(observationFields), null, 2);
 const activeTokens = estimateTokens(`${previousPayload}\n\n${newObservationPayload}`);
-const newObservationTokens = estimateTokens(newObservationPayload);
-const thresholdMet = newObservations.length > 0
-  && activeTokens >= thresholdTokens
-  && newObservationTokens >= minNewObservationTokens
-  && newObservations.length >= minNewObservations;
+const newObservationTokens = newObservations.length ? estimateTokens(newObservationPayload) : 0;
+const thresholdMet = reflectionThresholdMet({ newObservations, activeTokens, newObservationTokens }, {
+  activeTokens: thresholdTokens,
+  newObservationTokens: minNewObservationTokens,
+  newObservations: minNewObservations,
+});
 
 console.log(JSON.stringify({
   sessionId,
@@ -136,78 +147,6 @@ function loadConfig() {
   const value = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   if (!value.publicKey || !value.secretKey) fail('Langfuse config missing publicKey/secretKey.');
   return { ...value, host: value.host || 'https://cloud.langfuse.com' };
-}
-
-function metadataString(score, key) {
-  return typeof score?.metadata?.[key] === 'string' ? score.metadata[key] : '';
-}
-
-function metadataStrings(score, key) {
-  return arrayOfStrings(score?.metadata?.[key]);
-}
-
-function generatedAt(score) {
-  return metadataString(score, 'generatedAt') || score.createdAt || '';
-}
-
-function reflectionFields(score) {
-  return score ? {
-    reflectionMarkdown: metadataString(score, 'reflectionMarkdown'),
-    summary: metadataString(score, 'summary'),
-    goal: metadataStrings(score, 'goal'),
-    constraints: metadataStrings(score, 'constraints'),
-    currentTask: metadataString(score, 'currentTask'),
-    taskStatus: metadataString(score, 'taskStatus'),
-    completed: metadataStrings(score, 'completed'),
-    inProgress: metadataStrings(score, 'inProgress'),
-    openIssues: metadataStrings(score, 'openIssues'),
-    decisions: metadataStrings(score, 'decisions'),
-    nextSteps: metadataStrings(score, 'nextSteps'),
-    criticalContext: metadataStrings(score, 'criticalContext'),
-    filesRead: metadataStrings(score, 'filesRead'),
-    filesModified: metadataStrings(score, 'filesModified'),
-    filesCreated: metadataStrings(score, 'filesCreated'),
-    filesDeleted: metadataStrings(score, 'filesDeleted'),
-    filesTouched: metadataStrings(score, 'filesTouched'),
-    toolsUsed: metadataStrings(score, 'toolsUsed'),
-  } : null;
-}
-
-function observationFields(score) {
-  return {
-    scoreId: score.id,
-    traceId: score.traceId || metadataString(score, 'traceId'),
-    generatedAt: generatedAt(score),
-    observationsMarkdown: metadataString(score, 'observationsMarkdown'),
-    summary: metadataString(score, 'summary'),
-    goal: metadataStrings(score, 'goal'),
-    constraints: metadataStrings(score, 'constraints'),
-    currentTask: metadataString(score, 'currentTask'),
-    taskStatus: metadataString(score, 'taskStatus'),
-    completed: metadataStrings(score, 'completed'),
-    inProgress: metadataStrings(score, 'inProgress'),
-    openIssues: metadataStrings(score, 'openIssues'),
-    decisions: metadataStrings(score, 'decisions'),
-    nextSteps: metadataStrings(score, 'nextSteps'),
-    criticalContext: metadataStrings(score, 'criticalContext'),
-    filesRead: metadataStrings(score, 'filesRead'),
-    filesModified: metadataStrings(score, 'filesModified'),
-    filesCreated: metadataStrings(score, 'filesCreated'),
-    filesDeleted: metadataStrings(score, 'filesDeleted'),
-    filesTouched: metadataStrings(score, 'filesTouched'),
-    toolsUsed: metadataStrings(score, 'toolsUsed'),
-  };
-}
-
-function latestReflection(scores) {
-  return [...scores].sort((a, b) => {
-    const generationDiff = Number(b.metadata?.generation || 0) - Number(a.metadata?.generation || 0);
-    return generationDiff || generatedAt(b).localeCompare(generatedAt(a));
-  })[0];
-}
-
-function estimateTokens(value) {
-  return Math.ceil(String(value || '').length / 4);
 }
 
 async function fetchScoreIdsForSession(id) {
