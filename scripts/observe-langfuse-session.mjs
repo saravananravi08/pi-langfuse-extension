@@ -130,12 +130,18 @@ async function fetchAllTraces(sessionId) {
 
 async function fetchAllObservations(traceId) {
   const all = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ traceId, page: String(page), limit: '100' });
-    const res = await lfGet(`/api/public/observations?${params}`);
+  let cursor;
+  do {
+    const params = new URLSearchParams({
+      traceId,
+      limit: '1000',
+      fields: 'core,basic,time,io,metadata,model,usage',
+    });
+    if (cursor) params.set('cursor', cursor);
+    const res = await lfGet(`/api/public/v2/observations?${params}`);
     all.push(...(res.data || []));
-    if (!res.meta || page >= res.meta.totalPages) break;
-  }
+    cursor = res.meta?.cursor;
+  } while (cursor);
   return all.sort((a, b) => String(a.startTime || '').localeCompare(String(b.startTime || '')));
 }
 
@@ -294,9 +300,9 @@ async function fetchTextWithRetry(url, options, label, attempts = 5) {
     const text = await res.text();
     lastText = text;
     if (res.ok) return text;
-    if ((res.status === 429 || res.status >= 500) && attempt < attempts) {
+    if ((res.status === 408 || res.status === 429 || res.status >= 500) && attempt < attempts) {
       const retryAfter = Number(res.headers.get('retry-after')) || parseRetryAfter(text) || attempt * 2;
-      await sleep(Math.min(retryAfter, 30) * 1000);
+      await sleep(retryAfter * 1000);
       continue;
     }
     throw new Error(`${label} ${res.status}: ${text.slice(0, 1000)}`);

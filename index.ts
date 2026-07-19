@@ -703,11 +703,56 @@ function latestReflection(scores: MemoryScore[]): MemoryScore | undefined {
   })[0];
 }
 
+let langfuseRequestQueue = Promise.resolve();
+
+function langfuseRetryAfterMs(response: Response, raw: string, attempt: number): number {
+  const header = response.headers.get("retry-after");
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  if (header) {
+    const date = Date.parse(header);
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+  try {
+    const bodySeconds = Number(JSON.parse(raw)?.details?.retryAfterSeconds);
+    if (Number.isFinite(bodySeconds) && bodySeconds > 0) return bodySeconds * 1000;
+  } catch {}
+  return Math.min(2 ** (attempt - 1) * 1000, 10_000);
+}
+
+async function langfuseRequest(path: string, init: RequestInit = {}): Promise<{ response: Response; raw: string }> {
+  const request = langfuseRequestQueue.catch(() => undefined).then(async () => {
+    const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      let response: Response;
+      try {
+        response = await fetch(`${config.host}${path}`, {
+          ...init,
+          headers: { Authorization: `Basic ${auth}`, ...init.headers },
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt < 5) {
+          await sleep(Math.min(2 ** (attempt - 1) * 1000, 10_000));
+          continue;
+        }
+        break;
+      }
+      const raw = await response.text();
+      if (response.ok) return { response, raw };
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      if (!retryable || attempt === 5) throw new Error(`Langfuse ${init.method || "GET"} ${response.status}: ${raw.slice(0, 500)}`);
+      await sleep(langfuseRetryAfterMs(response, raw, attempt));
+    }
+    throw new Error(`Langfuse ${init.method || "GET"} failed after 5 attempts`, { cause: lastError });
+  });
+  langfuseRequestQueue = request.then(() => undefined, () => undefined);
+  return request;
+}
+
 async function langfuseGet(path: string): Promise<Record<string, unknown>> {
-  const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
-  const response = await fetch(`${config.host}${path}`, { headers: { Authorization: `Basic ${auth}` } });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Langfuse GET ${response.status}: ${raw.slice(0, 500)}`);
+  const { raw } = await langfuseRequest(path);
   return raw ? JSON.parse(raw) : {};
 }
 
@@ -918,7 +963,6 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
       if (generatedAt(observation) <= coveredUntil) cachedObservations.delete(id);
     }
   }
-  console.log(`📊 Langfuse: Created session reflection generation ${generation} covering ${sourceObservationScoreIds.length} observations`);
 }
 
 async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<void> {
@@ -932,20 +976,11 @@ async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObser
 }
 
 async function writeMemoryScore(score: Record<string, unknown>): Promise<void> {
-  const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
-  const response = await fetch(`${config.host}/api/public/scores`, {
+  await langfuseRequest("/api/public/scores", {
     method: "POST",
-    headers: {
-      Authorization: `Basic ${auth}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(score),
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Langfuse memory score ${response.status}: ${text.slice(0, 500)}`);
-  }
 }
 
 async function writeTraceMemoryObservation(snapshot: TraceSnapshot): Promise<void> {

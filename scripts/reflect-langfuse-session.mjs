@@ -35,6 +35,7 @@ const thresholdTokens = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_THRES
 const minNewObservationTokens = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS || reflectionConfig.minNewObservationTokens, 8_000);
 const minNewObservations = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS || reflectionConfig.minNewObservations, 5);
 const auth = `Basic ${Buffer.from(`${config.publicKey}:${config.secretKey}`).toString('base64')}`;
+let lfRequestQueue = Promise.resolve();
 
 if (!reflectionEnabled) fail('Reflection disabled. Set memory.reflection.enabled=true or PI_LANGFUSE_REFLECTION_ENABLED=true.');
 if (!observerModel) fail('Missing reflector model. Configure observer.model or OBSERVER_MODEL.');
@@ -240,10 +241,53 @@ async function fetchScoresByName(name) {
   return scores;
 }
 
+async function lfRequest(path, init = {}) {
+  const request = lfRequestQueue.catch(() => undefined).then(async () => {
+    let lastError;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      let response;
+      try {
+        response = await fetch(`${config.host}${path}`, {
+          ...init,
+          headers: { Authorization: auth, ...init.headers },
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt < 5) {
+          await sleep(Math.min(2 ** (attempt - 1), 10) * 1000);
+          continue;
+        }
+        break;
+      }
+      const raw = await response.text();
+      if (response.ok) return raw;
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      if (!retryable || attempt === 5) throw new Error(`Langfuse ${init.method || 'GET'} ${response.status}: ${raw.slice(0, 1000)}`);
+      await sleep(langfuseRetryAfterMs(response, raw, attempt));
+    }
+    throw new Error(`Langfuse ${init.method || 'GET'} failed after 5 attempts`, { cause: lastError });
+  });
+  lfRequestQueue = request.then(() => undefined, () => undefined);
+  return request;
+}
+
+function langfuseRetryAfterMs(response, raw, attempt) {
+  const header = response.headers.get('retry-after');
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  if (header) {
+    const date = Date.parse(header);
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+  try {
+    const bodySeconds = Number(JSON.parse(raw)?.details?.retryAfterSeconds);
+    if (Number.isFinite(bodySeconds) && bodySeconds > 0) return bodySeconds * 1000;
+  } catch {}
+  return Math.min(2 ** (attempt - 1), 10) * 1000;
+}
+
 async function lfGet(path) {
-  const response = await fetch(`${config.host}${path}`, { headers: { Authorization: auth } });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Langfuse GET ${response.status}: ${raw.slice(0, 1000)}`);
+  const raw = await lfRequest(path);
   return raw ? JSON.parse(raw) : {};
 }
 
@@ -419,13 +463,11 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
 }
 
 async function writeScore(score) {
-  const response = await fetch(`${config.host}/api/public/scores`, {
+  await lfRequest('/api/public/scores', {
     method: 'POST',
-    headers: { Authorization: auth, 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(score),
   });
-  const raw = await response.text();
-  if (!response.ok) throw new Error(`Langfuse score write ${response.status}: ${raw.slice(0, 1000)}`);
 }
 
 function extractJson(text) {
