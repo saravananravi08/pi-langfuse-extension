@@ -93,7 +93,7 @@ PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
 
 Reflection reuses the observer API/model. It triggers only when all structured active-memory fields reach 20,000 estimated tokens, with at least 8,000 structured observation tokens and five observations added since the latest reflection. Each `memory_session_reflection` is append-only. `coveredUntil` identifies observations already incorporated; newer observations remain available for append/retrieval. Live remote memory is cached per session/path for five minutes, updated immediately after writes, and refreshed before reflection creation.
 
-Observer and reflector system prompts are centralized in [`memory-prompts.js`](./memory-prompts.js). Live and batch paths use the same prompt versions. Outputs must satisfy the complete structured schema before they are stored; malformed or incomplete outputs are retried.
+Observer and reflector system prompts are centralized in [`memory-prompts.js`](./memory-prompts.js). Live and batch paths use the same prompt versions. Outputs must satisfy the complete structured schema before they are stored; malformed or incomplete outputs are retried. Reflection structured fields are canonical, and `reflectionMarkdown` is rendered deterministically after retention, duplication, and contradiction checks.
 
 For npm install, find the extension at:
 ```

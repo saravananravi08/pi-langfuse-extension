@@ -8,7 +8,7 @@ function validOutput(kind = 'observer') {
     currentTask: 'Continue work',
     taskStatus: 'active',
   };
-  value[kind === 'reflection' ? 'reflectionMarkdown' : 'observationsMarkdown'] = 'Memory';
+  if (kind === 'observer') value.observationsMarkdown = 'Memory';
   for (const field of MEMORY_ARRAY_FIELDS) value[field] = [];
   return value;
 }
@@ -34,8 +34,12 @@ test('rejects invalid array values and missing task status', () => {
   assert.equal(validateMemoryOutput(statusValue, 'reflection'), 'taskStatus must be a non-empty string');
 });
 
-test('requires non-empty canonical markdown and summary', () => {
-  const value = validOutput('reflection');
-  value.reflectionMarkdown = ' ';
-  assert.equal(validateMemoryOutput(value, 'reflection'), 'reflectionMarkdown must be a non-empty string');
+test('requires observer markdown and summary', () => {
+  const observer = validOutput();
+  observer.observationsMarkdown = ' ';
+  assert.equal(validateMemoryOutput(observer, 'observer'), 'observationsMarkdown must be a non-empty string');
+
+  const reflection = validOutput('reflection');
+  reflection.summary = '';
+  assert.equal(validateMemoryOutput(reflection, 'reflection'), 'summary must be a non-empty string');
 });

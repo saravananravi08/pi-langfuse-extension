@@ -63,6 +63,8 @@
 		"memory-state.d.ts",
 		"memory-cache.js",
 		"memory-cache.d.ts",
+		"memory-reflection.js",
+		"memory-reflection.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",

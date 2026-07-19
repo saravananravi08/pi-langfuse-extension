@@ -1,5 +1,5 @@
 export const OBSERVER_PROMPT_VERSION = "observer-v2";
-export const REFLECTION_PROMPT_VERSION = "reflection-v2";
+export const REFLECTION_PROMPT_VERSION = "reflection-v3";
 
 export const OBSERVER_SYSTEM_PROMPT = `You are the memory observer for an AI coding assistant.
 
@@ -36,17 +36,8 @@ Rules:
 - Merge repeated file/tool activity into outcome-focused summaries.
 - Never invent completion, decisions, facts, or resolution.
 - Never copy credentials, API keys, access tokens, passwords, or secret values into memory.
-- reflectionMarkdown must use this exact heading structure, including empty sections:
-
-## Goal
-## Constraints & Preferences
-## Progress
-### Done
-### In Progress
-### Blocked
-## Key Decisions
-## Next Steps
-## Critical Context`;
+- Structured fields are canonical. Preserve enough detail in them to stand alone.
+- Do not return reflectionMarkdown; the runtime renders it deterministically from the structured fields.`;
 
 export const REQUIRED_REFLECTION_HEADINGS = [
   "## Goal",

@@ -10,6 +10,7 @@ import {
   REQUIRED_REFLECTION_HEADINGS,
 } from '../memory-prompts.js';
 import { validateMemoryOutput } from '../memory-validation.js';
+import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory-reflection.js';
 import {
   estimateTokens,
   generatedAt,
@@ -296,7 +297,6 @@ ${JSON.stringify(newObservationFields, null, 2)}
 
 Return ONLY valid JSON:
 {
-  "reflectionMarkdown": "Pi checkpoint using the required headings",
   "summary": "short session summary",
   "goal": ["current user goal"],
   "constraints": ["requirement or preference"],
@@ -315,15 +315,18 @@ Return ONLY valid JSON:
   "toolsUsed": ["tool name"]
 }
 
-Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
+Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   const compressionGuidance = REFLECTION_COMPRESSION_GUIDANCE;
   let parsed;
+  let renderedMarkdown = '';
+  let qualityMetrics = {};
   let compressionAttempt = 0;
   let lastError;
+  let correction = '';
   for (let attempt = 1; attempt <= compressionGuidance.length; attempt++) {
     compressionAttempt = attempt;
     try {
-      const text = await complete(REFLECTION_SYSTEM_PROMPT, `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1]}`);
+      const text = await complete(REFLECTION_SYSTEM_PROMPT, `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1]}${correction}`);
       if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError('Reflector output contains degenerate repetition');
       let candidate;
       try {
@@ -333,15 +336,40 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
       }
       const validationError = validateMemoryOutput(candidate, 'reflection');
       if (validationError) throw new MemoryOutputValidationError(`Invalid reflector schema: ${validationError}`);
-      const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !String(candidate.reflectionMarkdown).includes(heading));
-      if (missingHeading) throw new MemoryOutputValidationError(`Reflector output missing ${missingHeading}`);
-      const outputTokens = estimateTokens(candidate.reflectionMarkdown);
+      const canonical = {
+        ...candidate,
+        summary: String(candidate.summary).trim(),
+        goal: arrayOfStrings(candidate.goal),
+        constraints: arrayOfStrings(candidate.constraints),
+        currentTask: String(candidate.currentTask || '').trim(),
+        taskStatus: normalizeTaskStatus(candidate.taskStatus),
+        completed: arrayOfStrings(candidate.completed),
+        inProgress: arrayOfStrings(candidate.inProgress),
+        openIssues: arrayOfStrings(candidate.openIssues),
+        decisions: arrayOfStrings(candidate.decisions),
+        nextSteps: arrayOfStrings(candidate.nextSteps),
+        criticalContext: arrayOfStrings(candidate.criticalContext),
+        filesRead: unique([...metadataStrings(previous, 'filesRead'), ...newObservationFields.flatMap(item => item.filesRead), ...arrayOfStrings(candidate.filesRead)]),
+        filesModified: unique([...metadataStrings(previous, 'filesModified'), ...newObservationFields.flatMap(item => item.filesModified), ...arrayOfStrings(candidate.filesModified)]),
+        filesCreated: unique([...metadataStrings(previous, 'filesCreated'), ...newObservationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(candidate.filesCreated)]),
+        filesDeleted: unique([...metadataStrings(previous, 'filesDeleted'), ...newObservationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(candidate.filesDeleted)]),
+        toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(candidate.toolsUsed)]),
+      };
+      const quality = evaluateReflectionQuality(canonical, previousFields, newObservationFields);
+      if (quality.errors.length) throw new MemoryOutputValidationError(`Reflection quality failed: ${quality.errors.join('; ')}`);
+      const markdown = renderReflectionMarkdown(canonical);
+      const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !markdown.includes(heading));
+      if (missingHeading) throw new MemoryOutputValidationError(`Rendered reflection missing ${missingHeading}`);
+      const outputTokens = estimateTokens(markdown);
       if (outputTokens > targetTokens) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
-      parsed = candidate;
+      parsed = canonical;
+      renderedMarkdown = markdown;
+      qualityMetrics = quality.metrics;
       break;
     } catch (error) {
       if (!(error instanceof MemoryOutputValidationError) && !(error instanceof SyntaxError)) throw error;
       lastError = error;
+      correction = `\nPrevious output was rejected: ${error instanceof Error ? error.message : error}. Correct that issue in the next output.`;
       if (attempt < compressionGuidance.length) console.warn(`reflection validation failed; retrying compression (${attempt}/${compressionGuidance.length})`);
     }
   }
@@ -361,7 +389,7 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
     sessionId: scope.sessionId,
     cwd: scope.pathKey || null,
     pathKey: scope.pathKey || null,
-    reflectionMarkdown: String(parsed.reflectionMarkdown).trim(),
+    reflectionMarkdown: renderedMarkdown,
     summary: String(parsed.summary).trim(),
     goal: arrayOfStrings(parsed.goal),
     constraints: arrayOfStrings(parsed.constraints),
@@ -380,9 +408,10 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
     filesTouched: unique([...metadataStrings(previous, 'filesTouched'), ...newObservationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
     toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
     inputTokensEstimated: inputTokens,
-    outputTokensEstimated: estimateTokens(parsed.reflectionMarkdown),
-    compressionRatio: Number((estimateTokens(parsed.reflectionMarkdown) / inputTokens).toFixed(3)),
+    outputTokensEstimated: estimateTokens(renderedMarkdown),
+    compressionRatio: Number((estimateTokens(renderedMarkdown) / inputTokens).toFixed(3)),
     compressionAttempt,
+    qualityMetrics,
     sourceTraceIds,
     sourceObservationScoreIds,
     sourceReflectionScoreIds: previous ? [previous.id] : [],
@@ -396,7 +425,7 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
     value: 'reflected',
     sessionId: scope.sessionId,
     dataType: 'CATEGORICAL',
-    comment: clamp(String(parsed.summary || firstLine(parsed.reflectionMarkdown)), 1000),
+    comment: clamp(String(parsed.summary || firstLine(renderedMarkdown)), 1000),
     metadata,
   };
 }
