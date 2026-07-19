@@ -217,6 +217,23 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
   };
 }
 
+function formatTokens(tokens) {
+  if (!Number.isFinite(tokens)) return "?";
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}m`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+  return String(Math.round(tokens));
+}
+
+export function formatMemoryContextStatus(status) {
+  const actual = Number.isFinite(status.actualInputTokens)
+    ? `${formatTokens(status.actualInputTokens)}/${formatTokens(status.contextWindow)} (${status.contextWindow > 0 ? ((status.actualInputTokens / status.contextWindow) * 100).toFixed(1) : "?"}%)`
+    : "awaiting next response";
+  const replacement = Number.isFinite(status.replacementTokensEstimated)
+    ? formatTokens(status.replacementTokensEstimated)
+    : "?";
+  return `Memory context ON | actual request: ${actual} | replacement messages est: ${replacement} | entries dropped/retained: ${status.droppedEntryCount || 0}/${status.retainedEntryCount || 0}`;
+}
+
 export function formatMemoryContextPreview(plan, maxIds = 20) {
   const limited = values => values.length > maxIds ? [...values.slice(0, maxIds), `... ${values.length - maxIds} more`] : values;
   return JSON.stringify({

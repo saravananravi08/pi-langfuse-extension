@@ -4,6 +4,7 @@ import {
   buildMemoryContextCoverage,
   buildMemoryContextText,
   formatMemoryContextPreview,
+  formatMemoryContextStatus,
   planMemoryContextReplacement,
 } from '../memory-context.js';
 
@@ -92,6 +93,14 @@ test('blocks replacement that cannot map a model message or would split a tool p
   const split = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', splitCoverage);
   assert.equal(split.safe, false);
   assert.match(split.reasons.join('\n'), /split tool pair/);
+});
+
+test('formats actual provider usage separately from replacement-message estimate', () => {
+  assert.equal(
+    formatMemoryContextStatus({ actualInputTokens: 67_728, contextWindow: 272_000, replacementTokensEstimated: 7_128, droppedEntryCount: 40, retainedEntryCount: 5 }),
+    'Memory context ON | actual request: 67.7k/272.0k (24.9%) | replacement messages est: 7.1k | entries dropped/retained: 40/5',
+  );
+  assert.match(formatMemoryContextStatus({}), /awaiting next response/);
 });
 
 test('preview exposes score, entry, tool-pair, and token decisions', () => {

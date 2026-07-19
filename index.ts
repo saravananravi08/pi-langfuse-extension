@@ -32,7 +32,7 @@ import { validateMemoryOutput } from "./memory-validation.js";
 import { createMemoryCache } from "./memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
-import { buildMemoryContextCoverage, buildMemoryContextText, formatMemoryContextPreview, planMemoryContextReplacement } from "./memory-context.js";
+import { buildMemoryContextCoverage, buildMemoryContextText, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory-context.js";
 import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory-pi-entries.js";
 import { abortableSleep as sleep, isAbortError } from "./memory-lifecycle.js";
 import { appendMemoryErrorLog, describeMemoryOutput } from "./memory-error-log.js";
@@ -251,8 +251,33 @@ const sessionMemoryCache = createMemoryCache(300_000);
 let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
 const lookupTraceCache = new Map<string, { value: Record<string, unknown>; loadedAt: number }>();
 let memoryContextEnabled = false;
+let memoryContextDisplay: {
+  actualInputTokens?: number;
+  contextWindow?: number;
+  replacementTokensEstimated?: number;
+  droppedEntryCount?: number;
+  retainedEntryCount?: number;
+} = {};
 let lastMemoryContextErrorAt = 0;
 const PI_SESSIONS_ROOT = join(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "sessions");
+const MEMORY_CONTEXT_WIDGET = "langfuse-memory-context-usage";
+
+type MemoryContextWidgetUi = {
+  setWidget(key: string, value: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+};
+
+function updateMemoryContextWidget(ui: MemoryContextWidgetUi): void {
+  ui.setWidget(
+    MEMORY_CONTEXT_WIDGET,
+    memoryContextEnabled ? [formatMemoryContextStatus(memoryContextDisplay)] : undefined,
+    { placement: "belowEditor" },
+  );
+}
+
+function resetMemoryContextWidget(ui: MemoryContextWidgetUi): void {
+  memoryContextDisplay = {};
+  updateMemoryContextWidget(ui);
+}
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -1260,6 +1285,7 @@ export default async function (pi: ExtensionAPI) {
       const enabling = action === "on" || (action === "" && !memoryContextEnabled);
       if (action === "off" || (action === "" && memoryContextEnabled)) {
         memoryContextEnabled = false;
+        resetMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: false });
         ctx.ui.notify("Langfuse memory context replacement disabled. Full Pi context will be sent to the model.", "info");
         return;
@@ -1278,15 +1304,24 @@ export default async function (pi: ExtensionAPI) {
         }
         if (enabling && !plan.safe) {
           memoryContextEnabled = false;
+          resetMemoryContextWidget(ctx.ui);
           pi.appendEntry("langfuse-memory-context-state", { enabled: false });
           ctx.ui.notify(`Langfuse memory context replacement blocked:\n${plan.reasons.join("\n")}`, "warning");
           return;
         }
         memoryContextEnabled = true;
+        memoryContextDisplay = {
+          contextWindow: ctx.model?.contextWindow,
+          replacementTokensEstimated: plan.replacementTokensEstimated,
+          droppedEntryCount: plan.droppedEntryIds.length,
+          retainedEntryCount: plan.retainedEntryIds.length,
+        };
+        updateMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: true });
         ctx.ui.notify("Langfuse memory context replacement enabled with exact Pi-entry boundaries.", "info");
       } catch (error) {
         memoryContextEnabled = false;
+        resetMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: false });
         ctx.ui.notify(`Langfuse memory context replacement blocked: ${errorMessage(error)}`, "warning");
       }
@@ -1401,12 +1436,14 @@ export default async function (pi: ExtensionAPI) {
     // Reset state for new session
     resetSessionState();
     memoryContextEnabled = false;
+    memoryContextDisplay = { contextWindow: ctx.model?.contextWindow };
     lastMemoryContextErrorAt = 0;
     for (const entry of ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: { enabled?: boolean } }>) {
       if (entry.type === "custom" && entry.customType === "langfuse-memory-context-state") {
         memoryContextEnabled = entry.data?.enabled === true;
       }
     }
+    updateMemoryContextWidget(ctx.ui);
   });
 
   pi.on("context", async (event, ctx) => {
@@ -1419,13 +1456,23 @@ export default async function (pi: ExtensionAPI) {
       const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage);
       if (!plan.safe) {
         memoryContextEnabled = false;
+        resetMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: false });
         ctx.ui.notify(`Langfuse memory context replacement disabled:\n${plan.reasons.join("\n")}`, "warning");
         return;
       }
+      memoryContextDisplay = {
+        ...memoryContextDisplay,
+        contextWindow: ctx.model?.contextWindow,
+        replacementTokensEstimated: plan.replacementTokensEstimated,
+        droppedEntryCount: plan.droppedEntryIds.length,
+        retainedEntryCount: plan.retainedEntryIds.length,
+      };
+      updateMemoryContextWidget(ctx.ui);
       return { messages: plan.messages as typeof event.messages };
     } catch (error) {
       memoryContextEnabled = false;
+      resetMemoryContextWidget(ctx.ui);
       pi.appendEntry("langfuse-memory-context-state", { enabled: false });
       if (Date.now() - lastMemoryContextErrorAt > 60_000) {
         logMemoryError({
@@ -1446,6 +1493,14 @@ export default async function (pi: ExtensionAPI) {
   pi.on("model_select", async (event, ctx) => {
     currentModel = event.model?.id || '';
     currentProvider = event.model?.provider || '';
+    if (memoryContextEnabled) {
+      memoryContextDisplay = {
+        ...memoryContextDisplay,
+        actualInputTokens: undefined,
+        contextWindow: event.model?.contextWindow,
+      };
+      updateMemoryContextWidget(ctx.ui);
+    }
   });
 
   // Use before_agent_start to capture user prompt and create trace
@@ -1663,12 +1718,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   // Track turns and generations
-  pi.on("turn_end", async (event) => {
-    if (!currentTrace) return;
-
-    // Increment turn counter
-    turnCount++;
-
+  pi.on("turn_end", async (event, ctx) => {
     const eventData = event as unknown as {
       message?: {
         role: string;
@@ -1691,6 +1741,19 @@ export default async function (pi: ExtensionAPI) {
     if (!message || message.role !== "assistant") return;
 
     const usage = message.usage;
+    if (memoryContextEnabled && usage) {
+      memoryContextDisplay = {
+        ...memoryContextDisplay,
+        actualInputTokens: (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0),
+        contextWindow: ctx.model?.contextWindow,
+      };
+      updateMemoryContextWidget(ctx.ui);
+    }
+    if (!currentTrace) return;
+
+    // Increment turn counter
+    turnCount++;
+
     const modelId = message.model || currentModel;
     const provider = currentProvider;
     const cost = usage?.cost;
@@ -1762,8 +1825,10 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     memoryLifecycleController.abort(new DOMException("Pi session shut down", "AbortError"));
+    memoryContextEnabled = false;
+    resetMemoryContextWidget(ctx.ui);
     if (currentTrace) {
       if (currentTrace.update) {
         currentTrace.update({ metadata: { completed: true } });

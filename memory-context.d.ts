@@ -52,3 +52,10 @@ export function planMemoryContextReplacement(
   timestamp?: number,
 ): MemoryContextPlan;
 export function formatMemoryContextPreview(plan: MemoryContextPlan, maxIds?: number): string;
+export function formatMemoryContextStatus(status: {
+  actualInputTokens?: number;
+  contextWindow?: number;
+  replacementTokensEstimated?: number;
+  droppedEntryCount?: number;
+  retainedEntryCount?: number;
+}): string;
