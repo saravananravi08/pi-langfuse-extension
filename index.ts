@@ -18,6 +18,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "typebox";
 import {
   OBSERVER_PROMPT_VERSION,
   REFLECTION_PROMPT_VERSION,
@@ -29,6 +30,7 @@ import {
 import { validateMemoryOutput } from "./memory-validation.js";
 import { createMemoryCache } from "./memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-reflection.js";
+import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
 import {
   buildActiveMemory,
   estimateTokens,
@@ -206,6 +208,8 @@ const activeSpans: Map<string, SpanData> = new Map();
 const traceSteps: TraceStep[] = [];
 const memoryQueues = new Map<string, Promise<void>>();
 const sessionMemoryCache = createMemoryCache(300_000);
+let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
+const lookupTraceCache = new Map<string, { value: Record<string, unknown>; loadedAt: number }>();
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -265,9 +269,11 @@ const REFLECTION_MIN_NEW_OBSERVATIONS = positiveInteger(process.env.PI_LANGFUSE_
 
 interface MemoryScore {
   id: string;
+  name?: string;
   traceId?: string | null;
   sessionId?: string | null;
   createdAt?: string;
+  comment?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -683,8 +689,8 @@ async function langfuseRequest(path: string, init: RequestInit = {}): Promise<{ 
   return request;
 }
 
-async function langfuseGet(path: string): Promise<Record<string, unknown>> {
-  const { raw } = await langfuseRequest(path);
+async function langfuseGet(path: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  const { raw } = await langfuseRequest(path, { signal });
   return raw ? JSON.parse(raw) : {};
 }
 
@@ -709,11 +715,11 @@ async function fetchScoresByIds(ids: string[], name: string): Promise<MemoryScor
   return scores;
 }
 
-async function fetchScoresByName(name: string): Promise<MemoryScore[]> {
+async function fetchScoresByName(name: string, signal?: AbortSignal): Promise<MemoryScore[]> {
   const scores: MemoryScore[] = [];
   for (let page = 1; ; page++) {
     const params = new URLSearchParams({ name, dataType: "CATEGORICAL", page: String(page), limit: "100" });
-    const response = await langfuseGet(`/api/public/v2/scores?${params}`) as { data?: MemoryScore[]; meta?: { totalPages?: number } };
+    const response = await langfuseGet(`/api/public/v2/scores?${params}`, signal) as { data?: MemoryScore[]; meta?: { totalPages?: number } };
     scores.push(...(response.data || []));
     if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
   }
@@ -933,6 +939,7 @@ async function writeMemoryScore(score: Record<string, unknown>): Promise<void> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(score),
   });
+  lookupScoresCache = undefined;
 }
 
 async function writeTraceMemoryObservation(snapshot: TraceSnapshot): Promise<void> {
@@ -955,6 +962,70 @@ function enqueueTraceMemoryObservation(snapshot: TraceSnapshot): void {
   });
 }
 
+async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<MemoryScore[]> {
+  if (!refresh && lookupScoresCache && Date.now() - lookupScoresCache.loadedAt < 300_000) return lookupScoresCache.scores;
+  const [observations, reflections] = await Promise.all([
+    fetchScoresByName(MEMORY_SCORE_NAME, signal),
+    fetchScoresByName(REFLECTION_SCORE_NAME, signal),
+  ]);
+  const scores = [...observations, ...reflections].filter(score => metadataString(score, "version") === MEMORY_SCORE_VERSION);
+  lookupScoresCache = { scores, loadedAt: Date.now() };
+  return scores;
+}
+
+function boundedLookupValue(value: unknown, max: number): string {
+  return clampText(redactSecrets(value), max);
+}
+
+async function getLookupTrace(traceId: string, refresh: boolean, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  const cached = lookupTraceCache.get(traceId);
+  if (!refresh && cached && Date.now() - cached.loadedAt < 300_000) return cached.value;
+
+  const trace = await langfuseGet(`/api/public/traces/${encodeURIComponent(traceId)}`, signal);
+  const observations: Array<Record<string, unknown>> = [];
+  let cursor = "";
+  do {
+    const params = new URLSearchParams({
+      traceId,
+      limit: "1000",
+      fields: "core,basic,time,io,metadata,model,usage",
+    });
+    if (cursor) params.set("cursor", cursor);
+    const response = await langfuseGet(`/api/public/v2/observations?${params}`, signal) as {
+      data?: Array<Record<string, unknown>>;
+      meta?: { cursor?: string };
+    };
+    observations.push(...(response.data || []));
+    cursor = response.meta?.cursor || "";
+  } while (cursor);
+
+  const value = redactSecrets({
+    traceId,
+    timestamp: trace.timestamp || null,
+    name: trace.name || null,
+    input: boundedLookupValue(trace.input, 2000),
+    output: boundedLookupValue(trace.output, 3000),
+    metadata: boundedLookupValue(trace.metadata, 2000),
+    sourceObservationCount: observations.filter(observation => !String(observation.name || "").startsWith("memory:")).length,
+    observations: observations
+      .filter(observation => !String(observation.name || "").startsWith("memory:"))
+      .sort((a, b) => String(a.startTime || "").localeCompare(String(b.startTime || "")))
+      .slice(0, 20)
+      .map(observation => ({
+        id: observation.id,
+        type: observation.type,
+        name: observation.name,
+        startTime: observation.startTime,
+        input: boundedLookupValue(observation.input, 800),
+        output: boundedLookupValue(observation.output, 1200),
+        metadata: boundedLookupValue(observation.metadata, 800),
+      })),
+    sourceLimit: "First 20 source observations; values are bounded to protect context.",
+  }) as Record<string, unknown>;
+  lookupTraceCache.set(traceId, { value, loadedAt: Date.now() });
+  return value;
+}
+
 // ============================================
 // Extension
 // ============================================
@@ -966,6 +1037,63 @@ export default async function (pi: ExtensionAPI) {
   }
 
   console.log("📊 Langfuse: Tracing enabled →", config.host);
+
+  pi.registerTool({
+    name: "langfuse_memory_lookup",
+    label: "Langfuse Memory Lookup",
+    description: "Search scoped Langfuse memory observations/reflections with provenance. Defaults to current session and cwd. Optionally returns bounded source-trace details for at most two traces.",
+    promptSnippet: "Search prior Langfuse observations/reflections with provenance",
+    promptGuidelines: [
+      "Use langfuse_memory_lookup when exact older session details, decisions, files, errors, IDs, or covered source traces are needed.",
+    ],
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ description: "Text, path, symbol, error, URL, or identifier to find." })),
+      scope: Type.Optional(Type.String({ description: "session (default), path, or all." })),
+      sessionId: Type.Optional(Type.String({ description: "Override session ID used by session scope." })),
+      cwd: Type.Optional(Type.String({ description: "Override cwd/pathKey used by session or path scope." })),
+      traceId: Type.Optional(Type.String({ description: "Exact source trace ID." })),
+      scoreId: Type.Optional(Type.String({ description: "Exact observation/reflection score ID." })),
+      includeSource: Type.Optional(Type.Boolean({ description: "Include bounded original trace/tool details for up to two matching source traces." })),
+      refresh: Type.Optional(Type.Boolean({ description: "Bypass five-minute lookup cache." })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum memory results; default 5." })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const scope = ["session", "path", "all"].includes(params.scope || "") ? params.scope : "session";
+      const sessionId = String(params.sessionId || currentSessionId || "").replace(/^\/?sessions\//, "").replace(/\.jsonl$/, "");
+      const pathKey = String(params.cwd || ctx.cwd || "");
+      const scores = await getLookupScores(Boolean(params.refresh), signal);
+      const matches = searchMemoryScores(scores, {
+        query: params.query,
+        scope,
+        sessionId,
+        pathKey,
+        traceId: params.traceId,
+        scoreId: params.scoreId,
+        limit: params.limit,
+      });
+      const results = matches.map(({ score, rank }) => ({ rank, ...formatMemoryResult(score) }));
+      const sourceTraceIds = unique(matches.flatMap(({ score }) => [
+        score.traceId || metadataString(score, "traceId"),
+        ...metadataStrings(score, "sourceTraceIds"),
+      ])).slice(0, 2);
+      const sourceTraces = params.includeSource
+        ? await Promise.all(sourceTraceIds.map(traceId => getLookupTrace(traceId, Boolean(params.refresh), signal)))
+        : [];
+      const payload = redactSecrets({
+        scope: { mode: scope, sessionId: scope === "session" ? sessionId || null : null, pathKey: scope === "all" ? null : pathKey || null },
+        query: params.query || null,
+        resultCount: results.length,
+        results,
+        sourceTraces,
+        sourceDetailsLimited: Boolean(params.includeSource),
+      }) as Record<string, unknown>;
+      const text = clampText(payload, 48_000);
+      return {
+        content: [{ type: "text", text }],
+        details: payload,
+      };
+    },
+  });
 
   // Capture session ID on session start
   pi.on("session_start", async (_event, ctx) => {

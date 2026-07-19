@@ -32,7 +32,8 @@
 		"image": "https://raw.githubusercontent.com/saravananravi08/pi-langfuse-extension/main/docs/screenshot1.jpg"
 	},
 	"dependencies": {
-		"langfuse": "^3.0.0"
+		"langfuse": "^3.0.0",
+		"typebox": "^1.3.6"
 	},
 	"peerDependencies": {
 		"@mariozechner/pi-coding-agent": "*"
@@ -67,6 +68,8 @@
 		"memory-reflection.d.ts",
 		"memory-audit.js",
 		"memory-audit.d.ts",
+		"memory-lookup.js",
+		"memory-lookup.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",

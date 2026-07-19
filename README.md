@@ -95,6 +95,8 @@ Reflection reuses the observer API/model. It triggers only when all structured a
 
 Observer and reflector system prompts are centralized in [`memory-prompts.js`](./memory-prompts.js). Live and batch paths use the same prompt versions. Outputs must satisfy the complete structured schema before they are stored; malformed or incomplete outputs are retried. Reflection structured fields are canonical, and `reflectionMarkdown` is rendered deterministically after retention, duplication, and contradiction checks.
 
+The `langfuse_memory_lookup` tool searches observations and reflections. It defaults to the current session and cwd, supports exact trace/score IDs and broader path/all scopes, caches score reads for five minutes, returns score/trace provenance, redacts secret-like values, and can include bounded source details for up to two traces.
+
 For npm install, find the extension at:
 ```
 ~/.pi/agent/npm/@ravan08/pi-langfuse/index.ts
