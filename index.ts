@@ -27,6 +27,7 @@ import {
   REQUIRED_REFLECTION_HEADINGS,
 } from "./memory-prompts.js";
 import { validateMemoryOutput } from "./memory-validation.js";
+import { createMemoryCache } from "./memory-cache.js";
 import {
   buildActiveMemory,
   estimateTokens,
@@ -36,6 +37,7 @@ import {
   observationFields,
   reflectionFields,
   reflectionThresholdMet,
+  sameMemoryScope,
 } from "./memory-state.js";
 
 // ============================================
@@ -202,9 +204,7 @@ let currentCwd: string = "";
 const activeSpans: Map<string, SpanData> = new Map();
 const traceSteps: TraceStep[] = [];
 const memoryQueues = new Map<string, Promise<void>>();
-// Langfuse score reads can lag writes; these caches only bridge indexing delay.
-const recentObservations = new Map<string, Map<string, MemoryScore>>();
-const recentReflections = new Map<string, MemoryScore>();
+const sessionMemoryCache = createMemoryCache(300_000);
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -719,19 +719,27 @@ async function fetchScoresByName(name: string): Promise<MemoryScore[]> {
   return scores;
 }
 
-async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<ActiveSessionMemory> {
-  const scoreIds = await fetchScoreIdsForSession(snapshot.sessionId);
-  const [observations, reflections] = await Promise.all([
-    fetchScoresByIds(scoreIds, MEMORY_SCORE_NAME),
-    fetchScoresByName(REFLECTION_SCORE_NAME),
-  ]);
-
+async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservation: MemoryScore, forceRefresh = false): Promise<ActiveSessionMemory> {
   const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
-  const cachedObservations = [...(recentObservations.get(scopeKey)?.values() || [])];
-  const cachedReflection = recentReflections.get(scopeKey);
+  sessionMemoryCache.addObservation(scopeKey, currentObservation);
+
+  if (forceRefresh || sessionMemoryCache.needsRefresh(scopeKey)) {
+    const scoreIds = await fetchScoreIdsForSession(snapshot.sessionId);
+    const [observations, reflections] = await Promise.all([
+      fetchScoresByIds(scoreIds, MEMORY_SCORE_NAME),
+      fetchScoresByName(REFLECTION_SCORE_NAME),
+    ]);
+    sessionMemoryCache.mergeRemote(
+      scopeKey,
+      observations.filter(score => sameMemoryScope(score, snapshot.sessionId, snapshot.cwd, MEMORY_SCORE_VERSION)),
+      reflections.filter(score => sameMemoryScope(score, snapshot.sessionId, snapshot.cwd, MEMORY_SCORE_VERSION)),
+    );
+  }
+
+  const cached = sessionMemoryCache.get(scopeKey);
   return buildActiveMemory(
-    [...observations, ...cachedObservations, currentObservation],
-    [...reflections, ...(cachedReflection ? [cachedReflection] : [])],
+    cached.observations,
+    cached.reflection ? [cached.reflection] : [],
     snapshot.sessionId,
     snapshot.cwd,
     MEMORY_SCORE_VERSION,
@@ -869,24 +877,24 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
   };
 
   await writeMemoryScore(score);
-  const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
-  recentReflections.set(scopeKey, score);
-  const cachedObservations = recentObservations.get(scopeKey);
-  if (cachedObservations) {
-    for (const [id, observation] of cachedObservations) {
-      if (generatedAt(observation) <= coveredUntil) cachedObservations.delete(id);
-    }
-  }
+  sessionMemoryCache.setReflection(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
 }
 
 async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<void> {
   if (!REFLECTION_ENABLED || !snapshot.sessionId) return;
-  const memory = await getActiveSessionMemory(snapshot, currentObservation);
-  if (!reflectionThresholdMet(memory, {
+  const thresholds = {
     activeTokens: REFLECTION_THRESHOLD_TOKENS,
     newObservationTokens: REFLECTION_MIN_NEW_TOKENS,
     newObservations: REFLECTION_MIN_NEW_OBSERVATIONS,
-  })) return;
+  };
+  const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
+  const refreshesDuringRead = sessionMemoryCache.needsRefresh(scopeKey);
+  let memory = await getActiveSessionMemory(snapshot, currentObservation);
+  if (!reflectionThresholdMet(memory, thresholds)) return;
+
+  // Refresh before writing so external batch reflections cannot cause a stale generation.
+  if (!refreshesDuringRead) memory = await getActiveSessionMemory(snapshot, currentObservation, true);
+  if (!reflectionThresholdMet(memory, thresholds)) return;
   await writeSessionReflection(snapshot, memory);
 }
 
@@ -902,10 +910,7 @@ async function writeTraceMemoryObservation(snapshot: TraceSnapshot): Promise<voi
   const score = await generateTraceMemoryObservation(snapshot);
   if (!score) return;
   await writeMemoryScore(score);
-  const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
-  const cachedObservations = recentObservations.get(scopeKey) || new Map<string, MemoryScore>();
-  cachedObservations.set(score.id, score);
-  recentObservations.set(scopeKey, cachedObservations);
+  sessionMemoryCache.addObservation(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
   await maybeWriteSessionReflection(snapshot, score);
 }
 

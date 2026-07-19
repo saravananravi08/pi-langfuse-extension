@@ -61,6 +61,8 @@
 		"memory-validation.d.ts",
 		"memory-state.js",
 		"memory-state.d.ts",
+		"memory-cache.js",
+		"memory-cache.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",
