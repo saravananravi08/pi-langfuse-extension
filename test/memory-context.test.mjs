@@ -86,8 +86,19 @@ test('retains a trailing current user before its Pi entry becomes visible', () =
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch.slice(0, 4), 'memory', coverage);
   assert.equal(plan.safe, true);
-  assert.deepEqual(plan.retainedUnmappedUserIndexes, [4]);
+  assert.deepEqual(plan.retainedUnmappedTailIndexes, [4]);
   assert.deepEqual(plan.messages.slice(1), [user2]);
+});
+
+test('retains trailing parallel tool results while Pi session entries catch up', () => {
+  const call2 = { role: 'assistant', content: [{ type: 'toolCall', id: 'call-2', name: 'bash', arguments: {} }], timestamp: 6 };
+  const result2 = { role: 'toolResult', toolCallId: 'call-2', content: [{ type: 'text', text: 'late result' }], timestamp: 7 };
+  const currentBranch = [...branch, entry('a3', 'u2', call2)];
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, call2, result2], currentBranch, 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.retainedUnmappedTailIndexes, [6]);
+  assert.deepEqual(plan.messages.slice(1), [user2, call2, result2]);
 });
 
 test('blocks replacement that cannot map an older model message or would split a tool pair', () => {

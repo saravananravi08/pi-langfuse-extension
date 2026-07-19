@@ -161,9 +161,12 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     if (entryId) usedEntryIds.add(entryId);
     else if (["user", "assistant", "toolResult"].includes(message?.role)) unmappedMessageIndexes.push(index);
   }
+  const originalCalls = new Set(withoutOldMemory.flatMap(toolCallIds));
   const unsafeUnmappedMessageIndexes = unmappedMessageIndexes.filter(index => {
     const message = withoutOldMemory[index];
-    return message?.role !== "user" || mappedEntryIds.slice(index + 1).some(Boolean);
+    const safeTrailingRole = message?.role === "user"
+      || (message?.role === "toolResult" && originalCalls.has(message.toolCallId));
+    return !safeTrailingRole || mappedEntryIds.slice(index + 1).some(Boolean);
   });
   if (unsafeUnmappedMessageIndexes.length) {
     reasons.push(`${unsafeUnmappedMessageIndexes.length} model message(s) cannot be mapped to exact Pi entries`);
@@ -182,7 +185,6 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     if (entryId) retainedEntryIds.push(entryId);
   }
 
-  const originalCalls = new Set(withoutOldMemory.flatMap(toolCallIds));
   const originalResults = new Set(withoutOldMemory.filter(message => message?.role === "toolResult").map(message => message.toolCallId).filter(Boolean));
   const retainedCalls = new Set(retained.flatMap(toolCallIds));
   const retainedResults = new Set(retained.filter(message => message?.role === "toolResult").map(message => message.toolCallId).filter(Boolean));
@@ -215,7 +217,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     droppedEntryIds,
     retainedEntryIds,
     unmappedMessageIndexes,
-    retainedUnmappedUserIndexes: unmappedMessageIndexes.filter(index => !unsafeUnmappedMessageIndexes.includes(index)),
+    retainedUnmappedTailIndexes: unmappedMessageIndexes.filter(index => !unsafeUnmappedMessageIndexes.includes(index)),
     toolPairs: coverage?.toolPairs || [],
     originalTokensEstimated: estimate(withoutOldMemory),
     memoryTokensEstimated: estimate(injected),
@@ -257,7 +259,7 @@ export function formatMemoryContextPreview(plan, maxIds = 20) {
     droppedEntryIds: limited(plan.droppedEntryIds),
     retainedEntryCount: plan.retainedEntryIds.length,
     retainedEntryIds: limited(plan.retainedEntryIds),
-    retainedUnmappedUserMessageIndexes: plan.retainedUnmappedUserIndexes,
+    retainedUnmappedTailMessageIndexes: plan.retainedUnmappedTailIndexes,
     toolPairCount: plan.toolPairs.length,
     toolPairs: plan.toolPairs.slice(0, maxIds),
     tokens: {
