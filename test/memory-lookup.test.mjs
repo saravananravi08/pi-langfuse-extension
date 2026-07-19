@@ -42,6 +42,23 @@ test('ranks exact phrase above token-only matches', () => {
   assert.equal(results[0].score.id, 'a');
 });
 
+test('searches and returns exact Pi entry/tool-pair provenance', () => {
+  const value = score('a', 'session-a', '/a', 'summary', {
+    piProvenanceVersion: 'pi-entry-v1',
+    piProvenanceStatus: 'complete',
+    piUserEntryId: 'entry-user',
+    piFirstEntryId: 'entry-user',
+    piLastEntryId: 'entry-result',
+    piEntryIds: ['entry-user', 'entry-assistant', 'entry-result'],
+    piToolPairs: [{ toolCallId: 'call-exact', assistantEntryId: 'entry-assistant', toolResultEntryId: 'entry-result' }],
+  });
+  assert.equal(searchMemoryScores([value], { query: 'call-exact', scope: 'all' })[0].score.id, 'a');
+  const result = formatMemoryResult(value);
+  assert.equal(result.piUserEntryId, 'entry-user');
+  assert.deepEqual(result.piEntryIds, ['entry-user', 'entry-assistant', 'entry-result']);
+  assert.equal(result.piToolPairs[0].toolResultEntryId, 'entry-result');
+});
+
 test('redacts nested credentials without hiding token metrics', () => {
   const redacted = redactSecrets({
     apiKey: 'example-credential-value',

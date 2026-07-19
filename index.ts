@@ -34,6 +34,7 @@ import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-re
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
 import { buildMemoryContextText, replaceWithMemoryContext } from "./memory-context.js";
 import { appendMemoryErrorLog, describeMemoryOutput } from "./memory-error-log.js";
+import { aggregatePiReflectionProvenance, buildPiTraceProvenance, findPiTraceStartEntryId, type PiTraceProvenance } from "./memory-provenance.js";
 import {
   buildActiveMemory,
   estimateTokens,
@@ -209,6 +210,8 @@ interface TraceSnapshot {
   userPrompt: string;
   output?: string;
   steps: TraceStep[];
+  piProvenance?: PiTraceProvenance;
+  piProvenanceErrors: string[];
 }
 
 interface AgentContentPart {
@@ -235,6 +238,8 @@ let currentSessionId: string = "";
 let currentModel: string = "";
 let currentProvider: string = "";
 let currentCwd: string = "";
+let currentTraceParentEntryId: string = "";
+let currentPiSessionId: string = "";
 const activeSpans: Map<string, SpanData> = new Map();
 const traceSteps: TraceStep[] = [];
 const memoryQueues = new Map<string, Promise<void>>();
@@ -260,6 +265,7 @@ function resetSessionState() {
   currentModel = "";
   currentProvider = "";
   currentCwd = "";
+  currentTraceParentEntryId = "";
   traceSteps.length = 0;
 }
 
@@ -741,6 +747,17 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
       toolsUsed,
       sourceStepIds: snapshot.steps.map(step => step.id),
       sourceStepCount: snapshot.steps.length,
+      piProvenanceVersion: snapshot.piProvenance?.version || null,
+      piProvenanceStatus: snapshot.piProvenance?.complete ? "complete" : "incomplete",
+      piProvenanceErrors: snapshot.piProvenanceErrors,
+      piSessionId: snapshot.piProvenance?.piSessionId || null,
+      piUserEntryId: snapshot.piProvenance?.userEntryId || null,
+      piFirstEntryId: snapshot.piProvenance?.firstEntryId || null,
+      piLastEntryId: snapshot.piProvenance?.lastEntryId || null,
+      piEntryIds: snapshot.piProvenance?.entryIds || [],
+      piMessageEntryIds: snapshot.piProvenance?.messageEntryIds || [],
+      piToolPairs: snapshot.piProvenance?.toolPairs || [],
+      piProvenance: snapshot.piProvenance || null,
       generatedAt: new Date().toISOString(),
     },
   };
@@ -995,6 +1012,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   const sourceObservationScoreIds = memory.newObservations.map(score => score.id);
   const sourceTraceIds = unique(memory.newObservations.map(score => score.traceId || metadataString(score, "traceId")));
   const coveredUntil = generatedAt(memory.newObservations[memory.newObservations.length - 1]!);
+  const piReflectionProvenance = aggregatePiReflectionProvenance(previous?.metadata, memory.newObservations);
   const generated = new Date().toISOString();
   const metadata = {
     version: MEMORY_SCORE_VERSION,
@@ -1034,6 +1052,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     sourceObservationScoreIds,
     sourceReflectionScoreIds: previous ? [previous.id] : [],
     sourceObservationCount: sourceObservationScoreIds.length,
+    ...piReflectionProvenance,
     coveredUntil,
     generatedAt: generated,
   };
@@ -1292,6 +1311,7 @@ export default async function (pi: ExtensionAPI) {
   // Capture session ID on session start
   pi.on("session_start", async (_event, ctx) => {
     currentSessionId = "";
+    currentPiSessionId = ctx.sessionManager.getSessionId();
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (sessionFile) {
       // Extract session ID from file path (format: 2026-04-25T13-23-54-756Z_<uuid>.jsonl)
@@ -1340,6 +1360,7 @@ export default async function (pi: ExtensionAPI) {
 
   // Use before_agent_start to capture user prompt and create trace
   pi.on("before_agent_start", async (event, ctx) => {
+    currentTraceParentEntryId = ctx.sessionManager.getLeafId() || "";
     try {
       const lf = await getClient();
       const cwd = event.systemPromptOptions?.cwd || process.cwd();
@@ -1370,7 +1391,7 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_end", async (event) => {
+  pi.on("agent_end", async (event, ctx) => {
     if (currentTrace) {
       // Get final response/output
       const eventData = event as unknown as {
@@ -1417,6 +1438,22 @@ export default async function (pi: ExtensionAPI) {
         console.warn("📊 Langfuse: Failed to send evaluation scores", e);
       }
 
+      const piBranch = ctx.sessionManager.getBranch() as unknown as Array<Record<string, unknown>>;
+      const piTraceStartEntryId = findPiTraceStartEntryId(piBranch, currentTraceParentEntryId);
+      const piProvenance = buildPiTraceProvenance(piBranch, piTraceStartEntryId, currentPiSessionId);
+      if (piProvenance.errors.length) {
+        logMemoryError({
+          stage: "pi-provenance",
+          errors: piProvenance.errors,
+          traceId: currentTrace.id,
+          sessionId: currentSessionId,
+          piSessionId: currentPiSessionId,
+          parentEntryId: currentTraceParentEntryId || null,
+          startEntryId: piTraceStartEntryId || null,
+          branchLeafEntryId: ctx.sessionManager.getLeafId() || null,
+        });
+        console.warn(`📊 Langfuse: Pi provenance incomplete; details: ${MEMORY_ERROR_LOG_PATH}`);
+      }
       const memorySnapshot: TraceSnapshot = {
         traceId: currentTrace.id,
         traceTimestamp: currentTraceTimestamp,
@@ -1427,6 +1464,8 @@ export default async function (pi: ExtensionAPI) {
         userPrompt: currentUserPrompt,
         output,
         steps: buildObservationSteps(messages, traceSteps),
+        piProvenance: piProvenance.provenance,
+        piProvenanceErrors: piProvenance.errors,
       };
       enqueueTraceMemoryObservation(memorySnapshot);
       
@@ -1645,5 +1684,6 @@ export default async function (pi: ExtensionAPI) {
       client = null;
     }
     resetSessionState();
+    currentPiSessionId = "";
   });
 }

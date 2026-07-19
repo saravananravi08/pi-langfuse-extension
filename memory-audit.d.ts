@@ -31,6 +31,21 @@ export interface ObservationAudit {
   nonDeterministicScoreIds: string[];
 }
 
+export interface PiProvenanceAudit {
+  scores: number;
+  withProvenance: number;
+  complete: number;
+  missing: number;
+  incomplete: number;
+  invalid: number;
+  overlappingEntries: number;
+  missingScoreIds: string[];
+  incompleteScoreIds: string[];
+  invalidScoreIds: string[];
+  overlappingEntryIds: string[];
+}
+
+export function auditPiProvenance(scores: AuditScore[]): PiProvenanceAudit;
 export function auditObservationCoverage(traces: AuditTrace[], scores: AuditScore[], options: {
   scoreName: string;
   version: string;

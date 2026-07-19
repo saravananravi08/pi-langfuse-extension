@@ -16,6 +16,16 @@ const SEMANTIC_FIELDS = [
   "filesDeleted",
   "filesTouched",
   "toolsUsed",
+  "piUserEntryId",
+  "piFirstEntryId",
+  "piLastEntryId",
+  "piEntryIds",
+  "piMessageEntryIds",
+  "piToolPairs",
+  "sourcePiEntryIds",
+  "sourcePiRanges",
+  "sourcePiToolPairs",
+  "coveredThroughPiEntryId",
   "observationsMarkdown",
   "reflectionMarkdown",
 ];
@@ -123,6 +133,20 @@ export function formatMemoryResult(score) {
     sourceTraceIds: strings(metadata.sourceTraceIds, 20),
     sourceObservationScoreIds: strings(metadata.sourceObservationScoreIds, 20),
     sourceReflectionScoreIds: strings(metadata.sourceReflectionScoreIds, 20),
+    piProvenanceVersion: metadata.piProvenanceVersion || null,
+    piProvenanceStatus: metadata.piProvenanceStatus || null,
+    piProvenanceComplete: metadata.piProvenanceComplete ?? metadata.piProvenance?.complete ?? null,
+    piSessionId: metadata.piSessionId || metadata.piProvenance?.piSessionId || null,
+    piUserEntryId: metadata.piUserEntryId || metadata.piProvenance?.userEntryId || null,
+    piFirstEntryId: metadata.piFirstEntryId || metadata.piProvenance?.firstEntryId || null,
+    piLastEntryId: metadata.piLastEntryId || metadata.piProvenance?.lastEntryId || null,
+    coveredThroughPiEntryId: metadata.coveredThroughPiEntryId || null,
+    piEntryIds: strings(metadata.piEntryIds || metadata.piProvenance?.entryIds, 100),
+    piMessageEntryIds: strings(metadata.piMessageEntryIds || metadata.piProvenance?.messageEntryIds, 100),
+    missingPiProvenanceScoreIds: strings(metadata.missingPiProvenanceScoreIds, 100),
+    piToolPairs: Array.isArray(metadata.piToolPairs || metadata.piProvenance?.toolPairs)
+      ? (metadata.piToolPairs || metadata.piProvenance.toolPairs).slice(0, 100)
+      : [],
   };
   return redactSecrets(result);
 }

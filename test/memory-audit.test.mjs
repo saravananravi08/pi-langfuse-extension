@@ -1,6 +1,28 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { auditObservationCoverage } from '../memory-audit.js';
+import { auditObservationCoverage, auditPiProvenance } from '../memory-audit.js';
+
+test('audits missing, incomplete, invalid, and overlapping Pi provenance', () => {
+  const complete = {
+    version: 'pi-entry-v1', complete: true,
+    firstEntryId: 'u1', lastEntryId: 'a1', userEntryId: 'u1',
+    entryIds: ['u1', 'a1'], messageEntryIds: ['u1', 'a1'], toolPairs: [],
+    missingToolResultIds: [], orphanToolResultIds: [],
+  };
+  const report = auditPiProvenance([
+    { id: 'complete', metadata: { piProvenance: complete } },
+    { id: 'overlap', metadata: { piProvenance: { ...complete, firstEntryId: 'u2', entryIds: ['u2', 'a1'], userEntryId: 'u2', messageEntryIds: ['u2', 'a1'] } } },
+    { id: 'incomplete', metadata: { piProvenance: { ...complete, complete: false, firstEntryId: 'u3', lastEntryId: 'a3', entryIds: ['u3', 'a3'], messageEntryIds: ['u3', 'a3'], userEntryId: 'u3', missingToolResultIds: ['call'] } } },
+    { id: 'invalid', metadata: { piProvenance: { ...complete, firstEntryId: 'wrong', lastEntryId: 'a4', entryIds: ['u4', 'a4'], messageEntryIds: ['u4', 'a4'], userEntryId: 'u4' } } },
+    { id: 'missing', metadata: {} },
+  ]);
+  assert.equal(report.scores, 5);
+  assert.equal(report.complete, 2);
+  assert.deepEqual(report.missingScoreIds, ['missing']);
+  assert.deepEqual(report.incompleteScoreIds, ['incomplete']);
+  assert.deepEqual(report.invalidScoreIds, ['invalid']);
+  assert.deepEqual(report.overlappingEntryIds, ['a1']);
+});
 
 const options = {
   scoreName: 'memory_trace_observation',

@@ -1,3 +1,53 @@
+export function auditPiProvenance(scores) {
+  const missingScoreIds = [];
+  const incompleteScoreIds = [];
+  const invalidScoreIds = [];
+  const overlappingEntryIds = [];
+  const entryOwners = new Map();
+
+  for (const score of scores) {
+    const provenance = score.metadata?.piProvenance;
+    if (!provenance || provenance.version !== "pi-entry-v1") {
+      missingScoreIds.push(score.id);
+      continue;
+    }
+    const entryIds = Array.isArray(provenance.entryIds) ? provenance.entryIds : [];
+    const messageEntryIds = Array.isArray(provenance.messageEntryIds) ? provenance.messageEntryIds : [];
+    const toolPairs = Array.isArray(provenance.toolPairs) ? provenance.toolPairs : [];
+    const validRange = entryIds.length > 0
+      && provenance.firstEntryId === entryIds[0]
+      && provenance.lastEntryId === entryIds.at(-1)
+      && messageEntryIds.every(id => entryIds.includes(id))
+      && (!provenance.userEntryId || messageEntryIds.includes(provenance.userEntryId));
+    const validPairs = toolPairs.every(pair => pair.toolCallId
+      && messageEntryIds.includes(pair.assistantEntryId)
+      && messageEntryIds.includes(pair.toolResultEntryId));
+    if (!validRange || !validPairs) invalidScoreIds.push(score.id);
+    if (provenance.complete !== true || provenance.missingToolResultIds?.length || provenance.orphanToolResultIds?.length) {
+      incompleteScoreIds.push(score.id);
+    }
+    for (const entryId of entryIds) {
+      const owner = entryOwners.get(entryId);
+      if (owner && owner !== score.id) overlappingEntryIds.push(entryId);
+      else entryOwners.set(entryId, score.id);
+    }
+  }
+
+  return {
+    scores: scores.length,
+    withProvenance: scores.length - missingScoreIds.length,
+    complete: scores.length - new Set([...missingScoreIds, ...incompleteScoreIds, ...invalidScoreIds]).size,
+    missing: missingScoreIds.length,
+    incomplete: incompleteScoreIds.length,
+    invalid: invalidScoreIds.length,
+    overlappingEntries: new Set(overlappingEntryIds).size,
+    missingScoreIds,
+    incompleteScoreIds,
+    invalidScoreIds,
+    overlappingEntryIds: [...new Set(overlappingEntryIds)],
+  };
+}
+
 export function auditObservationCoverage(traces, scores, options) {
   const byTrace = new Map();
   for (const score of scores) {

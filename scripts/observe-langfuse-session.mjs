@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import crypto from 'node:crypto';
 import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory-prompts.js';
 import { validateMemoryOutput } from '../memory-validation.js';
-import { auditObservationCoverage } from '../memory-audit.js';
+import { auditObservationCoverage, auditPiProvenance } from '../memory-audit.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
@@ -56,7 +56,7 @@ if (auditMode) {
     version: VERSION,
     expectedScoreId: traceId => deterministicUuid(`${SCORE_NAME}:${VERSION}:${traceId}`),
   });
-  console.log(JSON.stringify({ sessionId, ...audit }, null, 2));
+  console.log(JSON.stringify({ sessionId, ...audit, piProvenance: auditPiProvenance(observationScores) }, null, 2));
   if (!backfill) process.exit(0);
   const missing = new Set([
     ...audit.eligibleMissingTraceIds,
