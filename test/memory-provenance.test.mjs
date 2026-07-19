@@ -66,6 +66,18 @@ test('reports missing boundaries and incomplete tool pairs', () => {
   assert.match(result.errors.join('; '), /no assistant call entry/);
 });
 
+test('records but does not require results for unexecuted errored tool calls', () => {
+  const entries = [
+    entry('u1', null, 'user', 'current'),
+    entry('a1', 'u1', 'assistant', [{ type: 'toolCall', id: 'never-ran', name: 'bash', arguments: {} }], { stopReason: 'error' }),
+  ];
+  const result = buildPiTraceProvenance(entries, 'u1', 'session');
+  assert.equal(result.provenance.complete, true);
+  assert.deepEqual(result.provenance.toolPairs, []);
+  assert.deepEqual(result.provenance.missingToolResultIds, []);
+  assert.deepEqual(result.provenance.unexecutedToolCallIds, ['never-ran']);
+});
+
 test('aggregates reflection ranges and preserves incomplete historical coverage', () => {
   const provenance = {
     version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true,

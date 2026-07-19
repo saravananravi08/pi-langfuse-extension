@@ -7,6 +7,10 @@ export function aggregatePiReflectionProvenance(previousMetadata, observations) 
   const missingPiProvenanceScoreIds = items.filter(item => !item.provenance?.complete).map(item => item.score.id);
   const previousRanges = Array.isArray(previousMetadata?.sourcePiRanges) ? previousMetadata.sourcePiRanges : [];
   const previousToolPairs = Array.isArray(previousMetadata?.sourcePiToolPairs) ? previousMetadata.sourcePiToolPairs : [];
+  const sourcePiUnexecutedToolCallIds = unique([
+    ...(Array.isArray(previousMetadata?.sourcePiUnexecutedToolCallIds) ? previousMetadata.sourcePiUnexecutedToolCallIds : []),
+    ...items.flatMap(item => item.provenance?.unexecutedToolCallIds || []),
+  ]);
   const sourcePiSessionIds = unique([
     ...(Array.isArray(previousMetadata?.sourcePiSessionIds) ? previousMetadata.sourcePiSessionIds : []),
     ...items.map(item => item.provenance?.piSessionId),
@@ -27,11 +31,14 @@ export function aggregatePiReflectionProvenance(previousMetadata, observations) 
   ];
   const sourcePiToolPairs = [
     ...previousToolPairs,
-    ...items.flatMap(item => (item.provenance?.toolPairs || []).map(pair => ({
-      observationScoreId: item.score.id,
-      traceId: item.score.traceId || item.score.metadata?.traceId || null,
-      ...pair,
-    }))),
+    ...items.flatMap(item => {
+      const unexecuted = new Set(item.provenance?.unexecutedToolCallIds || []);
+      return (item.provenance?.toolPairs || []).filter(pair => !unexecuted.has(pair.toolCallId)).map(pair => ({
+        observationScoreId: item.score.id,
+        traceId: item.score.traceId || item.score.metadata?.traceId || null,
+        ...pair,
+      }));
+    }),
   ];
   const previousComplete = previousMetadata ? previousMetadata.piProvenanceComplete === true : true;
   return {
@@ -42,6 +49,7 @@ export function aggregatePiReflectionProvenance(previousMetadata, observations) 
     sourcePiEntryIds,
     sourcePiRanges,
     sourcePiToolPairs,
+    sourcePiUnexecutedToolCallIds,
     coveredThroughPiEntryId: items.at(-1)?.provenance?.lastEntryId || null,
   };
 }
@@ -71,9 +79,14 @@ export function buildPiTraceProvenance(entries, startEntryId, piSessionId) {
   const assistantEntries = messageEntries.filter(entry => entry.message?.role === "assistant");
   const resultEntries = messageEntries.filter(entry => entry.message?.role === "toolResult");
   const calls = new Map();
+  const unexecutedToolCallIds = [];
   for (const entry of assistantEntries) {
     for (const part of Array.isArray(entry.message?.content) ? entry.message.content : []) {
       if (part?.type !== "toolCall" || !part.id) continue;
+      if (["aborted", "error"].includes(entry.message?.stopReason)) {
+        unexecutedToolCallIds.push(part.id);
+        continue;
+      }
       if (calls.has(part.id)) errors.push(`duplicate tool call id ${part.id}`);
       calls.set(part.id, { toolCallId: part.id, toolName: part.name || null, assistantEntryId: entry.id });
     }
@@ -114,6 +127,7 @@ export function buildPiTraceProvenance(entries, startEntryId, piSessionId) {
       toolPairs,
       missingToolResultIds,
       orphanToolResultIds,
+      unexecutedToolCallIds,
       complete: errors.length === 0,
     },
     errors,

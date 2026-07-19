@@ -101,6 +101,31 @@ test('retains trailing parallel tool results while Pi session entries catch up',
   assert.deepEqual(plan.messages.slice(1), [user2, call2, result2]);
 });
 
+test('does not require a result for a tool call from an errored assistant response', () => {
+  const errored = { role: 'assistant', content: [{ type: 'toolCall', id: 'never-ran', name: 'bash', arguments: {} }], stopReason: 'error', timestamp: 6 };
+  const currentBranch = [...branch, entry('a3', 'u2', errored)];
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, errored], currentBranch, 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.messages.slice(1), [user2, errored]);
+});
+
+test('accepts stale merged missing-pair metadata when the call is proven unexecuted', () => {
+  const user = { role: 'user', content: 'run', timestamp: 10 };
+  const errored = { role: 'assistant', content: [{ type: 'toolCall', id: 'never-ran', name: 'bash', arguments: {} }], stopReason: 'error', timestamp: 11 };
+  const entries = [entry('u10', null, user), entry('a10', 'u10', errored)];
+  const stale = {
+    version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true,
+    firstEntryId: 'u10', lastEntryId: 'a10', entryIds: ['u10', 'a10'],
+    toolPairs: [{ toolCallId: 'never-ran', assistantEntryId: 'a10', toolResultEntryId: null }],
+    missingToolResultIds: ['never-ran'], unexecutedToolCallIds: ['never-ran'],
+  };
+  const coverage = buildMemoryContextCoverage(undefined, [observation('stale', stale)], 'pi-session');
+  const plan = planMemoryContextReplacement([user, errored], entries, 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.deepEqual(coverage.toolPairs, []);
+});
+
 test('blocks replacement that cannot map an older model message or would split a tool pair', () => {
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
   const changedUser = { ...user1, content: 'changed older message' };

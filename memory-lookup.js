@@ -22,6 +22,7 @@ const SEMANTIC_FIELDS = [
   "piEntryIds",
   "piMessageEntryIds",
   "piToolPairs",
+  "piUnexecutedToolCallIds",
   "sourcePiEntryIds",
   "sourcePiRanges",
   "sourcePiToolPairs",
@@ -144,6 +145,7 @@ export function formatMemoryResult(score) {
     piEntryIds: strings(metadata.piEntryIds || metadata.piProvenance?.entryIds, 100),
     piMessageEntryIds: strings(metadata.piMessageEntryIds || metadata.piProvenance?.messageEntryIds, 100),
     missingPiProvenanceScoreIds: strings(metadata.missingPiProvenanceScoreIds, 100),
+    piUnexecutedToolCallIds: strings(metadata.piUnexecutedToolCallIds || metadata.piProvenance?.unexecutedToolCallIds, 100),
     piToolPairs: Array.isArray(metadata.piToolPairs || metadata.piProvenance?.toolPairs)
       ? (metadata.piToolPairs || metadata.piProvenance.toolPairs).slice(0, 100)
       : [],

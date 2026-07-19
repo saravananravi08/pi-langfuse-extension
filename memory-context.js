@@ -16,6 +16,7 @@ function metadata(score) {
 }
 
 function toolCallIds(message) {
+  if (["aborted", "error"].includes(message?.stopReason)) return [];
   return (Array.isArray(message?.content) ? message.content : [])
     .filter(part => part?.type === "toolCall" && part.id)
     .map(part => part.id);
@@ -30,6 +31,7 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
   const scoreIds = [];
   const ranges = [];
   const toolPairs = [];
+  const unexecutedToolCallIds = [];
   const piSessionIds = [];
 
   if (reflection) {
@@ -42,6 +44,7 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
       ranges.push(...value.sourcePiRanges);
     }
     if (Array.isArray(value.sourcePiToolPairs)) toolPairs.push(...value.sourcePiToolPairs);
+    if (Array.isArray(value.sourcePiUnexecutedToolCallIds)) unexecutedToolCallIds.push(...value.sourcePiUnexecutedToolCallIds);
     if (Array.isArray(value.sourcePiSessionIds)) piSessionIds.push(...value.sourcePiSessionIds);
     if (Array.isArray(value.missingPiProvenanceScoreIds) && value.missingPiProvenanceScoreIds.length) {
       reasons.push(`reflection ${reflection.id} reports missing observation provenance`);
@@ -63,11 +66,15 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
       lastEntryId: provenance.lastEntryId,
       entryIds: provenance.entryIds,
     });
-    toolPairs.push(...(Array.isArray(provenance.toolPairs) ? provenance.toolPairs.map(pair => ({
-      observationScoreId: observation.id,
-      traceId: observation.traceId || value.traceId || null,
-      ...pair,
-    })) : []));
+    const observationUnexecuted = new Set(Array.isArray(provenance.unexecutedToolCallIds) ? provenance.unexecutedToolCallIds : []);
+    unexecutedToolCallIds.push(...observationUnexecuted);
+    toolPairs.push(...(Array.isArray(provenance.toolPairs) ? provenance.toolPairs
+      .filter(pair => !observationUnexecuted.has(pair?.toolCallId))
+      .map(pair => ({
+        observationScoreId: observation.id,
+        traceId: observation.traceId || value.traceId || null,
+        ...pair,
+      })) : []));
     if (provenance.piSessionId) piSessionIds.push(provenance.piSessionId);
   }
 
@@ -102,6 +109,7 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
     entryIds: [...seenEntries.keys()],
     ranges,
     toolPairs,
+    unexecutedToolCallIds: unique(unexecutedToolCallIds),
     overlappingEntryIds: unique(overlappingEntryIds),
     coveredThroughEntryId: ranges.at(-1)?.lastEntryId || null,
   };
@@ -126,6 +134,14 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     if (actual.length !== entryIds.length || actual.some((id, index) => id !== entryIds[index])) {
       reasons.push(`memory range ${range?.observationScoreId || "unknown"} is not contiguous on current branch`);
     }
+  }
+
+  for (const toolCallId of coverage?.unexecutedToolCallIds || []) {
+    const interruptedCall = branchEntries.some(entry => entry?.type === "message"
+      && entry.message?.role === "assistant"
+      && ["aborted", "error"].includes(entry.message?.stopReason)
+      && (Array.isArray(entry.message?.content) ? entry.message.content : []).some(part => part?.type === "toolCall" && part.id === toolCallId));
+    if (!interruptedCall) reasons.push(`unexecuted tool call ${toolCallId} is not from an interrupted assistant response`);
   }
 
   for (const pair of coverage?.toolPairs || []) {

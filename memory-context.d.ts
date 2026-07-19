@@ -17,6 +17,7 @@ export interface MemoryContextCoverage {
   entryIds: string[];
   ranges: Array<Record<string, unknown>>;
   toolPairs: Array<Record<string, unknown>>;
+  unexecutedToolCallIds: string[];
   overlappingEntryIds: string[];
   coveredThroughEntryId: string | null;
 }

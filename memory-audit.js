@@ -23,7 +23,10 @@ export function auditPiProvenance(scores) {
       && messageEntryIds.includes(pair.assistantEntryId)
       && messageEntryIds.includes(pair.toolResultEntryId));
     if (!validRange || !validPairs) invalidScoreIds.push(score.id);
-    if (provenance.complete !== true || provenance.missingToolResultIds?.length || provenance.orphanToolResultIds?.length) {
+    const unexecuted = new Set(Array.isArray(provenance.unexecutedToolCallIds) ? provenance.unexecutedToolCallIds : []);
+    const unresolvedMissing = (Array.isArray(provenance.missingToolResultIds) ? provenance.missingToolResultIds : [])
+      .filter(toolCallId => !unexecuted.has(toolCallId));
+    if (provenance.complete !== true || unresolvedMissing.length || provenance.orphanToolResultIds?.length) {
       incompleteScoreIds.push(score.id);
     }
     for (const entryId of entryIds) {

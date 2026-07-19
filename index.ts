@@ -784,6 +784,7 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
       piEntryIds: snapshot.piProvenance?.entryIds || [],
       piMessageEntryIds: snapshot.piProvenance?.messageEntryIds || [],
       piToolPairs: snapshot.piProvenance?.toolPairs || [],
+      piUnexecutedToolCallIds: snapshot.piProvenance?.unexecutedToolCallIds || [],
       piProvenance: snapshot.piProvenance || null,
       generatedAt: new Date().toISOString(),
     },

@@ -21,6 +21,7 @@ export interface PiTraceProvenance {
   toolPairs: PiToolPair[];
   missingToolResultIds: string[];
   orphanToolResultIds: string[];
+  unexecutedToolCallIds: string[];
   complete: boolean;
 }
 
