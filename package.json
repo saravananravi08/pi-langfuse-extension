@@ -4,6 +4,9 @@
 	"description": "Langfuse observability extension for Pi coding agent with tracing and optional observational memory reflections.",
 	"type": "module",
 	"main": "index.ts",
+	"scripts": {
+		"test": "node --test"
+	},
 	"keywords": [
 		"pi-package",
 		"langfuse",
@@ -54,8 +57,11 @@
 		"index.ts",
 		"memory-prompts.js",
 		"memory-prompts.d.ts",
+		"memory-validation.js",
+		"memory-validation.d.ts",
 		"config.example.json",
 		"docs",
-		"scripts"
+		"scripts",
+		"test"
 	]
 }

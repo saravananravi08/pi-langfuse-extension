@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
 import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory-prompts.js';
+import { validateMemoryOutput } from '../memory-validation.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
@@ -191,7 +192,26 @@ function buildTimeline(trace, observations) {
 
 async function observeTrace(trace, observations, timeline) {
   const system = OBSERVER_SYSTEM_PROMPT;
-  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract trace-level memory and return ONLY valid JSON with keys: observationsMarkdown, summary, goal, constraints, currentTask, taskStatus, completed, inProgress, openIssues, decisions, nextSteps, criticalContext, filesRead, filesModified, filesCreated, filesDeleted, toolsUsed.`;
+  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract trace-level memory and return ONLY valid JSON with this shape:
+{
+  "observationsMarkdown": "Date: <date from trace>\\n* 🔴 (<time>) ...",
+  "summary": "one short paragraph",
+  "goal": ["user goal"],
+  "constraints": ["requirement or preference"],
+  "currentTask": "current task/status after this trace",
+  "taskStatus": "active | waiting_for_user | blocked | complete",
+  "completed": ["verified completed outcome"],
+  "inProgress": ["unfinished work"],
+  "openIssues": ["remaining issue or blocker"],
+  "decisions": ["decision and rationale"],
+  "nextSteps": ["next action"],
+  "criticalContext": ["detail required to continue"],
+  "filesRead": ["path inspected"],
+  "filesModified": ["path changed"],
+  "filesCreated": ["path created"],
+  "filesDeleted": ["path deleted"],
+  "toolsUsed": ["tool name"]
+}`;
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const text = await observerComplete(system, user);
@@ -248,9 +268,8 @@ async function observerComplete(system, user) {
 function parseObserverJson(text) {
   const jsonText = extractJson(text);
   const parsed = JSON.parse(jsonText);
-  if (!String(parsed.observationsMarkdown || '').trim() || !String(parsed.summary || '').trim()) {
-    throw new Error('Observer output missing observationsMarkdown or summary');
-  }
+  const validationError = validateMemoryOutput(parsed, 'observer');
+  if (validationError) throw new Error(`Invalid observer schema: ${validationError}`);
   return {
     observationsMarkdown: String(parsed.observationsMarkdown).trim(),
     summary: String(parsed.summary).trim(),

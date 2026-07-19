@@ -26,6 +26,7 @@ import {
   REFLECTION_COMPRESSION_GUIDANCE,
   REQUIRED_REFLECTION_HEADINGS,
 } from "./memory-prompts.js";
+import { validateMemoryOutput } from "./memory-validation.js";
 
 // ============================================
 // Configuration
@@ -550,9 +551,8 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
     try {
       if (detectDegenerateRepetition(text)) throw new Error("Observer output contains degenerate repetition");
       const candidate = JSON.parse(extractJsonObject(text)) as Record<string, unknown>;
-      if (!String(candidate.observationsMarkdown || "").trim() || !String(candidate.summary || "").trim()) {
-        throw new Error("Observer output missing observationsMarkdown or summary");
-      }
+      const validationError = validateMemoryOutput(candidate, "observer");
+      if (validationError) throw new Error(`Invalid observer schema: ${validationError}`);
       parsed = candidate;
       break;
     } catch (error) {
@@ -881,9 +881,8 @@ Target reflectionMarkdown size: at most ${targetTokens} estimated tokens.`;
       } catch (error) {
         throw new MemoryOutputValidationError(`Reflector returned invalid JSON: ${error instanceof Error ? error.message : error}`);
       }
-      if (!String(candidate.reflectionMarkdown || "").trim() || !String(candidate.summary || "").trim()) {
-        throw new MemoryOutputValidationError("Reflector output missing reflectionMarkdown or summary");
-      }
+      const validationError = validateMemoryOutput(candidate, "reflection");
+      if (validationError) throw new MemoryOutputValidationError(`Invalid reflector schema: ${validationError}`);
       const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !String(candidate.reflectionMarkdown).includes(heading));
       if (missingHeading) throw new MemoryOutputValidationError(`Reflector output missing ${missingHeading}`);
       const outputTokens = estimateTokens(candidate.reflectionMarkdown);
