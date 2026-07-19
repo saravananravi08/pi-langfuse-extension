@@ -1,6 +1,37 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildMemoryContextText, replaceWithMemoryContext } from '../memory-context.js';
+import {
+  buildMemoryContextCoverage,
+  buildMemoryContextText,
+  formatMemoryContextPreview,
+  planMemoryContextReplacement,
+} from '../memory-context.js';
+
+function entry(id, parentId, message) {
+  return { type: 'message', id, parentId, timestamp: new Date(message.timestamp).toISOString(), message };
+}
+
+function observation(id, provenance) {
+  return { id, traceId: `trace-${id}`, metadata: { piProvenance: provenance } };
+}
+
+const user1 = { role: 'user', content: 'old user', timestamp: 1 };
+const call1 = { role: 'assistant', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: {} }], timestamp: 2 };
+const result1 = { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'result' }], timestamp: 3 };
+const answer1 = { role: 'assistant', content: [{ type: 'text', text: 'old answer' }], timestamp: 4 };
+const user2 = { role: 'user', content: 'current user', timestamp: 5 };
+const branch = [
+  entry('u1', null, user1),
+  entry('a1', 'u1', call1),
+  entry('r1', 'a1', result1),
+  entry('a2', 'r1', answer1),
+  entry('u2', 'a2', user2),
+];
+const provenance = {
+  version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true,
+  firstEntryId: 'u1', lastEntryId: 'a2', entryIds: ['u1', 'a1', 'r1', 'a2'],
+  toolPairs: [{ toolCallId: 'call-1', assistantEntryId: 'a1', toolResultEntryId: 'r1' }],
+};
 
 test('builds bounded untrusted memory with provenance and newest observations', () => {
   const text = buildMemoryContextText({
@@ -18,33 +49,59 @@ test('builds bounded untrusted memory with provenance and newest observations', 
   assert.match(text, /\[REDACTED\]/);
 });
 
-test('replaces old history while retaining two complete user turns', () => {
-  const messages = [
-    { role: 'user', content: 'old user' },
-    { role: 'assistant', content: [{ type: 'text', text: 'old answer' }] },
-    { role: 'user', content: 'recent user' },
-    { role: 'assistant', content: [{ type: 'toolCall', id: 'call-1', name: 'read', arguments: {} }] },
-    { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'result' }] },
-    { role: 'assistant', content: [{ type: 'text', text: 'recent answer' }] },
-    { role: 'user', content: 'current user' },
-  ];
+test('drops only exactly covered entries and preserves current turn and complete tool pairs', () => {
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, 123);
 
-  const replaced = replaceWithMemoryContext(messages, 'memory', 2, 123);
-  assert.equal(replaced[0].customType, 'langfuse-memory-context');
-  assert.equal(replaced[0].timestamp, 123);
-  assert.deepEqual(replaced.slice(1), messages.slice(2));
-  assert.equal(replaced.find(message => message.role === 'toolResult')?.toolCallId, 'call-1');
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.droppedEntryIds, ['u1', 'a1', 'r1', 'a2']);
+  assert.deepEqual(plan.retainedEntryIds, ['u2']);
+  assert.equal(plan.messages[0].customType, 'langfuse-memory-context');
+  assert.deepEqual(plan.messages.slice(1), [user2]);
+  assert.equal(plan.toolPairs[0].toolCallId, 'call-1');
 });
 
-test('does not replace context without active memory and removes stale injected copies', () => {
-  const messages = [{ role: 'user', content: 'current' }];
-  assert.equal(replaceWithMemoryContext(messages, ''), messages);
+test('blocks incomplete, overlapping, mismatched-session, and non-contiguous provenance', () => {
+  const incomplete = buildMemoryContextCoverage(undefined, [observation('bad', { ...provenance, complete: false })], 'pi-session');
+  assert.equal(incomplete.safe, false);
 
-  const withStale = [
-    { role: 'custom', customType: 'langfuse-memory-context', content: 'stale' },
-    { role: 'user', content: 'current' },
-  ];
-  const replaced = replaceWithMemoryContext(withStale, 'fresh', 2, 123);
-  assert.equal(replaced.filter(message => message.customType === 'langfuse-memory-context').length, 1);
-  assert.equal(replaced[0].content, 'fresh');
+  const overlap = buildMemoryContextCoverage(undefined, [
+    observation('one', provenance),
+    observation('two', { ...provenance, firstEntryId: 'a2', entryIds: ['a2'], toolPairs: [] }),
+  ], 'pi-session');
+  assert.equal(overlap.safe, false);
+  assert.deepEqual(overlap.overlappingEntryIds, ['a2']);
+
+  const mismatch = buildMemoryContextCoverage(undefined, [observation('one', provenance)], 'other-session');
+  assert.equal(mismatch.safe, false);
+
+  const coverage = buildMemoryContextCoverage(undefined, [observation('one', { ...provenance, entryIds: ['u1', 'r1', 'a2'] })], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage);
+  assert.equal(plan.safe, false);
+  assert.match(plan.reasons.join('\n'), /not contiguous/);
+});
+
+test('blocks replacement that cannot map a model message or would split a tool pair', () => {
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const changedUser = { ...user2, content: 'changed by another extension' };
+  const unmapped = planMemoryContextReplacement([user1, call1, result1, answer1, changedUser], branch, 'memory', coverage);
+  assert.equal(unmapped.safe, false);
+  assert.match(unmapped.reasons.join('\n'), /cannot be mapped/);
+
+  const splitCoverage = { ...coverage, entryIds: ['u1', 'a1'], ranges: [{ observationScoreId: 'x', firstEntryId: 'u1', lastEntryId: 'a1', entryIds: ['u1', 'a1'] }] };
+  const split = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', splitCoverage);
+  assert.equal(split.safe, false);
+  assert.match(split.reasons.join('\n'), /split tool pair/);
+});
+
+test('preview exposes score, entry, tool-pair, and token decisions', () => {
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage);
+  const preview = JSON.parse(formatMemoryContextPreview(plan));
+  assert.equal(preview.safe, true);
+  assert.deepEqual(preview.scoreIds, ['score-1']);
+  assert.equal(preview.droppedEntryCount, 4);
+  assert.equal(preview.retainedEntryCount, 1);
+  assert.equal(preview.toolPairCount, 1);
+  assert.ok(preview.tokens.replacement > 0);
 });

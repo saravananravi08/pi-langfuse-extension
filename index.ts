@@ -15,10 +15,10 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { buildSessionContext, type ExtensionAPI, type SessionEntry } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import {
   OBSERVER_PROMPT_VERSION,
@@ -32,7 +32,9 @@ import { validateMemoryOutput } from "./memory-validation.js";
 import { createMemoryCache } from "./memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
-import { buildMemoryContextText, replaceWithMemoryContext } from "./memory-context.js";
+import { buildMemoryContextCoverage, buildMemoryContextText, formatMemoryContextPreview, planMemoryContextReplacement } from "./memory-context.js";
+import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory-pi-entries.js";
+import { abortableSleep as sleep, isAbortError } from "./memory-lifecycle.js";
 import { appendMemoryErrorLog, describeMemoryOutput } from "./memory-error-log.js";
 import { aggregatePiReflectionProvenance, buildPiTraceProvenance, findPiTraceStartEntryId, type PiTraceProvenance } from "./memory-provenance.js";
 import {
@@ -240,6 +242,8 @@ let currentProvider: string = "";
 let currentCwd: string = "";
 let currentTraceParentEntryId: string = "";
 let currentPiSessionId: string = "";
+let currentPiSessionFile: string = "";
+let memoryLifecycleController = new AbortController();
 const activeSpans: Map<string, SpanData> = new Map();
 const traceSteps: TraceStep[] = [];
 const memoryQueues = new Map<string, Promise<void>>();
@@ -248,6 +252,7 @@ let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
 const lookupTraceCache = new Map<string, { value: Record<string, unknown>; loadedAt: number }>();
 let memoryContextEnabled = false;
 let lastMemoryContextErrorAt = 0;
+const PI_SESSIONS_ROOT = join(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "sessions");
 
 // Evaluation tracking state
 let toolCallCount: number = 0;
@@ -381,10 +386,6 @@ function detectDegenerateRepetition(text: string): boolean {
   return (total > 5 && duplicates / total > 0.4) || text.split("\n").some(line => line.length > 50_000);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function retryAfterMs(response: Response, raw: string, attempt: number): number {
   const seconds = Number(response.headers.get("retry-after"));
   if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 30) * 1000;
@@ -486,6 +487,7 @@ async function observerComplete(
   label = "Observer",
   temperature = 0.1,
   diagnostics: Record<string, unknown> = {},
+  signal?: AbortSignal,
 ): Promise<string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
@@ -520,14 +522,17 @@ async function observerComplete(
   };
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    signal?.throwIfAborted();
     let response: Response;
     try {
       response = await fetch(endpoint, {
         method: "POST",
         headers,
         body: requestBody,
+        signal,
       });
     } catch (error) {
+      if (isAbortError(error)) throw error;
       lastError = error;
       logMemoryError({
         ...requestDiagnostics,
@@ -538,7 +543,7 @@ async function observerComplete(
       });
       if (attempt === 3) break;
       console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/3); details: ${MEMORY_ERROR_LOG_PATH}`);
-      await sleep(attempt * 1000);
+      await sleep(attempt * 1000, signal);
       continue;
     }
 
@@ -558,7 +563,7 @@ async function observerComplete(
       });
       if (retryable && attempt < 3) {
         console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/3); details: ${MEMORY_ERROR_LOG_PATH}`);
-        await sleep(retryDelayMs);
+        await sleep(retryDelayMs, signal);
         continue;
       }
       throw new Error(`${label} model ${response.status}`);
@@ -631,7 +636,7 @@ function buildTraceTimeline(snapshot: TraceSnapshot) {
   return lines.join("\n");
 }
 
-async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
+async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: AbortSignal) {
   if (!OBSERVER_ENABLED || !OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
 
   const timeline = buildTraceTimeline(snapshot);
@@ -664,7 +669,7 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
       sessionId: snapshot.sessionId,
       pathKey: snapshot.cwd,
       promptVersion: OBSERVER_PROMPT_VERSION,
-    });
+    }, signal);
     let outputShape: Record<string, unknown> | undefined;
     try {
       if (detectDegenerateRepetition(text)) throw new Error("Observer output contains degenerate repetition");
@@ -786,9 +791,12 @@ function langfuseRetryAfterMs(response: Response, raw: string, attempt: number):
 
 async function langfuseRequest(path: string, init: RequestInit = {}): Promise<{ response: Response; raw: string }> {
   const request = langfuseRequestQueue.catch(() => undefined).then(async () => {
+    const signal = init.signal;
+    signal?.throwIfAborted();
     const auth = Buffer.from(`${config.publicKey}:${config.secretKey}`).toString("base64");
     let lastError: unknown;
     for (let attempt = 1; attempt <= 5; attempt++) {
+      signal?.throwIfAborted();
       let response: Response;
       try {
         response = await fetch(`${config.host}${path}`, {
@@ -796,9 +804,10 @@ async function langfuseRequest(path: string, init: RequestInit = {}): Promise<{ 
           headers: { Authorization: `Basic ${auth}`, ...init.headers },
         });
       } catch (error) {
+        if (isAbortError(error)) throw error;
         lastError = error;
         if (attempt < 5) {
-          await sleep(Math.min(2 ** (attempt - 1) * 1000, 10_000));
+          await sleep(Math.min(2 ** (attempt - 1) * 1000, 10_000), signal);
           continue;
         }
         break;
@@ -807,7 +816,7 @@ async function langfuseRequest(path: string, init: RequestInit = {}): Promise<{ 
       if (response.ok) return { response, raw };
       const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
       if (!retryable || attempt === 5) throw new Error(`Langfuse ${init.method || "GET"} ${response.status}: ${raw.slice(0, 500)}`);
-      await sleep(langfuseRetryAfterMs(response, raw, attempt));
+      await sleep(langfuseRetryAfterMs(response, raw, attempt), signal);
     }
     throw new Error(`Langfuse ${init.method || "GET"} failed after 5 attempts`, { cause: lastError });
   });
@@ -820,22 +829,22 @@ async function langfuseGet(path: string, signal?: AbortSignal): Promise<Record<s
   return raw ? JSON.parse(raw) : {};
 }
 
-async function fetchScoreIdsForSession(sessionId: string): Promise<string[]> {
+async function fetchScoreIdsForSession(sessionId: string, signal?: AbortSignal): Promise<string[]> {
   const ids: string[] = [];
   for (let page = 1; ; page++) {
     const params = new URLSearchParams({ sessionId, page: String(page), limit: "100", fields: "core,scores" });
-    const response = await langfuseGet(`/api/public/traces?${params}`) as { data?: Array<{ scores?: string[] }>; meta?: { totalPages?: number } };
+    const response = await langfuseGet(`/api/public/traces?${params}`, signal) as { data?: Array<{ scores?: string[] }>; meta?: { totalPages?: number } };
     for (const trace of response.data || []) ids.push(...(trace.scores || []));
     if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
   }
   return unique(ids);
 }
 
-async function fetchScoresByIds(ids: string[], name: string): Promise<MemoryScore[]> {
+async function fetchScoresByIds(ids: string[], name: string, signal?: AbortSignal): Promise<MemoryScore[]> {
   const scores: MemoryScore[] = [];
   for (let offset = 0; offset < ids.length; offset += 50) {
     const params = new URLSearchParams({ name, dataType: "CATEGORICAL", limit: "100", scoreIds: ids.slice(offset, offset + 50).join(",") });
-    const response = await langfuseGet(`/api/public/v2/scores?${params}`) as { data?: MemoryScore[] };
+    const response = await langfuseGet(`/api/public/v2/scores?${params}`, signal) as { data?: MemoryScore[] };
     scores.push(...(response.data || []));
   }
   return scores;
@@ -852,15 +861,15 @@ async function fetchScoresByName(name: string, signal?: AbortSignal): Promise<Me
   return scores;
 }
 
-async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservation: MemoryScore, forceRefresh = false): Promise<ActiveSessionMemory> {
+async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservation: MemoryScore, forceRefresh = false, signal?: AbortSignal): Promise<ActiveSessionMemory> {
   const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
   sessionMemoryCache.addObservation(scopeKey, currentObservation);
 
   if (forceRefresh || sessionMemoryCache.needsRefresh(scopeKey)) {
-    const scoreIds = await fetchScoreIdsForSession(snapshot.sessionId);
+    const scoreIds = await fetchScoreIdsForSession(snapshot.sessionId, signal);
     const [observations, reflections] = await Promise.all([
-      fetchScoresByIds(scoreIds, MEMORY_SCORE_NAME),
-      fetchScoresByName(REFLECTION_SCORE_NAME),
+      fetchScoresByIds(scoreIds, MEMORY_SCORE_NAME, signal),
+      fetchScoresByName(REFLECTION_SCORE_NAME, signal),
     ]);
     sessionMemoryCache.mergeRemote(
       scopeKey,
@@ -879,7 +888,7 @@ async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservatio
   );
 }
 
-async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSessionMemory): Promise<void> {
+async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSessionMemory, signal?: AbortSignal): Promise<void> {
   const previous = memory.latestReflection;
   const previousFields = reflectionFields(previous);
   const newObservationFields = memory.newObservations.map(observationFields);
@@ -940,6 +949,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
           previousReflectionScoreId: previous?.id || null,
           sourceObservationCount: memory.newObservations.length,
         },
+        signal,
       );
       responseChars = text.length;
       if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError("Reflector output contains degenerate repetition");
@@ -1066,11 +1076,11 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     metadata,
   };
 
-  await writeMemoryScore(score);
+  await writeMemoryScore(score, signal);
   sessionMemoryCache.setReflection(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
 }
 
-async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore): Promise<void> {
+async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore, signal?: AbortSignal): Promise<void> {
   if (!REFLECTION_ENABLED || !snapshot.sessionId) return;
   const thresholds = {
     activeTokens: REFLECTION_THRESHOLD_TOKENS,
@@ -1079,38 +1089,41 @@ async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObser
   };
   const scopeKey = memoryScopeKey(snapshot.sessionId, snapshot.cwd);
   const refreshesDuringRead = sessionMemoryCache.needsRefresh(scopeKey);
-  let memory = await getActiveSessionMemory(snapshot, currentObservation);
+  let memory = await getActiveSessionMemory(snapshot, currentObservation, false, signal);
   if (!reflectionThresholdMet(memory, thresholds)) return;
 
   // Refresh before writing so external batch reflections cannot cause a stale generation.
-  if (!refreshesDuringRead) memory = await getActiveSessionMemory(snapshot, currentObservation, true);
+  if (!refreshesDuringRead) memory = await getActiveSessionMemory(snapshot, currentObservation, true, signal);
   if (!reflectionThresholdMet(memory, thresholds)) return;
-  await writeSessionReflection(snapshot, memory);
+  await writeSessionReflection(snapshot, memory, signal);
 }
 
-async function writeMemoryScore(score: Record<string, unknown>): Promise<void> {
+async function writeMemoryScore(score: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
   await langfuseRequest("/api/public/scores", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(score),
+    signal,
   });
   lookupScoresCache = undefined;
 }
 
-async function writeTraceMemoryObservation(snapshot: TraceSnapshot): Promise<void> {
-  const score = await generateTraceMemoryObservation(snapshot);
+async function writeTraceMemoryObservation(snapshot: TraceSnapshot, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  const score = await generateTraceMemoryObservation(snapshot, signal);
   if (!score) return;
-  await writeMemoryScore(score);
+  await writeMemoryScore(score, signal);
   sessionMemoryCache.addObservation(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
-  await maybeWriteSessionReflection(snapshot, score);
+  await maybeWriteSessionReflection(snapshot, score, signal);
 }
 
-function enqueueTraceMemoryObservation(snapshot: TraceSnapshot): void {
+function enqueueTraceMemoryObservation(snapshot: TraceSnapshot, signal: AbortSignal): void {
   const key = `${snapshot.sessionId}:${snapshot.cwd}`;
   const previous = memoryQueues.get(key) || Promise.resolve();
-  const task = previous.catch(() => undefined).then(() => writeTraceMemoryObservation(snapshot));
+  const task = previous.catch(() => undefined).then(() => writeTraceMemoryObservation(snapshot, signal));
   memoryQueues.set(key, task);
   void task.catch(e => {
+    if (isAbortError(e)) return;
     logMemoryError({
       stage: "memory-update",
       error: errorMessage(e),
@@ -1136,7 +1149,7 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
   return scores;
 }
 
-function buildContextMemoryPayload(scores: MemoryScore[], sessionId: string, pathKey: string) {
+function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string) {
   const memory = buildActiveMemory(
     scores.filter(score => score.name === MEMORY_SCORE_NAME),
     scores.filter(score => score.name === REFLECTION_SCORE_NAME),
@@ -1144,7 +1157,7 @@ function buildContextMemoryPayload(scores: MemoryScore[], sessionId: string, pat
     pathKey,
     MEMORY_SCORE_VERSION,
   );
-  return {
+  const payload = {
     reflection: memory.latestReflection ? {
       scoreId: memory.latestReflection.id,
       generation: memory.latestReflection.metadata?.generation || null,
@@ -1160,6 +1173,10 @@ function buildContextMemoryPayload(scores: MemoryScore[], sessionId: string, pat
       generatedAt: generatedAt(score),
       fields: observationFields(score),
     })),
+  };
+  return {
+    payload,
+    coverage: buildMemoryContextCoverage(memory.latestReflection, memory.newObservations, piSessionId),
   };
 }
 
@@ -1229,35 +1246,61 @@ export default async function (pi: ExtensionAPI) {
   console.log("📊 Langfuse: Tracing enabled →", config.host);
 
   pi.registerCommand("memory-context", {
-    description: "Toggle Langfuse memory-based context replacement",
+    description: "Preview or toggle provenance-gated Langfuse context replacement",
     handler: async (args, ctx) => {
       const action = args.trim().toLowerCase();
       if (action === "status") {
         ctx.ui.notify(`Langfuse memory context replacement is ${memoryContextEnabled ? "on" : "off"}.`, "info");
         return;
       }
-      if (action && action !== "on" && action !== "off") {
-        ctx.ui.notify("Usage: /memory-context [on|off|status]", "warning");
+      if (action && !["on", "off", "preview"].includes(action)) {
+        ctx.ui.notify("Usage: /memory-context [on|off|status|preview]", "warning");
         return;
       }
-      memoryContextEnabled = action === "on" || (action === "" && !memoryContextEnabled);
-      pi.appendEntry("langfuse-memory-context-state", { enabled: memoryContextEnabled });
-      ctx.ui.notify(
-        memoryContextEnabled
-          ? "Langfuse memory context replacement enabled. Latest memory plus two recent user turns will be sent to the model."
-          : "Langfuse memory context replacement disabled. Full Pi context will be sent to the model.",
-        "info",
-      );
+      const enabling = action === "on" || (action === "" && !memoryContextEnabled);
+      if (action === "off" || (action === "" && memoryContextEnabled)) {
+        memoryContextEnabled = false;
+        pi.appendEntry("langfuse-memory-context-state", { enabled: false });
+        ctx.ui.notify("Langfuse memory context replacement disabled. Full Pi context will be sent to the model.", "info");
+        return;
+      }
+
+      try {
+        const scores = await getLookupScores(true, ctx.signal);
+        const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId);
+        const memoryText = buildMemoryContextText(state.payload);
+        const branch = ctx.sessionManager.getBranch() as unknown as SessionEntry[];
+        const messages = buildSessionContext(branch, ctx.sessionManager.getLeafId()).messages;
+        const plan = planMemoryContextReplacement(messages, branch as unknown as Array<Record<string, unknown>>, memoryText, state.coverage);
+        if (action === "preview") {
+          ctx.ui.notify(formatMemoryContextPreview(plan), plan.safe ? "info" : "warning");
+          return;
+        }
+        if (enabling && !plan.safe) {
+          memoryContextEnabled = false;
+          pi.appendEntry("langfuse-memory-context-state", { enabled: false });
+          ctx.ui.notify(`Langfuse memory context replacement blocked:\n${plan.reasons.join("\n")}`, "warning");
+          return;
+        }
+        memoryContextEnabled = true;
+        pi.appendEntry("langfuse-memory-context-state", { enabled: true });
+        ctx.ui.notify("Langfuse memory context replacement enabled with exact Pi-entry boundaries.", "info");
+      } catch (error) {
+        memoryContextEnabled = false;
+        pi.appendEntry("langfuse-memory-context-state", { enabled: false });
+        ctx.ui.notify(`Langfuse memory context replacement blocked: ${errorMessage(error)}`, "warning");
+      }
     },
   });
 
   pi.registerTool({
     name: "langfuse_memory_lookup",
     label: "Langfuse Memory Lookup",
-    description: "Search scoped Langfuse memory observations/reflections with provenance. Defaults to current session and cwd. Optionally returns bounded source-trace details for at most two traces.",
+    description: "Search scoped Langfuse memory with provenance. Optionally returns bounded source traces and exact redacted Pi session entries.",
     promptSnippet: "Search prior Langfuse observations/reflections with provenance",
     promptGuidelines: [
       "Use langfuse_memory_lookup when exact older session details, decisions, files, errors, IDs, or covered source traces are needed.",
+      "Set includePiEntries only when exact original Pi entry content is required; output is bounded and redacted.",
     ],
     parameters: Type.Object({
       query: Type.Optional(Type.String({ description: "Text, path, symbol, error, URL, or identifier to find." })),
@@ -1267,6 +1310,7 @@ export default async function (pi: ExtensionAPI) {
       traceId: Type.Optional(Type.String({ description: "Exact source trace ID." })),
       scoreId: Type.Optional(Type.String({ description: "Exact observation/reflection score ID." })),
       includeSource: Type.Optional(Type.Boolean({ description: "Include bounded original trace/tool details for up to two matching source traces." })),
+      includePiEntries: Type.Optional(Type.Boolean({ description: "Include up to 50 exact redacted Pi session entries per matched session." })),
       refresh: Type.Optional(Type.Boolean({ description: "Bypass five-minute lookup cache." })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum memory results; default 5." })),
     }),
@@ -1292,13 +1336,46 @@ export default async function (pi: ExtensionAPI) {
       const sourceTraces = params.includeSource
         ? await Promise.all(sourceTraceIds.map(traceId => getLookupTrace(traceId, Boolean(params.refresh), signal)))
         : [];
+      const piEntries = [];
+      if (params.includePiEntries) {
+        signal?.throwIfAborted();
+        const groups = new Map<string, MemoryScore[]>();
+        for (const { score } of matches) {
+          const scoreSessionId = metadataString(score, "sessionId") || score.sessionId || "";
+          if (!scoreSessionId) continue;
+          const group = groups.get(scoreSessionId) || [];
+          group.push(score);
+          groups.set(scoreSessionId, group);
+        }
+        for (const [scoreSessionId, group] of [...groups].slice(0, 2)) {
+          const piSessionIds = unique(group.flatMap(score => [
+            metadataString(score, "piSessionId"),
+            ...metadataStrings(score, "sourcePiSessionIds"),
+            String((score.metadata?.piProvenance as Record<string, unknown> | undefined)?.piSessionId || ""),
+          ]));
+          const ids = provenanceEntryIds(group, Number.MAX_SAFE_INTEGER);
+          const sessionFile = findPiSessionFile(
+            PI_SESSIONS_ROOT,
+            scoreSessionId,
+            piSessionIds[0] || "",
+            scoreSessionId === currentSessionId ? currentPiSessionFile : "",
+          );
+          piEntries.push({
+            sessionId: scoreSessionId,
+            piSessionId: piSessionIds[0] || null,
+            ...readBoundedPiEntries(sessionFile, ids, 50, 3000),
+          });
+        }
+      }
       const payload = redactSecrets({
         scope: { mode: scope, sessionId: scope === "session" ? sessionId || null : null, pathKey: scope === "all" ? null : pathKey || null },
         query: params.query || null,
         resultCount: results.length,
         results,
         sourceTraces,
+        piEntries,
         sourceDetailsLimited: Boolean(params.includeSource),
+        piEntriesLimited: Boolean(params.includePiEntries),
       }) as Record<string, unknown>;
       const text = clampText(payload, 48_000);
       return {
@@ -1310,9 +1387,12 @@ export default async function (pi: ExtensionAPI) {
 
   // Capture session ID on session start
   pi.on("session_start", async (_event, ctx) => {
+    memoryLifecycleController.abort(new DOMException("Pi session changed", "AbortError"));
+    memoryLifecycleController = new AbortController();
     currentSessionId = "";
     currentPiSessionId = ctx.sessionManager.getSessionId();
     const sessionFile = ctx.sessionManager.getSessionFile();
+    currentPiSessionFile = sessionFile || "";
     if (sessionFile) {
       // Extract session ID from file path (format: 2026-04-25T13-23-54-756Z_<uuid>.jsonl)
       const filename = sessionFile.split('/').pop() || '';
@@ -1333,10 +1413,20 @@ export default async function (pi: ExtensionAPI) {
     if (!memoryContextEnabled || !currentSessionId) return;
     try {
       const scores = await getLookupScores(false, ctx.signal);
-      const memoryText = buildMemoryContextText(buildContextMemoryPayload(scores, currentSessionId, ctx.cwd));
-      if (!memoryText) return;
-      return { messages: replaceWithMemoryContext(event.messages, memoryText, 2) };
+      const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId);
+      const memoryText = buildMemoryContextText(state.payload);
+      const branch = ctx.sessionManager.getBranch() as unknown as Array<Record<string, unknown>>;
+      const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage);
+      if (!plan.safe) {
+        memoryContextEnabled = false;
+        pi.appendEntry("langfuse-memory-context-state", { enabled: false });
+        ctx.ui.notify(`Langfuse memory context replacement disabled:\n${plan.reasons.join("\n")}`, "warning");
+        return;
+      }
+      return { messages: plan.messages as typeof event.messages };
     } catch (error) {
+      memoryContextEnabled = false;
+      pi.appendEntry("langfuse-memory-context-state", { enabled: false });
       if (Date.now() - lastMemoryContextErrorAt > 60_000) {
         logMemoryError({
           stage: "context-replacement",
@@ -1345,7 +1435,7 @@ export default async function (pi: ExtensionAPI) {
           sessionId: currentSessionId,
           pathKey: ctx.cwd,
         });
-        console.warn(`📊 Langfuse: Memory context replacement skipped; details: ${MEMORY_ERROR_LOG_PATH}`, error);
+        console.warn(`📊 Langfuse: Memory context replacement disabled; details: ${MEMORY_ERROR_LOG_PATH}`, error);
         lastMemoryContextErrorAt = Date.now();
       }
       return;
@@ -1467,7 +1557,7 @@ export default async function (pi: ExtensionAPI) {
         piProvenance: piProvenance.provenance,
         piProvenanceErrors: piProvenance.errors,
       };
-      enqueueTraceMemoryObservation(memorySnapshot);
+      enqueueTraceMemoryObservation(memorySnapshot, memoryLifecycleController.signal);
       
       currentTrace = null;
     }
@@ -1673,6 +1763,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    memoryLifecycleController.abort(new DOMException("Pi session shut down", "AbortError"));
     if (currentTrace) {
       if (currentTrace.update) {
         currentTrace.update({ metadata: { completed: true } });
@@ -1685,5 +1776,6 @@ export default async function (pi: ExtensionAPI) {
     }
     resetSessionState();
     currentPiSessionId = "";
+    currentPiSessionFile = "";
   });
 }

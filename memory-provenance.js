@@ -7,6 +7,10 @@ export function aggregatePiReflectionProvenance(previousMetadata, observations) 
   const missingPiProvenanceScoreIds = items.filter(item => !item.provenance?.complete).map(item => item.score.id);
   const previousRanges = Array.isArray(previousMetadata?.sourcePiRanges) ? previousMetadata.sourcePiRanges : [];
   const previousToolPairs = Array.isArray(previousMetadata?.sourcePiToolPairs) ? previousMetadata.sourcePiToolPairs : [];
+  const sourcePiSessionIds = unique([
+    ...(Array.isArray(previousMetadata?.sourcePiSessionIds) ? previousMetadata.sourcePiSessionIds : []),
+    ...items.map(item => item.provenance?.piSessionId),
+  ]);
   const sourcePiEntryIds = unique([
     ...(Array.isArray(previousMetadata?.sourcePiEntryIds) ? previousMetadata.sourcePiEntryIds : []),
     ...items.flatMap(item => item.provenance?.entryIds || []),
@@ -34,6 +38,7 @@ export function aggregatePiReflectionProvenance(previousMetadata, observations) 
     piProvenanceVersion: "pi-entry-v1",
     piProvenanceComplete: previousComplete && missingPiProvenanceScoreIds.length === 0,
     missingPiProvenanceScoreIds,
+    sourcePiSessionIds,
     sourcePiEntryIds,
     sourcePiRanges,
     sourcePiToolPairs,

@@ -99,9 +99,9 @@ Observer, reflection, model connection/HTTP retry, memory-update, and context-re
 
 New trace observations record exact `pi-entry-v1` provenance from Pi's active session branch: first/last/user/message entry IDs plus assistant tool-call/result entry pairs. Reflections aggregate source entry ranges and expose `coveredThroughPiEntryId`; `piProvenanceComplete` remains false when any covered historical observation lacks deterministic provenance. `--audit` reports missing, incomplete, invalid, and overlapping provenance separately.
 
-The `langfuse_memory_lookup` tool searches observations and reflections. It defaults to the current session and cwd, supports exact trace/score IDs and broader path/all scopes, caches score reads for five minutes, returns score/trace provenance, redacts secret-like values, and can include bounded source details for up to two traces.
+The `langfuse_memory_lookup` tool searches observations and reflections. It defaults to the current session and cwd, supports exact trace/score IDs and broader path/all scopes, caches score reads for five minutes, returns score/trace provenance, and redacts secret-like values. `includeSource` adds bounded details for at most two traces; `includePiEntries` adds at most 50 exact redacted Pi entries per matched session.
 
-Model-visible history replacement is disabled by default. Use `/memory-context on` to replace older model context with the latest scoped reflection, uncovered observations, and the two most recent complete user turns. Use `/memory-context off` to restore full Pi context or `/memory-context status` to inspect the session setting. The setting persists in the Pi session; stored history is never deleted.
+Model-visible history replacement is disabled by default. `/memory-context preview` reports score IDs, exact retained/dropped Pi entry IDs, tool pairs, and estimated tokens without changing context. `/memory-context on` succeeds only when every active-memory range is complete, non-overlapping, contiguous on the current branch, belongs to the current Pi session, and preserves complete tool pairs. `/memory-context off` restores full Pi context; `/memory-context status` shows the setting. Stored session history is never deleted. Session changes and shutdown abort queued or running observer/reflector requests.
 
 For npm install, find the extension at:
 ```

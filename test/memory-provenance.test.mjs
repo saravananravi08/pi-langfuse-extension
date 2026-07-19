@@ -68,7 +68,7 @@ test('reports missing boundaries and incomplete tool pairs', () => {
 
 test('aggregates reflection ranges and preserves incomplete historical coverage', () => {
   const provenance = {
-    version: 'pi-entry-v1', complete: true,
+    version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true,
     firstEntryId: 'u2', lastEntryId: 'a2', entryIds: ['u2', 'a2'],
     toolPairs: [{ toolCallId: 'call', assistantEntryId: 'a2', toolResultEntryId: 'r2' }],
   };
@@ -79,6 +79,7 @@ test('aggregates reflection ranges and preserves incomplete historical coverage'
   }, [{ id: 'new', traceId: 'trace-new', metadata: { piProvenance: provenance } }]);
 
   assert.equal(result.piProvenanceComplete, false);
+  assert.deepEqual(result.sourcePiSessionIds, ['pi-session']);
   assert.deepEqual(result.sourcePiEntryIds, ['u1', 'a1', 'u2', 'a2']);
   assert.equal(result.sourcePiRanges.at(-1).observationScoreId, 'new');
   assert.equal(result.sourcePiToolPairs[0].traceId, 'trace-new');
