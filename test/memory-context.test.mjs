@@ -82,10 +82,18 @@ test('blocks incomplete, overlapping, mismatched-session, and non-contiguous pro
   assert.match(plan.reasons.join('\n'), /not contiguous/);
 });
 
-test('blocks replacement that cannot map a model message or would split a tool pair', () => {
+test('retains a trailing current user before its Pi entry becomes visible', () => {
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
-  const changedUser = { ...user2, content: 'changed by another extension' };
-  const unmapped = planMemoryContextReplacement([user1, call1, result1, answer1, changedUser], branch, 'memory', coverage);
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch.slice(0, 4), 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.retainedUnmappedUserIndexes, [4]);
+  assert.deepEqual(plan.messages.slice(1), [user2]);
+});
+
+test('blocks replacement that cannot map an older model message or would split a tool pair', () => {
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const changedUser = { ...user1, content: 'changed older message' };
+  const unmapped = planMemoryContextReplacement([changedUser, call1, result1, answer1, user2], branch, 'memory', coverage);
   assert.equal(unmapped.safe, false);
   assert.match(unmapped.reasons.join('\n'), /cannot be mapped/);
 

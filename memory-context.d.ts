@@ -30,6 +30,7 @@ export interface MemoryContextPlan {
   droppedEntryIds: string[];
   retainedEntryIds: string[];
   unmappedMessageIndexes: number[];
+  retainedUnmappedUserIndexes: number[];
   toolPairs: Array<Record<string, unknown>>;
   originalTokensEstimated: number;
   memoryTokensEstimated: number;

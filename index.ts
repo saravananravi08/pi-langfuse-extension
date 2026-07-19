@@ -1314,7 +1314,7 @@ export default async function (pi: ExtensionAPI) {
           contextWindow: ctx.model?.contextWindow,
           replacementTokensEstimated: plan.replacementTokensEstimated,
           droppedEntryCount: plan.droppedEntryIds.length,
-          retainedEntryCount: plan.retainedEntryIds.length,
+          retainedEntryCount: plan.retainedEntryIds.length + plan.retainedUnmappedUserIndexes.length,
         };
         updateMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: true });
@@ -1466,7 +1466,7 @@ export default async function (pi: ExtensionAPI) {
         contextWindow: ctx.model?.contextWindow,
         replacementTokensEstimated: plan.replacementTokensEstimated,
         droppedEntryCount: plan.droppedEntryIds.length,
-        retainedEntryCount: plan.retainedEntryIds.length,
+        retainedEntryCount: plan.retainedEntryIds.length + plan.retainedUnmappedUserIndexes.length,
       };
       updateMemoryContextWidget(ctx.ui);
       return { messages: plan.messages as typeof event.messages };
