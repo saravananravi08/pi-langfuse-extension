@@ -72,6 +72,8 @@
 		"memory-lookup.d.ts",
 		"memory-context.js",
 		"memory-context.d.ts",
+		"memory-error-log.js",
+		"memory-error-log.d.ts",
 		"config.example.json",
 		"docs",
 		"scripts",

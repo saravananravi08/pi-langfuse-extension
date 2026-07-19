@@ -14,6 +14,7 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -32,6 +33,7 @@ import { createMemoryCache } from "./memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
 import { buildMemoryContextText, replaceWithMemoryContext } from "./memory-context.js";
+import { appendMemoryErrorLog, describeMemoryOutput } from "./memory-error-log.js";
 import {
   buildActiveMemory,
   estimateTokens,
@@ -102,6 +104,24 @@ function loadConfig(): Config {
 }
 
 const config = loadConfig();
+const MEMORY_ERROR_LOG_PATH = process.env.PI_LANGFUSE_MEMORY_ERROR_LOG
+  || resolve(homedir(), ".pi", "agent", "logs", "langfuse-memory-errors.jsonl");
+let memoryErrorLogWarningShown = false;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function logMemoryError(entry: Record<string, unknown>): void {
+  try {
+    appendMemoryErrorLog(MEMORY_ERROR_LOG_PATH, entry);
+  } catch (error) {
+    if (!memoryErrorLogWarningShown) {
+      console.warn(`📊 Langfuse: Failed to write memory error log ${MEMORY_ERROR_LOG_PATH}`, error);
+      memoryErrorLogWarningShown = true;
+    }
+  }
+}
 
 // ============================================
 // Langfuse Client (lazy-loaded via dynamic import)
@@ -568,17 +588,32 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
   let lastError: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const text = await observerComplete(OBSERVER_SYSTEM_PROMPT, user, 6000, "Observer", 0.1);
+    let outputShape: Record<string, unknown> | undefined;
     try {
       if (detectDegenerateRepetition(text)) throw new Error("Observer output contains degenerate repetition");
       const candidate = JSON.parse(extractJsonObject(text)) as Record<string, unknown>;
+      outputShape = describeMemoryOutput(candidate);
       const validationError = validateMemoryOutput(candidate, "observer");
       if (validationError) throw new Error(`Invalid observer schema: ${validationError}`);
       parsed = candidate;
       break;
     } catch (error) {
       lastError = error;
+      logMemoryError({
+        stage: "observer-validation",
+        attempt,
+        maxAttempts: 2,
+        error: errorMessage(error),
+        responseChars: text.length,
+        outputShape,
+        traceId: snapshot.traceId,
+        sessionId: snapshot.sessionId,
+        pathKey: snapshot.cwd,
+        promptVersion: OBSERVER_PROMPT_VERSION,
+        model: OBSERVER_MODEL,
+      });
       if (attempt === 2) throw error;
-      console.warn("📊 Langfuse: Invalid observer output; retrying once");
+      console.warn(`📊 Langfuse: Invalid observer output; retrying once; details: ${MEMORY_ERROR_LOG_PATH}`);
     }
   }
   if (!parsed) throw lastError;
@@ -801,6 +836,8 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   let correction = "";
   for (let attempt = 1; attempt <= compressionGuidance.length; attempt++) {
     compressionAttempt = attempt;
+    let responseChars = 0;
+    let outputShape: Record<string, unknown> | undefined;
     try {
       const text = await observerComplete(
         REFLECTION_SYSTEM_PROMPT,
@@ -809,10 +846,12 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         "Reflector",
         0,
       );
+      responseChars = text.length;
       if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError("Reflector output contains degenerate repetition");
       let candidate: Record<string, unknown>;
       try {
         candidate = JSON.parse(extractJsonObject(text)) as Record<string, unknown>;
+        outputShape = describeMemoryOutput(candidate);
       } catch (error) {
         throw new MemoryOutputValidationError(`Reflector returned invalid JSON: ${error instanceof Error ? error.message : error}`);
       }
@@ -851,9 +890,25 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     } catch (error) {
       if (!(error instanceof MemoryOutputValidationError) && !(error instanceof SyntaxError)) throw error;
       lastError = error;
+      logMemoryError({
+        stage: "reflection-validation",
+        attempt,
+        maxAttempts: compressionGuidance.length,
+        error: errorMessage(error),
+        responseChars,
+        outputShape,
+        sessionId: snapshot.sessionId,
+        pathKey: snapshot.cwd,
+        promptVersion: REFLECTION_PROMPT_VERSION,
+        model: OBSERVER_MODEL,
+        targetTokens,
+        activeTokens: memory.activeTokens,
+        previousReflectionScoreId: previous?.id || null,
+        sourceObservationScoreIds: memory.newObservations.map(score => score.id),
+      });
       correction = `\nPrevious output was rejected: ${error instanceof Error ? error.message : error}. Correct that issue in the next output.`;
       if (attempt < compressionGuidance.length) {
-        console.warn(`📊 Langfuse: Reflection validation failed; retrying compression (${attempt}/${compressionGuidance.length})`);
+        console.warn(`📊 Langfuse: Reflection validation failed; retrying compression (${attempt}/${compressionGuidance.length}); details: ${MEMORY_ERROR_LOG_PATH}`);
       }
     }
   }
@@ -959,7 +1014,15 @@ function enqueueTraceMemoryObservation(snapshot: TraceSnapshot): void {
   const task = previous.catch(() => undefined).then(() => writeTraceMemoryObservation(snapshot));
   memoryQueues.set(key, task);
   void task.catch(e => {
-    console.warn("📊 Langfuse: Failed to update observational memory", e);
+    logMemoryError({
+      stage: "memory-update",
+      error: errorMessage(e),
+      stack: e instanceof Error ? e.stack : undefined,
+      traceId: snapshot.traceId,
+      sessionId: snapshot.sessionId,
+      pathKey: snapshot.cwd,
+    });
+    console.warn(`📊 Langfuse: Failed to update observational memory; details: ${MEMORY_ERROR_LOG_PATH}`, e);
   }).finally(() => {
     if (memoryQueues.get(key) === task) memoryQueues.delete(key);
   });
@@ -1177,7 +1240,14 @@ export default async function (pi: ExtensionAPI) {
       return { messages: replaceWithMemoryContext(event.messages, memoryText, 2) };
     } catch (error) {
       if (Date.now() - lastMemoryContextErrorAt > 60_000) {
-        console.warn("📊 Langfuse: Memory context replacement skipped", error);
+        logMemoryError({
+          stage: "context-replacement",
+          error: errorMessage(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          sessionId: currentSessionId,
+          pathKey: ctx.cwd,
+        });
+        console.warn(`📊 Langfuse: Memory context replacement skipped; details: ${MEMORY_ERROR_LOG_PATH}`, error);
         lastMemoryContextErrorAt = Date.now();
       }
       return;
