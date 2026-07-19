@@ -112,6 +112,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function requestErrorDetails(error: unknown): Record<string, unknown> {
+  const cause = error && typeof error === "object" ? (error as { cause?: unknown }).cause : undefined;
+  const code = cause && typeof cause === "object" ? (cause as { code?: unknown }).code : undefined;
+  return {
+    error: errorMessage(error),
+    cause: cause ? errorMessage(cause) : undefined,
+    code: typeof code === "string" ? code : undefined,
+  };
+}
+
 function logMemoryError(entry: Record<string, unknown>): void {
   try {
     appendMemoryErrorLog(MEMORY_ERROR_LOG_PATH, entry);
@@ -463,7 +473,14 @@ function buildObservationSteps(messages: ObservedAgentMessage[], existingSteps: 
   return [...steps.values()];
 }
 
-async function observerComplete(system: string, user: string, maxTokens = 4000, label = "Observer", temperature = 0.1): Promise<string> {
+async function observerComplete(
+  system: string,
+  user: string,
+  maxTokens = 4000,
+  label = "Observer",
+  temperature = 0.1,
+  diagnostics: Record<string, unknown> = {},
+): Promise<string> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
     "Content-Type": "application/json",
@@ -486,19 +503,35 @@ async function observerComplete(system: string, user: string, maxTokens = 4000, 
         messages: [{ role: "user", content: user }],
       };
 
+  const endpoint = observerEndpoint();
+  const requestBody = JSON.stringify(body);
+  const requestDiagnostics = {
+    stage: `${label.toLowerCase()}-request`,
+    endpointHost: new URL(endpoint).host,
+    requestChars: requestBody.length,
+    model: OBSERVER_MODEL,
+    ...diagnostics,
+  };
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt++) {
     let response: Response;
     try {
-      response = await fetch(observerEndpoint(), {
+      response = await fetch(endpoint, {
         method: "POST",
         headers,
-        body: JSON.stringify(body),
+        body: requestBody,
       });
     } catch (error) {
       lastError = error;
+      logMemoryError({
+        ...requestDiagnostics,
+        kind: "connection",
+        attempt,
+        maxAttempts: 3,
+        ...requestErrorDetails(error),
+      });
       if (attempt === 3) break;
-      console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/3)`);
+      console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/3); details: ${MEMORY_ERROR_LOG_PATH}`);
       await sleep(attempt * 1000);
       continue;
     }
@@ -506,22 +539,55 @@ async function observerComplete(system: string, user: string, maxTokens = 4000, 
     const raw = await response.text();
     if (!response.ok) {
       const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      const retryDelayMs = retryable ? retryAfterMs(response, raw, attempt) : 0;
+      logMemoryError({
+        ...requestDiagnostics,
+        kind: "http",
+        attempt,
+        maxAttempts: 3,
+        status: response.status,
+        retryable,
+        retryDelayMs,
+        responseChars: raw.length,
+      });
       if (retryable && attempt < 3) {
-        console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/3)`);
-        await sleep(retryAfterMs(response, raw, attempt));
+        console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/3); details: ${MEMORY_ERROR_LOG_PATH}`);
+        await sleep(retryDelayMs);
         continue;
       }
-      throw new Error(`${label} model ${response.status}: ${raw.slice(0, 500)}`);
+      throw new Error(`${label} model ${response.status}`);
     }
 
-    const data = JSON.parse(raw);
+    let data: Record<string, any>;
+    try {
+      data = JSON.parse(raw) as Record<string, any>;
+    } catch (error) {
+      logMemoryError({
+        ...requestDiagnostics,
+        kind: "invalid-response-json",
+        attempt,
+        maxAttempts: 3,
+        responseChars: raw.length,
+        ...requestErrorDetails(error),
+      });
+      throw error;
+    }
     const text = OBSERVER_API === "openai"
       ? data.choices?.[0]?.message?.content
       : (data.content || [])
           .filter((part: { type?: string; text?: string }) => part.type === "text" && part.text)
           .map((part: { text: string }) => part.text)
           .join("\n");
-    if (!text?.trim()) throw new Error(`${label} model returned no text`);
+    if (!text?.trim()) {
+      logMemoryError({
+        ...requestDiagnostics,
+        kind: "empty-response",
+        attempt,
+        maxAttempts: 3,
+        responseChars: raw.length,
+      });
+      throw new Error(`${label} model returned no text`);
+    }
     return text.trim();
   }
 
@@ -587,7 +653,12 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot) {
   let parsed: Record<string, unknown> | undefined;
   let lastError: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const text = await observerComplete(OBSERVER_SYSTEM_PROMPT, user, 6000, "Observer", 0.1);
+    const text = await observerComplete(OBSERVER_SYSTEM_PROMPT, user, 6000, "Observer", 0.1, {
+      traceId: snapshot.traceId,
+      sessionId: snapshot.sessionId,
+      pathKey: snapshot.cwd,
+      promptVersion: OBSERVER_PROMPT_VERSION,
+    });
     let outputShape: Record<string, unknown> | undefined;
     try {
       if (detectDegenerateRepetition(text)) throw new Error("Observer output contains degenerate repetition");
@@ -845,6 +916,13 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         6000,
         "Reflector",
         0,
+        {
+          sessionId: snapshot.sessionId,
+          pathKey: snapshot.cwd,
+          promptVersion: REFLECTION_PROMPT_VERSION,
+          previousReflectionScoreId: previous?.id || null,
+          sourceObservationCount: memory.newObservations.length,
+        },
       );
       responseChars = text.length;
       if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError("Reflector output contains degenerate repetition");
