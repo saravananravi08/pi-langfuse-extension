@@ -226,19 +226,24 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
 
 function formatTokens(tokens) {
   if (!Number.isFinite(tokens)) return "?";
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}m`;
-  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+  if (tokens >= 1_000_000) {
+    const millions = tokens / 1_000_000;
+    return `${Number.isInteger(millions) ? millions : millions.toFixed(1)}m`;
+  }
+  if (tokens >= 1_000) {
+    const thousands = tokens / 1_000;
+    return `${Number.isInteger(thousands) ? thousands : thousands.toFixed(1)}k`;
+  }
   return String(Math.round(tokens));
 }
 
 export function formatMemoryContextStatus(status) {
-  const actual = Number.isFinite(status.actualInputTokens)
-    ? `${formatTokens(status.actualInputTokens)}/${formatTokens(status.contextWindow)} (${status.contextWindow > 0 ? ((status.actualInputTokens / status.contextWindow) * 100).toFixed(1) : "?"}%)`
-    : "awaiting next response";
   const replacement = Number.isFinite(status.replacementTokensEstimated)
     ? formatTokens(status.replacementTokensEstimated)
     : "?";
-  return `Memory context ON | actual request: ${actual} | replacement messages est: ${replacement} | entries dropped/retained: ${status.droppedEntryCount || 0}/${status.retainedEntryCount || 0}`;
+  if (!Number.isFinite(status.actualInputTokens)) return `Memory ON · awaiting usage · est ${replacement}`;
+  const percent = status.contextWindow > 0 ? ((status.actualInputTokens / status.contextWindow) * 100).toFixed(1) : "?";
+  return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}`;
 }
 
 export function formatMemoryContextPreview(plan, maxIds = 20) {

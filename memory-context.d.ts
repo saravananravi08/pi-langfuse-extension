@@ -57,6 +57,4 @@ export function formatMemoryContextStatus(status: {
   actualInputTokens?: number;
   contextWindow?: number;
   replacementTokensEstimated?: number;
-  droppedEntryCount?: number;
-  retainedEntryCount?: number;
 }): string;

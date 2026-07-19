@@ -106,9 +106,9 @@ test('blocks replacement that cannot map an older model message or would split a
 test('formats actual provider usage separately from replacement-message estimate', () => {
   assert.equal(
     formatMemoryContextStatus({ actualInputTokens: 67_728, contextWindow: 272_000, replacementTokensEstimated: 7_128, droppedEntryCount: 40, retainedEntryCount: 5 }),
-    'Memory context ON | actual request: 67.7k/272.0k (24.9%) | replacement messages est: 7.1k | entries dropped/retained: 40/5',
+    'Memory 24.9%/272k · est 7.1k',
   );
-  assert.match(formatMemoryContextStatus({}), /awaiting next response/);
+  assert.equal(formatMemoryContextStatus({ replacementTokensEstimated: 7_128 }), 'Memory ON · awaiting usage · est 7.1k');
 });
 
 test('preview exposes score, entry, tool-pair, and token decisions', () => {

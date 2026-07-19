@@ -255,26 +255,23 @@ let memoryContextDisplay: {
   actualInputTokens?: number;
   contextWindow?: number;
   replacementTokensEstimated?: number;
-  droppedEntryCount?: number;
-  retainedEntryCount?: number;
 } = {};
 let lastMemoryContextErrorAt = 0;
 const PI_SESSIONS_ROOT = join(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "sessions");
-const MEMORY_CONTEXT_WIDGET = "langfuse-memory-context-usage";
+const MEMORY_CONTEXT_STATUS = "langfuse-memory-context-usage";
 
-type MemoryContextWidgetUi = {
-  setWidget(key: string, value: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+type MemoryContextStatusUi = {
+  setStatus(key: string, value: string | undefined): void;
 };
 
-function updateMemoryContextWidget(ui: MemoryContextWidgetUi): void {
-  ui.setWidget(
-    MEMORY_CONTEXT_WIDGET,
-    memoryContextEnabled ? [formatMemoryContextStatus(memoryContextDisplay)] : undefined,
-    { placement: "belowEditor" },
+function updateMemoryContextWidget(ui: MemoryContextStatusUi): void {
+  ui.setStatus(
+    MEMORY_CONTEXT_STATUS,
+    memoryContextEnabled ? formatMemoryContextStatus(memoryContextDisplay) : undefined,
   );
 }
 
-function resetMemoryContextWidget(ui: MemoryContextWidgetUi): void {
+function resetMemoryContextWidget(ui: MemoryContextStatusUi): void {
   memoryContextDisplay = {};
   updateMemoryContextWidget(ui);
 }
@@ -1313,8 +1310,6 @@ export default async function (pi: ExtensionAPI) {
         memoryContextDisplay = {
           contextWindow: ctx.model?.contextWindow,
           replacementTokensEstimated: plan.replacementTokensEstimated,
-          droppedEntryCount: plan.droppedEntryIds.length,
-          retainedEntryCount: plan.retainedEntryIds.length + plan.retainedUnmappedUserIndexes.length,
         };
         updateMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: true });
@@ -1465,8 +1460,6 @@ export default async function (pi: ExtensionAPI) {
         ...memoryContextDisplay,
         contextWindow: ctx.model?.contextWindow,
         replacementTokensEstimated: plan.replacementTokensEstimated,
-        droppedEntryCount: plan.droppedEntryIds.length,
-        retainedEntryCount: plan.retainedEntryIds.length + plan.retainedUnmappedUserIndexes.length,
       };
       updateMemoryContextWidget(ctx.ui);
       return { messages: plan.messages as typeof event.messages };
