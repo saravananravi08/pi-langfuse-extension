@@ -38,6 +38,27 @@ function estimateContext(value) {
   return { tokens: Math.ceil(json.length / 4), imageCount };
 }
 
+export function filterMemoryScoresForBranch(scores, branchEntries) {
+  const branchEntryIds = new Set((branchEntries || []).map(entry => typeof entry === "string" ? entry : entry?.id).filter(Boolean));
+  if (!branchEntryIds.size) return scores;
+
+  return scores.filter(score => {
+    const value = metadata(score);
+    const ranges = Array.isArray(value.sourcePiRanges) ? value.sourcePiRanges : null;
+    if (ranges) {
+      const rangeEntryIds = ranges.map(range => Array.isArray(range?.entryIds) ? range.entryIds.filter(Boolean) : []);
+      if (!rangeEntryIds.length || rangeEntryIds.some(ids => !ids.length)) return true;
+      return rangeEntryIds.every(ids => ids.every(id => branchEntryIds.has(id)));
+    }
+
+    const entryIds = Array.isArray(value.piProvenance?.entryIds)
+      ? value.piProvenance.entryIds.filter(Boolean)
+      : Array.isArray(value.piEntryIds) ? value.piEntryIds.filter(Boolean) : [];
+    if (!entryIds.length) return true;
+    return entryIds.some(id => branchEntryIds.has(id));
+  });
+}
+
 export function buildMemoryContextCoverage(reflection, observations, expectedPiSessionId = "") {
   const reasons = [];
   const scoreIds = [];

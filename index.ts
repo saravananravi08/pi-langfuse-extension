@@ -32,7 +32,7 @@ import { validateMemoryOutput } from "./memory/memory-validation.js";
 import { createMemoryCache } from "./memory/memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory/memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
-import { buildMemoryContextCoverage, buildMemoryContextText, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
+import { buildMemoryContextCoverage, buildMemoryContextText, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
 import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory/memory-pi-entries.js";
 import { abortableSleep as sleep, isAbortError } from "./memory/memory-lifecycle.js";
 import { appendMemoryErrorLog, describeMemoryOutput } from "./memory/memory-error-log.js";
@@ -214,6 +214,8 @@ interface TraceSnapshot {
   steps: TraceStep[];
   piProvenance?: PiTraceProvenance;
   piProvenanceErrors: string[];
+  piBranchEntryIds: string[];
+  interrupted: boolean;
 }
 
 interface AgentContentPart {
@@ -230,6 +232,7 @@ interface ObservedAgentMessage {
   toolCallId?: string;
   toolName?: string;
   isError?: boolean;
+  stopReason?: string;
   timestamp?: number | string;
 }
 
@@ -349,6 +352,7 @@ interface ActiveSessionMemory {
   newObservations: MemoryScore[];
   activeTokens: number;
   newObservationTokens: number;
+  nextGeneration?: number;
 }
 
 function positiveInteger(value: unknown, fallback: number): number {
@@ -902,14 +906,21 @@ async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservatio
     );
   }
 
-  const cached = sessionMemoryCache.get(scopeKey);
-  return buildActiveMemory(
-    cached.observations,
-    cached.reflection ? [cached.reflection] : [],
+  const cached = sessionMemoryCache.getAll(scopeKey);
+  const branchObservations = filterMemoryScoresForBranch(cached.observations, snapshot.piBranchEntryIds);
+  const branchReflections = filterMemoryScoresForBranch(cached.reflections, snapshot.piBranchEntryIds);
+  const memory = buildActiveMemory(
+    branchObservations,
+    branchReflections,
     snapshot.sessionId,
     snapshot.cwd,
     MEMORY_SCORE_VERSION,
-  );
+  ) as ActiveSessionMemory;
+  memory.nextGeneration = Math.max(
+    Number(memory.latestReflection?.metadata?.generation || 0),
+    Number(cached.reflection?.metadata?.generation || 0),
+  ) + 1;
+  return memory;
 }
 
 async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSessionMemory, signal?: AbortSignal): Promise<void> {
@@ -1042,7 +1053,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     }
   }
   if (!parsed) throw lastError;
-  const generation = Number(previous?.metadata?.generation || 0) + 1;
+  const generation = memory.nextGeneration || Number(previous?.metadata?.generation || 0) + 1;
   const sourceObservationScoreIds = memory.newObservations.map(score => score.id);
   const sourceTraceIds = unique(memory.newObservations.map(score => score.traceId || metadataString(score, "traceId")));
   const coveredUntil = generatedAt(memory.newObservations[memory.newObservations.length - 1]!);
@@ -1138,7 +1149,7 @@ async function writeTraceMemoryObservation(snapshot: TraceSnapshot, signal?: Abo
   if (!score) return;
   await writeMemoryScore(score, signal);
   sessionMemoryCache.addObservation(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
-  await maybeWriteSessionReflection(snapshot, score, signal);
+  if (!snapshot.interrupted) await maybeWriteSessionReflection(snapshot, score, signal);
 }
 
 function enqueueTraceMemoryObservation(snapshot: TraceSnapshot, signal: AbortSignal): void {
@@ -1173,10 +1184,11 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
   return scores;
 }
 
-function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string) {
+function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string, branch: Array<Record<string, unknown>>) {
+  const branchScores = filterMemoryScoresForBranch(scores, branch);
   const memory = buildActiveMemory(
-    scores.filter(score => score.name === MEMORY_SCORE_NAME),
-    scores.filter(score => score.name === REFLECTION_SCORE_NAME),
+    branchScores.filter(score => score.name === MEMORY_SCORE_NAME),
+    branchScores.filter(score => score.name === REFLECTION_SCORE_NAME),
     sessionId,
     pathKey,
     MEMORY_SCORE_VERSION,
@@ -1292,9 +1304,9 @@ export default async function (pi: ExtensionAPI) {
 
       try {
         const scores = await getLookupScores(true, ctx.signal);
-        const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId);
-        const memoryText = buildMemoryContextText(state.payload);
         const branch = ctx.sessionManager.getBranch() as unknown as SessionEntry[];
+        const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch as unknown as Array<Record<string, unknown>>);
+        const memoryText = buildMemoryContextText(state.payload);
         const messages = buildSessionContext(branch, ctx.sessionManager.getLeafId()).messages;
         const plan = planMemoryContextReplacement(messages, branch as unknown as Array<Record<string, unknown>>, memoryText, state.coverage);
         if (action === "preview") {
@@ -1448,9 +1460,9 @@ export default async function (pi: ExtensionAPI) {
     if (!memoryContextEnabled || !currentSessionId) return;
     try {
       const scores = await getLookupScores(false, ctx.signal);
-      const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId);
-      const memoryText = buildMemoryContextText(state.payload);
       const branch = ctx.sessionManager.getBranch() as unknown as Array<Record<string, unknown>>;
+      const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch);
+      const memoryText = buildMemoryContextText(state.payload);
       const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage);
       if (!plan.safe) {
         memoryContextEnabled = false;
@@ -1541,6 +1553,7 @@ export default async function (pi: ExtensionAPI) {
       };
       const messages = eventData.messages || [];
       const lastAssistant = messages.filter(m => m.role === "assistant").pop();
+      const interrupted = ["aborted", "error"].includes(lastAssistant?.stopReason || "");
       
       // Extract text from content array (filter out thinking blocks)
       let output: string | undefined = undefined;
@@ -1558,7 +1571,9 @@ export default async function (pi: ExtensionAPI) {
       currentTrace.update?.({ 
         output: output || undefined,
         metadata: { 
-          completed: true, 
+          completed: !interrupted,
+          interrupted,
+          stopReason: lastAssistant?.stopReason || null,
           totalTools: toolCallCount,
           model: currentModel,
           provider: currentProvider,
@@ -1608,6 +1623,8 @@ export default async function (pi: ExtensionAPI) {
         steps: buildObservationSteps(messages, traceSteps),
         piProvenance: piProvenance.provenance,
         piProvenanceErrors: piProvenance.errors,
+        piBranchEntryIds: piBranch.map(entry => String(entry.id || "")).filter(Boolean),
+        interrupted,
       };
       enqueueTraceMemoryObservation(memorySnapshot, memoryLifecycleController.signal);
       

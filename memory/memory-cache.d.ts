@@ -6,12 +6,17 @@ export interface MemoryCacheSnapshot {
   loadedAt?: number;
 }
 
+export interface FullMemoryCacheSnapshot extends MemoryCacheSnapshot {
+  reflections: MemoryScore[];
+}
+
 export interface MemoryCache {
   needsRefresh(key: string): boolean;
   mergeRemote(key: string, observations: MemoryScore[], reflections: MemoryScore[]): void;
   addObservation(key: string, observation: MemoryScore): void;
   setReflection(key: string, reflection: MemoryScore): void;
   get(key: string): MemoryCacheSnapshot;
+  getAll(key: string): FullMemoryCacheSnapshot;
   invalidate(key?: string): void;
 }
 

@@ -44,6 +44,7 @@ export interface MemoryContextPlan {
 }
 
 export const MEMORY_CUSTOM_TYPE: "langfuse-memory-context";
+export function filterMemoryScoresForBranch<T extends MemoryContextScore>(scores: T[], branchEntries: Array<string | Record<string, unknown>>): T[];
 export function buildMemoryContextText(memory: ContextMemoryPayload, maxChars?: number): string;
 export function buildMemoryContextCoverage(
   reflection: MemoryContextScore | undefined,

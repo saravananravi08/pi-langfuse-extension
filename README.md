@@ -59,6 +59,7 @@ Observations and reflections are Langfuse scores, not additions to raw trace eve
 - Pi's stored JSONL session history remains unchanged.
 - Context replacement affects only messages sent to the model.
 - Covered ranges must belong to the current Pi session and active branch.
+- Observations from abandoned sibling branches remain available for lookup but are excluded from active context and reflection inputs.
 - Entry ranges must be complete, contiguous, non-overlapping, and exactly mapped.
 - Tool calls and results remain complete pairs.
 - Calls emitted by errored or aborted assistant responses are accepted only when proven unexecuted.

@@ -6,7 +6,7 @@ export function createMemoryCache(ttlMs = 300_000, now = Date.now) {
   function getEntry(key) {
     let entry = entries.get(key);
     if (!entry) {
-      entry = { observations: new Map(), reflection: undefined, loadedAt: undefined };
+      entry = { observations: new Map(), allObservations: new Map(), reflections: new Map(), reflection: undefined, loadedAt: undefined };
       entries.set(key, entry);
     }
     return entry;
@@ -28,7 +28,11 @@ export function createMemoryCache(ttlMs = 300_000, now = Date.now) {
 
     mergeRemote(key, observations, reflections) {
       const entry = getEntry(key);
-      for (const observation of observations) entry.observations.set(observation.id, observation);
+      for (const observation of observations) {
+        entry.observations.set(observation.id, observation);
+        entry.allObservations.set(observation.id, observation);
+      }
+      for (const reflection of reflections) entry.reflections.set(reflection.id, reflection);
       entry.reflection = latestReflection([entry.reflection, ...reflections].filter(Boolean));
       entry.loadedAt = now();
       pruneCovered(entry);
@@ -37,11 +41,13 @@ export function createMemoryCache(ttlMs = 300_000, now = Date.now) {
     addObservation(key, observation) {
       const entry = getEntry(key);
       entry.observations.set(observation.id, observation);
+      entry.allObservations.set(observation.id, observation);
       pruneCovered(entry);
     },
 
     setReflection(key, reflection) {
       const entry = getEntry(key);
+      entry.reflections.set(reflection.id, reflection);
       entry.reflection = latestReflection([entry.reflection, reflection].filter(Boolean));
       pruneCovered(entry);
     },
@@ -50,6 +56,16 @@ export function createMemoryCache(ttlMs = 300_000, now = Date.now) {
       const entry = getEntry(key);
       return {
         observations: [...entry.observations.values()],
+        reflection: entry.reflection,
+        loadedAt: entry.loadedAt,
+      };
+    },
+
+    getAll(key) {
+      const entry = getEntry(key);
+      return {
+        observations: [...entry.allObservations.values()],
+        reflections: [...entry.reflections.values()],
         reflection: entry.reflection,
         loadedAt: entry.loadedAt,
       };

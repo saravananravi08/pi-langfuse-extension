@@ -54,6 +54,8 @@ test('newest reflection wins and covered observations are pruned', () => {
   const state = cache.get('scope');
   assert.equal(state.reflection.id, 'local-g2');
   assert.deepEqual(state.observations.map(item => item.id), ['fresh']);
+  assert.deepEqual(cache.getAll('scope').observations.map(item => item.id), ['covered', 'fresh']);
+  assert.deepEqual(cache.getAll('scope').reflections.map(item => item.id), ['local-g2', 'older-g1']);
 });
 
 test('external newer reflection supersedes local state on refresh', () => {

@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildMemoryContextCoverage,
   buildMemoryContextText,
+  filterMemoryScoresForBranch,
   formatMemoryContextPreview,
   formatMemoryContextStatus,
   planMemoryContextReplacement,
@@ -48,6 +49,24 @@ test('builds bounded untrusted memory with provenance and newest observations', 
   assert.ok(text.indexOf('"new"') < text.indexOf('"old"'));
   assert.doesNotMatch(text, /example-credential/);
   assert.match(text, /\[REDACTED\]/);
+});
+
+test('excludes abandoned sibling-branch memory but keeps partial mappings fail-closed', () => {
+  const sibling = observation('sibling', {
+    ...provenance, firstEntryId: 'sibling-user', lastEntryId: 'sibling-answer',
+    entryIds: ['sibling-user', 'sibling-answer'], toolPairs: [],
+  });
+  const partial = observation('partial', {
+    ...provenance, firstEntryId: 'u1', lastEntryId: 'sibling-answer',
+    entryIds: ['u1', 'sibling-answer'], toolPairs: [],
+  });
+  const compatibleReflection = { id: 'reflection-current', metadata: { sourcePiRanges: [{ entryIds: ['u1', 'a1'] }] } };
+  const siblingReflection = { id: 'reflection-sibling', metadata: { sourcePiRanges: [{ entryIds: ['sibling-user', 'sibling-answer'] }] } };
+  const filtered = filterMemoryScoresForBranch(
+    [observation('current', provenance), sibling, partial, compatibleReflection, siblingReflection],
+    branch,
+  );
+  assert.deepEqual(filtered.map(score => score.id), ['current', 'partial', 'reflection-current']);
 });
 
 test('drops only exactly covered entries and preserves current turn and complete tool pairs', () => {
