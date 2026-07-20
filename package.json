@@ -1,7 +1,7 @@
 {
 	"name": "@ravan08/pi-langfuse",
 	"version": "1.3.0",
-	"description": "Langfuse observability extension for Pi coding agent with tracing and optional observational memory reflections.",
+	"description": "Langfuse observability and provenance-safe observational memory for Pi Coding Agent.",
 	"type": "module",
 	"main": "index.ts",
 	"scripts": {
@@ -18,6 +18,10 @@
 		"memory",
 		"observations",
 		"trace-memory",
+		"observational-memory",
+		"agent-memory",
+		"provenance",
+		"context-management",
 		"reflections",
 		"scores"
 	],
