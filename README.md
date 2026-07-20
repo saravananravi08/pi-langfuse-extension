@@ -122,14 +122,22 @@ Copy [`config.example.json`](./config.example.json) to `config.json` in the inst
 }
 ```
 
-Common global package locations:
+Install paths depend on package source, Pi scope, and Node installation. Use `pi list` to confirm the source. For a global npm install, find npm's actual package root with:
 
-```text
-npm: ~/.pi/agent/npm/@ravan08/pi-langfuse/
-git: ~/.pi/agent/git/github.com/saravananravi08/pi-langfuse-extension/
+```bash
+npm root -g
 ```
 
-Use `pi list` to confirm the actual install source. `config.json` is gitignored and must never be committed.
+Place `config.json` beside this package's `index.ts`. Typical locations are:
+
+```text
+npm, global:  <npm-root>/@ravan08/pi-langfuse/config.json
+npm, project: <project>/.pi/npm/@ravan08/pi-langfuse/config.json
+git, global:  ~/.pi/agent/git/github.com/saravananravi08/pi-langfuse-extension/config.json
+git, project: <project>/.pi/git/github.com/saravananravi08/pi-langfuse-extension/config.json
+```
+
+`config.json` is gitignored and must never be committed.
 
 The observer supports Anthropic-compatible and OpenAI-compatible endpoints. Example OpenAI-compatible configuration:
 
