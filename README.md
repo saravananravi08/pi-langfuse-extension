@@ -9,16 +9,16 @@ Langfuse integration for [Pi Coding Agent](https://github.com/mariozechner/pi-co
 
 ![Langfuse trace view](./docs/screenshot1.jpg)
 
-## What It Does
+## 🔭 What It Does
 
-### Observability
+### 📊 Observability
 
 - Maps each Pi turn to a Langfuse trace.
 - Records model, provider, latency, token usage, and cost.
 - Captures nested tool calls, arguments, results, and errors.
 - Groups traces by Pi session and working directory.
 
-### Observational memory
+### 🧠 Observational Memory
 
 - Creates an asynchronous `memory_trace_observation` score after each completed agent turn.
 - Consolidates active observations into append-only `memory_session_reflection` scores.
@@ -28,7 +28,7 @@ Langfuse integration for [Pi Coding Agent](https://github.com/mariozechner/pi-co
 - Records exact Pi session entries and complete tool-call/result pairs as provenance.
 - Provides read-only audits, controlled backfill, redacted diagnostics, and bounded source retrieval.
 
-## Memory Flow
+## 🧠 Memory Flow
 
 ```text
 Pi agent turn
@@ -54,7 +54,7 @@ Pi agent turn
 
 Observations and reflections are Langfuse scores, not additions to raw trace events. Reflections are append-only; the current reflection is selected by highest `generation`, then `generatedAt`.
 
-## Safety Guarantees
+## 🛡️ Safety Guarantees
 
 - Pi's stored JSONL session history remains unchanged.
 - Context replacement affects only messages sent to the model.
@@ -67,7 +67,7 @@ Observations and reflections are Langfuse scores, not additions to raw trace eve
 - Lookup output and diagnostic logs redact secret-like values.
 - Session changes and shutdown abort queued or running memory work.
 
-## Install
+## 📦 Install
 
 ### Stable npm package
 
@@ -89,7 +89,7 @@ pi install git:github.com/saravananravi08/pi-langfuse-extension@feature/provenan
 
 Pi packages execute with full system access. Review third-party package source before installing.
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Create Langfuse keys
 
@@ -164,7 +164,7 @@ After the turn completes, Langfuse should contain a `pi-agent` trace and, when t
 
 `preview` shows the exact replacement plan without changing model context. `on` succeeds only when all safety checks pass.
 
-## Usage
+## 🧭 Usage
 
 ### Automatic tracing
 
@@ -213,7 +213,7 @@ Scopes:
 
 Exact `traceId` and `scoreId` filters are supported. `includeSource` returns bounded details for at most two source traces. `includePiEntries` returns at most 50 exact, redacted Pi entries per matched session.
 
-## Configuration
+## ⚙️ Configuration
 
 Tracing requires `publicKey`, `secretKey`, and `host`. Memory generation additionally requires an observer API key and model.
 
@@ -248,7 +248,7 @@ PI_LANGFUSE_MEMORY_ERROR_LOG=~/.pi/agent/logs/langfuse-memory-errors.jsonl
 
 Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). Observer and reflector outputs must pass structured schema validation before storage. Reflection Markdown is rendered deterministically from canonical structured fields after retention, duplication, and contradiction checks.
 
-## Langfuse Data Model
+## 🗃️ Langfuse Data Model
 
 ```text
 Trace: pi-agent
@@ -277,7 +277,7 @@ Session score: memory_session_reflection
 
 Active memory is scoped by Langfuse session ID and cwd/path key. Remote reads are cached for five minutes, updated immediately after local writes, and refreshed before reflection creation.
 
-## Audit, Backfill, and Reflection Scripts
+## 🧰 Audit, Backfill, and Reflection Scripts
 
 ### Read-only audit
 
@@ -322,7 +322,7 @@ OBSERVER_API=openai OBSERVER_BASE_URL=https://api.openai.com OBSERVER_API_KEY=..
   node scripts/observe-langfuse-session.mjs <session-id>
 ```
 
-## Diagnostics
+## 🩺 Diagnostics
 
 Memory failures are appended to:
 
@@ -332,7 +332,7 @@ Memory failures are appended to:
 
 The file is created with `0600` permissions. Records contain safe request, validation, scope, and provenance details but never raw observer or reflector model output. Use `PI_LANGFUSE_MEMORY_ERROR_LOG` to override the path.
 
-## Operational Limits
+## ⚠️ Operational Limits
 
 - Older sessions without exact `pi-entry-v1` provenance may remain lookup-only and block context replacement.
 - Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
@@ -340,7 +340,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 - Pi auto-compaction behavior is unchanged.
 - Imported extension modules may remain cached after `/reload`; use a full restart when testing code changes.
 
-## Troubleshooting
+## 🛠️ Troubleshooting
 
 ### No traces
 
@@ -371,7 +371,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 
 Not every provider reports pricing data. Token usage may still be available.
 
-## Contributing
+## 🤝 Contributing
 
 Contributions are welcome.
 
@@ -384,11 +384,11 @@ Contributions are welcome.
 
 Open an issue before large architectural changes. Never commit `config.json`, API keys, private session data, or files under `documents/`.
 
-## Dependencies
+## 📚 Dependencies
 
 - [`langfuse`](https://www.npmjs.com/package/langfuse) — Langfuse SDK.
 - [`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — Pi extension API.
 
-## License
+## 📄 License
 
 MIT
