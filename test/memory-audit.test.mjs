@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { auditObservationCoverage, auditPiProvenance } from '../memory-audit.js';
+import { auditObservationCoverage, auditPiProvenance } from '../memory/memory-audit.js';
 
 test('audits missing, incomplete, invalid, and overlapping Pi provenance', () => {
   const complete = {

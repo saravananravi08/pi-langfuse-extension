@@ -246,7 +246,7 @@ PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
 PI_LANGFUSE_MEMORY_ERROR_LOG=~/.pi/agent/logs/langfuse-memory-errors.jsonl
 ```
 
-Prompts are centralized in [`memory-prompts.js`](./memory-prompts.js). Observer and reflector outputs must pass structured schema validation before storage. Reflection Markdown is rendered deterministically from canonical structured fields after retention, duplication, and contradiction checks.
+Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). Observer and reflector outputs must pass structured schema validation before storage. Reflection Markdown is rendered deterministically from canonical structured fields after retention, duplication, and contradiction checks.
 
 ## Langfuse Data Model
 

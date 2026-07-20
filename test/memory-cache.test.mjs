@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createMemoryCache } from '../memory-cache.js';
+import { createMemoryCache } from '../memory/memory-cache.js';
 
 function score(id, generatedAt, extra = {}) {
   return {

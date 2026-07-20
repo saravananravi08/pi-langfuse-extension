@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory-reflection.js';
-import { REQUIRED_REFLECTION_HEADINGS } from '../memory-prompts.js';
+import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory/memory-reflection.js';
+import { REQUIRED_REFLECTION_HEADINGS } from '../memory/memory-prompts.js';
 
 function fields(overrides = {}) {
   return {

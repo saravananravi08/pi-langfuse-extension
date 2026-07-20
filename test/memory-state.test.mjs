@@ -5,7 +5,7 @@ import {
   estimateTokens,
   latestReflection,
   reflectionThresholdMet,
-} from '../memory-state.js';
+} from '../memory/memory-state.js';
 
 function score(id, sessionId, pathKey, generatedAt, extra = {}) {
   return {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { formatMemoryResult, redactSecrets, searchMemoryScores } from '../memory-lookup.js';
+import { formatMemoryResult, redactSecrets, searchMemoryScores } from '../memory/memory-lookup.js';
 
 function score(id, sessionId, pathKey, summary, extra = {}) {
   return {

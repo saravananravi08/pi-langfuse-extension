@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MEMORY_ARRAY_FIELDS, validateMemoryOutput } from '../memory-validation.js';
+import { MEMORY_ARRAY_FIELDS, validateMemoryOutput } from '../memory/memory-validation.js';
 
 function validOutput(kind = 'observer') {
   const value = {

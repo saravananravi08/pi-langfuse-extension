@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { abortableSleep, isAbortError } from '../memory-lifecycle.js';
+import { abortableSleep, isAbortError } from '../memory/memory-lifecycle.js';
 
 test('cancels pending retry delays immediately', async () => {
   const controller = new AbortController();

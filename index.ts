@@ -27,16 +27,16 @@ import {
   REFLECTION_SYSTEM_PROMPT,
   REFLECTION_COMPRESSION_GUIDANCE,
   REQUIRED_REFLECTION_HEADINGS,
-} from "./memory-prompts.js";
-import { validateMemoryOutput } from "./memory-validation.js";
-import { createMemoryCache } from "./memory-cache.js";
-import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory-reflection.js";
-import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory-lookup.js";
-import { buildMemoryContextCoverage, buildMemoryContextText, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory-context.js";
-import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory-pi-entries.js";
-import { abortableSleep as sleep, isAbortError } from "./memory-lifecycle.js";
-import { appendMemoryErrorLog, describeMemoryOutput } from "./memory-error-log.js";
-import { aggregatePiReflectionProvenance, buildPiTraceProvenance, findPiTraceStartEntryId, type PiTraceProvenance } from "./memory-provenance.js";
+} from "./memory/memory-prompts.js";
+import { validateMemoryOutput } from "./memory/memory-validation.js";
+import { createMemoryCache } from "./memory/memory-cache.js";
+import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory/memory-reflection.js";
+import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
+import { buildMemoryContextCoverage, buildMemoryContextText, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
+import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory/memory-pi-entries.js";
+import { abortableSleep as sleep, isAbortError } from "./memory/memory-lifecycle.js";
+import { appendMemoryErrorLog, describeMemoryOutput } from "./memory/memory-error-log.js";
+import { aggregatePiReflectionProvenance, buildPiTraceProvenance, findPiTraceStartEntryId, type PiTraceProvenance } from "./memory/memory-provenance.js";
 import {
   buildActiveMemory,
   estimateTokens,
@@ -47,7 +47,7 @@ import {
   reflectionFields,
   reflectionThresholdMet,
   sameMemoryScope,
-} from "./memory-state.js";
+} from "./memory/memory-state.js";
 
 // ============================================
 // Configuration

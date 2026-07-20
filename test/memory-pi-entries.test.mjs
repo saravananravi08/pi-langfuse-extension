@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from '../memory-pi-entries.js';
+import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from '../memory/memory-pi-entries.js';
 
 test('finds session file and returns only bounded redacted provenance entries', () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-memory-entries-'));

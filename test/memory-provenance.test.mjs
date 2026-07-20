@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aggregatePiReflectionProvenance, buildPiTraceProvenance, findPiTraceStartEntryId } from '../memory-provenance.js';
+import { aggregatePiReflectionProvenance, buildPiTraceProvenance, findPiTraceStartEntryId } from '../memory/memory-provenance.js';
 
 const entry = (id, parentId, role, content, extra = {}) => ({
   type: 'message', id, parentId, timestamp: `2026-01-01T00:00:0${id.length}Z`,

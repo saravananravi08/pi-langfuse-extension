@@ -6,7 +6,7 @@ import {
   formatMemoryContextPreview,
   formatMemoryContextStatus,
   planMemoryContextReplacement,
-} from '../memory-context.js';
+} from '../memory/memory-context.js';
 
 function entry(id, parentId, message) {
   return { type: 'message', id, parentId, timestamp: new Date(message.timestamp).toISOString(), message };

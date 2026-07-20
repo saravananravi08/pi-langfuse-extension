@@ -8,9 +8,9 @@ import {
   REFLECTION_SYSTEM_PROMPT,
   REFLECTION_COMPRESSION_GUIDANCE,
   REQUIRED_REFLECTION_HEADINGS,
-} from '../memory-prompts.js';
-import { validateMemoryOutput } from '../memory-validation.js';
-import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory-reflection.js';
+} from '../memory/memory-prompts.js';
+import { validateMemoryOutput } from '../memory/memory-validation.js';
+import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory/memory-reflection.js';
 import {
   estimateTokens,
   generatedAt,
@@ -20,7 +20,7 @@ import {
   observationFields,
   reflectionFields,
   reflectionThresholdMet,
-} from '../memory-state.js';
+} from '../memory/memory-state.js';
 
 const OBSERVATION_SCORE_NAME = 'memory_trace_observation';
 const REFLECTION_SCORE_NAME = 'memory_session_reflection';

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { appendMemoryErrorLog, describeMemoryOutput } from '../memory-error-log.js';
+import { appendMemoryErrorLog, describeMemoryOutput } from '../memory/memory-error-log.js';
 
 test('describes output fields without storing their content', () => {
   const shape = describeMemoryOutput({
