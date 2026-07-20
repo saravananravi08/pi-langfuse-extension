@@ -37,6 +37,10 @@ export interface MemoryContextPlan {
   memoryTokensEstimated: number;
   retainedTokensEstimated: number;
   replacementTokensEstimated: number;
+  originalImageCount: number;
+  memoryImageCount: number;
+  retainedImageCount: number;
+  replacementImageCount: number;
 }
 
 export const MEMORY_CUSTOM_TYPE: "langfuse-memory-context";
@@ -58,4 +62,5 @@ export function formatMemoryContextStatus(status: {
   actualInputTokens?: number;
   contextWindow?: number;
   replacementTokensEstimated?: number;
+  replacementImageCount?: number;
 }): string;

@@ -26,6 +26,18 @@ function exactMessageKey(message) {
   return JSON.stringify(message);
 }
 
+function estimateContext(value) {
+  let imageCount = 0;
+  const json = JSON.stringify(value, (_key, item) => {
+    if (item?.type === "image" && typeof item.data === "string") {
+      imageCount++;
+      return { type: "image", mimeType: item.mimeType || null };
+    }
+    return item;
+  });
+  return { tokens: Math.ceil(json.length / 4), imageCount };
+}
+
 export function buildMemoryContextCoverage(reflection, observations, expectedPiSessionId = "") {
   const reasons = [];
   const scoreIds = [];
@@ -222,7 +234,10 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     timestamp,
   };
   const replacementMessages = safe ? [injected, ...retained] : withoutOldMemory;
-  const estimate = value => Math.ceil(JSON.stringify(value).length / 4);
+  const originalEstimate = estimateContext(withoutOldMemory);
+  const memoryEstimate = estimateContext(injected);
+  const retainedEstimate = estimateContext(retained);
+  const replacementEstimate = estimateContext(replacementMessages);
 
   return {
     safe,
@@ -235,10 +250,14 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     unmappedMessageIndexes,
     retainedUnmappedTailIndexes: unmappedMessageIndexes.filter(index => !unsafeUnmappedMessageIndexes.includes(index)),
     toolPairs: coverage?.toolPairs || [],
-    originalTokensEstimated: estimate(withoutOldMemory),
-    memoryTokensEstimated: estimate(injected),
-    retainedTokensEstimated: estimate(retained),
-    replacementTokensEstimated: safe ? estimate(replacementMessages) : estimate(withoutOldMemory),
+    originalTokensEstimated: originalEstimate.tokens,
+    memoryTokensEstimated: memoryEstimate.tokens,
+    retainedTokensEstimated: retainedEstimate.tokens,
+    replacementTokensEstimated: safe ? replacementEstimate.tokens : originalEstimate.tokens,
+    originalImageCount: originalEstimate.imageCount,
+    memoryImageCount: memoryEstimate.imageCount,
+    retainedImageCount: retainedEstimate.imageCount,
+    replacementImageCount: safe ? replacementEstimate.imageCount : originalEstimate.imageCount,
   };
 }
 
@@ -259,9 +278,10 @@ export function formatMemoryContextStatus(status) {
   const replacement = Number.isFinite(status.replacementTokensEstimated)
     ? formatTokens(status.replacementTokensEstimated)
     : "?";
-  if (!Number.isFinite(status.actualInputTokens)) return `Memory ON · awaiting usage · est ${replacement}`;
+  const images = status.replacementImageCount > 0 ? ` + ${status.replacementImageCount} image${status.replacementImageCount === 1 ? "" : "s"}` : "";
+  if (!Number.isFinite(status.actualInputTokens)) return `Memory ON · awaiting usage · est ${replacement}${images}`;
   const percent = status.contextWindow > 0 ? ((status.actualInputTokens / status.contextWindow) * 100).toFixed(1) : "?";
-  return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}`;
+  return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}${images}`;
 }
 
 export function formatMemoryContextPreview(plan, maxIds = 20) {
@@ -283,6 +303,12 @@ export function formatMemoryContextPreview(plan, maxIds = 20) {
       memory: plan.memoryTokensEstimated,
       retained: plan.retainedTokensEstimated,
       replacement: plan.replacementTokensEstimated,
+    },
+    images: {
+      original: plan.originalImageCount,
+      memory: plan.memoryImageCount,
+      retained: plan.retainedImageCount,
+      replacement: plan.replacementImageCount,
     },
   }, null, 2);
 }

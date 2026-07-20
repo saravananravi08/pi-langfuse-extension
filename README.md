@@ -198,7 +198,7 @@ While replacement is active, Pi shows compact status such as:
 Memory 24.9%/272k · est 7.1k
 ```
 
-The percentage is actual provider input usage against the selected model's context window. `est` is the estimated replacement-message size.
+The percentage is actual provider input usage against the selected model's context window. `est` is the estimated textual replacement-message size. Binary image data is excluded and reported separately, for example `est 7.1k + 2 images`, because image token accounting varies by provider and model.
 
 ### Scoped memory lookup
 

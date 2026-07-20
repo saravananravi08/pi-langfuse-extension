@@ -255,6 +255,7 @@ let memoryContextDisplay: {
   actualInputTokens?: number;
   contextWindow?: number;
   replacementTokensEstimated?: number;
+  replacementImageCount?: number;
 } = {};
 let lastMemoryContextErrorAt = 0;
 const PI_SESSIONS_ROOT = join(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "sessions");
@@ -1311,6 +1312,7 @@ export default async function (pi: ExtensionAPI) {
         memoryContextDisplay = {
           contextWindow: ctx.model?.contextWindow,
           replacementTokensEstimated: plan.replacementTokensEstimated,
+          replacementImageCount: plan.replacementImageCount,
         };
         updateMemoryContextWidget(ctx.ui);
         pi.appendEntry("langfuse-memory-context-state", { enabled: true });
@@ -1461,6 +1463,7 @@ export default async function (pi: ExtensionAPI) {
         ...memoryContextDisplay,
         contextWindow: ctx.model?.contextWindow,
         replacementTokensEstimated: plan.replacementTokensEstimated,
+        replacementImageCount: plan.replacementImageCount,
       };
       updateMemoryContextWidget(ctx.ui);
       return { messages: plan.messages as typeof event.messages };

@@ -101,6 +101,22 @@ test('retains trailing parallel tool results while Pi session entries catch up',
   assert.deepEqual(plan.messages.slice(1), [user2, call2, result2]);
 });
 
+test('excludes binary image data from token estimates and reports images separately', () => {
+  const imageCall = { role: 'assistant', content: [{ type: 'toolCall', id: 'call-image', name: 'read', arguments: {} }], timestamp: 6 };
+  const imageResult = {
+    role: 'toolResult', toolCallId: 'call-image', toolName: 'read', timestamp: 7,
+    content: [{ type: 'text', text: 'image' }, { type: 'image', data: 'a'.repeat(400_000), mimeType: 'image/png' }],
+  };
+  const currentBranch = [...branch, entry('a3', 'u2', imageCall), entry('r2', 'a3', imageResult)];
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, imageCall, imageResult], currentBranch, 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.equal(plan.originalImageCount, 1);
+  assert.equal(plan.retainedImageCount, 1);
+  assert.equal(plan.replacementImageCount, 1);
+  assert.ok(plan.replacementTokensEstimated < 1_000);
+});
+
 test('does not require a result for a tool call from an errored assistant response', () => {
   const errored = { role: 'assistant', content: [{ type: 'toolCall', id: 'never-ran', name: 'bash', arguments: {} }], stopReason: 'error', timestamp: 6 };
   const currentBranch = [...branch, entry('a3', 'u2', errored)];
@@ -145,6 +161,10 @@ test('formats actual provider usage separately from replacement-message estimate
     'Memory 24.9%/272k · est 7.1k',
   );
   assert.equal(formatMemoryContextStatus({ replacementTokensEstimated: 7_128 }), 'Memory ON · awaiting usage · est 7.1k');
+  assert.equal(
+    formatMemoryContextStatus({ actualInputTokens: 67_728, contextWindow: 272_000, replacementTokensEstimated: 7_128, replacementImageCount: 3 }),
+    'Memory 24.9%/272k · est 7.1k + 3 images',
+  );
 });
 
 test('preview exposes score, entry, tool-pair, and token decisions', () => {
@@ -157,4 +177,5 @@ test('preview exposes score, entry, tool-pair, and token decisions', () => {
   assert.equal(preview.retainedEntryCount, 1);
   assert.equal(preview.toolPairCount, 1);
   assert.ok(preview.tokens.replacement > 0);
+  assert.equal(preview.images.replacement, 0);
 });
