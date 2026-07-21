@@ -267,6 +267,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     else if (["user", "assistant", "toolResult"].includes(message?.role)) unmappedMessageIndexes.push(index);
   }
   const originalCalls = new Set(withoutOldMemory.flatMap(toolCallIds));
+  const originalResults = new Set(withoutOldMemory.filter(message => message?.role === "toolResult").map(message => message.toolCallId).filter(Boolean));
   const unsafeUnmappedMessageIndexes = unmappedMessageIndexes.filter(index => {
     const message = withoutOldMemory[index];
     const safeTrailingRole = message?.role === "user"
@@ -281,7 +282,14 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
   const recentRawTokenBudget = Math.max(1_000, Number(options.recentRawTokenBudget) || 12_000);
   const userIndexes = withoutOldMemory.map((message, index) => message?.role === "user" ? index : -1).filter(index => index >= 0);
   const protectedIndexes = new Set();
-  let protectedTokens = 0;
+  const pendingCallIds = new Set([...originalCalls].filter(id => !originalResults.has(id)));
+  for (const pendingCallId of pendingCallIds) {
+    const callIndex = withoutOldMemory.findIndex(message => toolCallIds(message).includes(pendingCallId));
+    if (callIndex < 0) continue;
+    const turnStart = userIndexes.filter(index => index <= callIndex).at(-1) ?? callIndex;
+    for (let index = turnStart; index < withoutOldMemory.length; index++) protectedIndexes.add(index);
+  }
+  let protectedTokens = estimateContext([...protectedIndexes].map(index => withoutOldMemory[index])).tokens;
   for (const userIndex of userIndexes.slice(-recentTurnCount).reverse()) {
     const nextUserIndex = userIndexes.find(index => index > userIndex) ?? withoutOldMemory.length;
     const indexes = Array.from({ length: nextUserIndex - userIndex }, (_, offset) => userIndex + offset);
@@ -336,11 +344,13 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     if (entryId && protectedIndexes.has(index)) recentRetainedEntryIds.push(entryId);
   }
 
-  const originalResults = new Set(withoutOldMemory.filter(message => message?.role === "toolResult").map(message => message.toolCallId).filter(Boolean));
   const retainedCalls = new Set(retained.flatMap(toolCallIds));
   const retainedResults = new Set(retained.filter(message => message?.role === "toolResult").map(message => message.toolCallId).filter(Boolean));
   for (const id of originalCalls) {
-    if (!originalResults.has(id)) reasons.push(`visible tool call ${id} has no result`);
+    if (!originalResults.has(id)) {
+      if (!retainedCalls.has(id)) reasons.push(`replacement would remove visible tool call ${id} without a result`);
+      continue;
+    }
     if (retainedCalls.has(id) !== retainedResults.has(id)) reasons.push(`replacement would split tool pair ${id}`);
   }
   for (const id of originalResults) {

@@ -197,6 +197,20 @@ test('does not require a result for a tool call from an errored assistant respon
   assert.deepEqual(plan.messages.slice(1), [user2, errored]);
 });
 
+test('retains a visible pending tool-call turn without disabling replacement', () => {
+  const pendingUser = { role: 'user', content: 'start pending work', timestamp: 10 };
+  const pendingCall = { role: 'assistant', content: [{ type: 'toolCall', id: 'still-running', name: 'bash', arguments: {} }], stopReason: 'toolUse', timestamp: 11 };
+  const currentUser = { role: 'user', content: 'check memory', timestamp: 12 };
+  const entries = [entry('u10', null, pendingUser), entry('a10', 'u10', pendingCall), entry('u11', 'a10', currentUser)];
+  const coverage = {
+    safe: true, reasons: [], entryIds: ['u10', 'a10'],
+    ranges: [{ observationScoreId: 'pending', firstEntryId: 'u10', lastEntryId: 'a10', entryIds: ['u10', 'a10'] }],
+  };
+  const plan = planMemoryContextReplacement([pendingUser, pendingCall, currentUser], entries, 'memory', coverage, undefined, { recentTurnCount: 1 });
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.messages.slice(1), [pendingUser, pendingCall, currentUser]);
+});
+
 test('accepts stale merged missing-pair metadata when the call is proven unexecuted', () => {
   const user = { role: 'user', content: 'run', timestamp: 10 };
   const errored = { role: 'assistant', content: [{ type: 'toolCall', id: 'never-ran', name: 'bash', arguments: {} }], stopReason: 'error', timestamp: 11 };
