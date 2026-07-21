@@ -33,6 +33,11 @@ export function latestReflection(scores) {
   })[0];
 }
 
+function metadataValue(score, key, fallback) {
+  const value = score?.metadata?.[key];
+  return value === undefined ? fallback : value;
+}
+
 export function reflectionFields(score) {
   return score ? {
     reflectionMarkdown: metadataString(score, "reflectionMarkdown"),
@@ -53,6 +58,16 @@ export function reflectionFields(score) {
     filesDeleted: metadataStrings(score, "filesDeleted"),
     filesTouched: metadataStrings(score, "filesTouched"),
     toolsUsed: metadataStrings(score, "toolsUsed"),
+    durableItems: metadataValue(score, "durableItems", []),
+    activeUserRequests: metadataValue(score, "activeUserRequests", []),
+    activeDecisions: metadataValue(score, "activeDecisions", []),
+    activeConstraints: metadataValue(score, "activeConstraints", []),
+    verifiedFacts: metadataValue(score, "verifiedFacts", []),
+    activeTasks: metadataValue(score, "activeTasks", []),
+    openQuestions: metadataValue(score, "openQuestions", []),
+    blockedItems: metadataValue(score, "blockedItems", []),
+    supersededItems: metadataValue(score, "supersededItems", []),
+    decisionConflicts: metadataValue(score, "decisionConflicts", []),
   } : null;
 }
 
@@ -79,13 +94,30 @@ export function observationFields(score) {
     filesDeleted: metadataStrings(score, "filesDeleted"),
     filesTouched: metadataStrings(score, "filesTouched"),
     toolsUsed: metadataStrings(score, "toolsUsed"),
+    episodeSummary: metadataString(score, "episodeSummary") || metadataString(score, "summary"),
+    userRequests: metadataValue(score, "userRequests", []),
+    questionsAnswered: metadataValue(score, "questionsAnswered", []),
+    corrections: metadataValue(score, "corrections", []),
+    taskDelta: metadataValue(score, "taskDelta", {}),
+    commitments: metadataValue(score, "commitments", []),
+    durableItems: metadataValue(score, "durableItems", []),
+    evidence: metadataValue(score, "evidence", []),
+    semanticCoverage: metadataValue(score, "semanticCoverage", {}),
+    replacementEligible: metadataValue(score, "replacementEligible", false),
+    memoryStatus: metadataString(score, "memoryStatus"),
   };
 }
 
 export function buildActiveMemory(observations, reflections, sessionId, pathKey, version = "v1") {
-  const scopedObservations = observations
+  const deduplicatedObservations = observations
     .filter((score, index, all) => all.findIndex(item => item.id === score.id) === index)
-    .filter(score => sameMemoryScope(score, sessionId, pathKey, version))
+    .filter(score => sameMemoryScope(score, sessionId, pathKey, version));
+  const finalTraceIds = new Set(deduplicatedObservations
+    .filter(score => metadataString(score, "segmentKind") === "final")
+    .map(score => score.traceId || metadataString(score, "traceId"))
+    .filter(Boolean));
+  const scopedObservations = deduplicatedObservations
+    .filter(score => metadataString(score, "segmentKind") !== "checkpoint" || !finalTraceIds.has(score.traceId || metadataString(score, "traceId")))
     .sort((a, b) => generatedAt(a).localeCompare(generatedAt(b)));
   const scopedReflections = reflections
     .filter((score, index, all) => all.findIndex(item => item.id === score.id) === index)

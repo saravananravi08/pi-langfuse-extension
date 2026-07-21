@@ -16,6 +16,7 @@ export interface ObservationAudit {
   traces: number;
   observedTraces: number;
   observationScores: number;
+  checkpointScores: number;
   eligibleMissing: number;
   preCoverage: number;
   intentionallySkipped: number;
@@ -46,6 +47,13 @@ export interface PiProvenanceAudit {
 }
 
 export function auditPiProvenance(scores: AuditScore[]): PiProvenanceAudit;
+export function auditSemanticCoverage(scores: AuditScore[]): {
+  semanticCoverageFailures: number;
+  activeDecisionConflicts: number;
+  semanticCoverageFailureScoreIds: string[];
+  activeDecisionConflictScoreIds: string[];
+  lookupOnlyScoreIds: string[];
+};
 export function auditObservationCoverage(traces: AuditTrace[], scores: AuditScore[], options: {
   scoreName: string;
   version: string;

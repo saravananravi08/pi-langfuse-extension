@@ -14,7 +14,16 @@ function entry(id, parentId, message) {
 }
 
 function observation(id, provenance) {
-  return { id, traceId: `trace-${id}`, metadata: { piProvenance: provenance } };
+  return {
+    id,
+    traceId: `trace-${id}`,
+    metadata: {
+      piProvenance: provenance,
+      memoryStatus: 'ready',
+      replacementEligible: true,
+      semanticCoverage: { userRequests: 1, preservedUserRequests: 1, corrections: 0, preservedCorrections: 0, questions: 0, preservedQuestions: 0 },
+    },
+  };
 }
 
 const user1 = { role: 'user', content: 'old user', timestamp: 1 };
@@ -48,7 +57,6 @@ test('builds bounded untrusted memory with provenance and newest observations', 
   assert.match(text, /reflection-1/);
   assert.ok(text.indexOf('"new"') < text.indexOf('"old"'));
   assert.doesNotMatch(text, /example-credential/);
-  assert.match(text, /\[REDACTED\]/);
 });
 
 test('excludes abandoned sibling-branch memory but keeps partial mappings fail-closed', () => {
@@ -74,10 +82,10 @@ test('drops only exactly covered entries and preserves current turn and complete
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, 123);
 
   assert.equal(plan.safe, true);
-  assert.deepEqual(plan.droppedEntryIds, ['u1', 'a1', 'r1', 'a2']);
-  assert.deepEqual(plan.retainedEntryIds, ['u2']);
+  assert.deepEqual(plan.droppedEntryIds, []);
+  assert.deepEqual(plan.retainedEntryIds, ['u1', 'a1', 'r1', 'a2', 'u2']);
   assert.equal(plan.messages[0].customType, 'langfuse-memory-context');
-  assert.deepEqual(plan.messages.slice(1), [user2]);
+  assert.deepEqual(plan.messages.slice(1), [user1, call1, result1, answer1, user2]);
   assert.equal(plan.toolPairs[0].toolCallId, 'call-1');
 });
 
@@ -103,7 +111,7 @@ test('blocks incomplete, overlapping, mismatched-session, and non-contiguous pro
 
 test('retains a trailing current user before its Pi entry becomes visible', () => {
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
-  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch.slice(0, 4), 'memory', coverage);
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch.slice(0, 4), 'memory', coverage, undefined, { recentTurnCount: 1 });
   assert.equal(plan.safe, true);
   assert.deepEqual(plan.retainedUnmappedTailIndexes, [4]);
   assert.deepEqual(plan.messages.slice(1), [user2]);
@@ -114,7 +122,7 @@ test('retains trailing parallel tool results while Pi session entries catch up',
   const result2 = { role: 'toolResult', toolCallId: 'call-2', content: [{ type: 'text', text: 'late result' }], timestamp: 7 };
   const currentBranch = [...branch, entry('a3', 'u2', call2)];
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
-  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, call2, result2], currentBranch, 'memory', coverage);
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, call2, result2], currentBranch, 'memory', coverage, undefined, { recentTurnCount: 1 });
   assert.equal(plan.safe, true);
   assert.deepEqual(plan.retainedUnmappedTailIndexes, [6]);
   assert.deepEqual(plan.messages.slice(1), [user2, call2, result2]);
@@ -140,7 +148,7 @@ test('does not require a result for a tool call from an errored assistant respon
   const errored = { role: 'assistant', content: [{ type: 'toolCall', id: 'never-ran', name: 'bash', arguments: {} }], stopReason: 'error', timestamp: 6 };
   const currentBranch = [...branch, entry('a3', 'u2', errored)];
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
-  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, errored], currentBranch, 'memory', coverage);
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, errored], currentBranch, 'memory', coverage, undefined, { recentTurnCount: 1 });
   assert.equal(plan.safe, true);
   assert.deepEqual(plan.messages.slice(1), [user2, errored]);
 });
@@ -169,7 +177,7 @@ test('blocks replacement that cannot map an older model message or would split a
   assert.match(unmapped.reasons.join('\n'), /cannot be mapped/);
 
   const splitCoverage = { ...coverage, entryIds: ['u1', 'a1'], ranges: [{ observationScoreId: 'x', firstEntryId: 'u1', lastEntryId: 'a1', entryIds: ['u1', 'a1'] }] };
-  const split = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', splitCoverage);
+  const split = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', splitCoverage, undefined, { recentTurnCount: 1 });
   assert.equal(split.safe, false);
   assert.match(split.reasons.join('\n'), /split tool pair/);
 });
@@ -200,9 +208,52 @@ test('preview exposes score, entry, tool-pair, and token decisions', () => {
   const preview = JSON.parse(formatMemoryContextPreview(plan));
   assert.equal(preview.safe, true);
   assert.deepEqual(preview.scoreIds, ['score-1']);
-  assert.equal(preview.droppedEntryCount, 4);
-  assert.equal(preview.retainedEntryCount, 1);
+  assert.equal(preview.droppedEntryCount, 0);
+  assert.equal(preview.retainedEntryCount, 5);
+  assert.equal(preview.recentRetainedEntryCount, 5);
   assert.equal(preview.toolPairCount, 1);
   assert.ok(preview.tokens.replacement > 0);
   assert.equal(preview.images.replacement, 0);
+});
+
+test('does not bypass Pi compaction when replacement remains above safe context budget', () => {
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, undefined, { maxReplacementTokens: 1 });
+  assert.equal(plan.safe, false);
+  assert.match(plan.reasons.join('\n'), /exceeds safe/);
+  assert.deepEqual(plan.messages, [user1, call1, result1, answer1, user2]);
+});
+
+test('semantic coverage is mandatory even when Pi provenance is complete', () => {
+  const lookupOnly = observation('lookup-only', provenance);
+  lookupOnly.metadata.replacementEligible = false;
+  const coverage = buildMemoryContextCoverage(undefined, [lookupOnly], 'pi-session');
+  assert.equal(coverage.safe, false);
+  assert.deepEqual(coverage.semanticCoverageFailures, ['lookup-only']);
+  assert.deepEqual(coverage.lookupOnlyScoreIds, ['lookup-only']);
+});
+
+test('retains two recent turns but replaces an older covered turn', () => {
+  const oldUser = { role: 'user', content: 'oldest user', timestamp: 0 };
+  const oldAnswer = { role: 'assistant', content: [{ type: 'text', text: 'oldest answer' }], timestamp: 0.5 };
+  const entries = [entry('u0', null, oldUser), entry('a0', 'u0', oldAnswer), ...branch.map(item => ({ ...item, parentId: item.parentId === null ? 'a0' : item.parentId }))];
+  const oldProvenance = { version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true, firstEntryId: 'u0', lastEntryId: 'a0', entryIds: ['u0', 'a0'], toolPairs: [] };
+  const coverage = buildMemoryContextCoverage(undefined, [observation('old-score', oldProvenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([oldUser, oldAnswer, user1, call1, result1, answer1, user2], entries, 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.droppedEntryIds, ['u0', 'a0']);
+  assert.ok(plan.recentRetainedEntryIds.includes('u1'));
+  assert.ok(plan.recentRetainedEntryIds.includes('u2'));
+});
+
+test('referential context prioritizes exact recent user requests', () => {
+  const text = buildMemoryContextText({
+    currentPrompt: 'What question did I ask?',
+    recentUserRequests: [{ entryId: 'e4ad2613', text: 'Check whether relevance, keywords and interests can fetch relevant profiles' }],
+    observations: [{ scoreId: 'older', fields: { summary: 'Unrelated payload question' } }],
+  });
+  assert.match(text, /Query class: referential/);
+  assert.match(text, /e4ad2613/);
+  assert.match(text, /relevance, keywords and interests/);
+  assert.ok(text.indexOf('Exact Recent User Requests') < text.indexOf('Relevant Retrieved Episodes'));
 });

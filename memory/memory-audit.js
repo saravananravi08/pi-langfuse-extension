@@ -51,6 +51,35 @@ export function auditPiProvenance(scores) {
   };
 }
 
+export function auditSemanticCoverage(scores) {
+  const semanticCoverageFailureScoreIds = [];
+  const activeDecisionConflictScoreIds = [];
+  const lookupOnlyScoreIds = [];
+  for (const score of scores) {
+    const metadata = score.metadata || {};
+    const coverage = metadata.semanticCoverage;
+    const observationComplete = metadata.memoryStatus === "ready"
+      && metadata.replacementEligible === true
+      && coverage
+      && coverage.userRequests === coverage.preservedUserRequests
+      && coverage.corrections === coverage.preservedCorrections
+      && coverage.questions === coverage.preservedQuestions;
+    const reflectionComplete = metadata.memoryStatus === "ready" && metadata.semanticCoverageComplete === true;
+    if (!observationComplete && !reflectionComplete) {
+      semanticCoverageFailureScoreIds.push(score.id);
+      lookupOnlyScoreIds.push(score.id);
+    }
+    if (Array.isArray(metadata.decisionConflicts) && metadata.decisionConflicts.length) activeDecisionConflictScoreIds.push(score.id);
+  }
+  return {
+    semanticCoverageFailures: semanticCoverageFailureScoreIds.length,
+    activeDecisionConflicts: activeDecisionConflictScoreIds.length,
+    semanticCoverageFailureScoreIds,
+    activeDecisionConflictScoreIds,
+    lookupOnlyScoreIds,
+  };
+}
+
 export function auditObservationCoverage(traces, scores, options) {
   const byTrace = new Map();
   for (const score of scores) {
@@ -63,7 +92,7 @@ export function auditObservationCoverage(traces, scores, options) {
   }
 
   const observedTimestamps = traces
-    .filter(trace => (byTrace.get(trace.id) || []).length > 0)
+    .filter(trace => (byTrace.get(trace.id) || []).some(score => score.metadata?.segmentKind !== "checkpoint"))
     .map(trace => Date.parse(trace.timestamp || ""))
     .filter(Number.isFinite);
   const coverageStartTimestamp = observedTimestamps.length ? Math.min(...observedTimestamps) : undefined;
@@ -76,6 +105,7 @@ export function auditObservationCoverage(traces, scores, options) {
   const promptVersions = {};
   const paths = {};
   let observedTraces = 0;
+  let checkpointScores = 0;
 
   for (const trace of traces) {
     const pathKey = trace.metadata?.cwd || "(unknown)";
@@ -84,11 +114,13 @@ export function auditObservationCoverage(traces, scores, options) {
     paths[pathKey] = path;
 
     const traceScores = byTrace.get(trace.id) || [];
-    if (traceScores.length) {
+    checkpointScores += traceScores.filter(score => score.metadata?.segmentKind === "checkpoint").length;
+    const finalScores = traceScores.filter(score => score.metadata?.segmentKind !== "checkpoint");
+    if (finalScores.length) {
       observedTraces++;
       path.observed++;
-      if (traceScores.length > 1) duplicateTraceIds.push(trace.id);
-      for (const score of traceScores) {
+      if (finalScores.length > 1) duplicateTraceIds.push(trace.id);
+      for (const score of finalScores) {
         const promptVersion = score.metadata?.promptVersion || "unknown";
         promptVersions[promptVersion] = (promptVersions[promptVersion] || 0) + 1;
         const expectedId = options.expectedScoreId(trace.id);
@@ -116,6 +148,7 @@ export function auditObservationCoverage(traces, scores, options) {
     traces: traces.length,
     observedTraces,
     observationScores: scores.filter(score => score.name === options.scoreName && score.metadata?.version === options.version).length,
+    checkpointScores,
     eligibleMissing: eligibleMissingTraceIds.length,
     preCoverage: preCoverageTraceIds.length,
     intentionallySkipped: intentionallySkippedTraceIds.length,

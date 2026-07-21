@@ -8,7 +8,16 @@ function validOutput(kind = 'observer') {
     currentTask: 'Continue work',
     taskStatus: 'active',
   };
-  if (kind === 'observer') value.observationsMarkdown = 'Memory';
+  value.durableItems = [];
+  if (kind === 'observer') {
+    value.observationsMarkdown = 'Memory';
+    value.userRequests = [];
+    value.questionsAnswered = [];
+    value.corrections = [];
+    value.taskDelta = {};
+    value.commitments = [];
+    value.evidence = [];
+  }
   for (const field of MEMORY_ARRAY_FIELDS) value[field] = [];
   return value;
 }

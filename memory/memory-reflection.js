@@ -38,6 +38,12 @@ function section(heading, items, ordered = false) {
   return body ? `${heading}\n${body}` : heading;
 }
 
+function durableLines(items, predicate) {
+  return (Array.isArray(items) ? items : [])
+    .filter(predicate)
+    .map(item => `[${item.authority}/${item.status}] ${item.topic}: ${item.content} (sources: ${(item.sourceEntryIds || []).join(", ")})`);
+}
+
 export function renderReflectionMarkdown(fields) {
   const progress = [];
   if (String(fields.currentTask || "").trim()) progress.push(`Current task: ${String(fields.currentTask).trim()}`);
@@ -45,7 +51,7 @@ export function renderReflectionMarkdown(fields) {
 
   return [
     section("## Goal", fields.goal),
-    section("## Constraints & Preferences", fields.constraints),
+    [section("## Constraints & Preferences", fields.constraints), section("### Active User Requests", durableLines(fields.durableItems, item => item.status === "active" && item.kind === "request")), section("### Active Decisions", durableLines(fields.durableItems, item => item.status === "active" && item.kind === "decision")), section("### Active Constraints", durableLines(fields.durableItems, item => item.status === "active" && item.kind === "constraint"))].join("\n"),
     ["## Progress", markdownItems(progress), section("### Done", fields.completed), section("### In Progress", fields.inProgress), section("### Blocked", fields.openIssues)].filter(Boolean).join("\n"),
     section("## Key Decisions", fields.decisions),
     section("## Next Steps", fields.nextSteps, true),
@@ -81,11 +87,22 @@ export function evaluateReflectionQuality(output, previous, observations) {
   if (output.taskStatus === "complete" && (strings(output.inProgress).length || strings(output.openIssues).length)) {
     contradictions.push("complete status has unfinished or blocked items");
   }
+  const durableItems = Array.isArray(output.durableItems) ? output.durableItems : [];
+  const activeById = new Map();
+  for (const item of durableItems.filter(item => item?.status === "active")) {
+    const previousItem = activeById.get(item.id);
+    if (previousItem && previousItem.content !== item.content) contradictions.push(`conflicting active durable item ${item.id}`);
+    activeById.set(item.id, item);
+  }
+  const previousDurable = sources.flatMap(source => Array.isArray(source?.durableItems) ? source.durableItems : []);
+  const lostUserItems = previousDurable.filter(item => item?.authority === "user" && item?.status === "active")
+    .filter(item => !durableItems.some(candidate => candidate?.id === item.id));
 
   const errors = [];
   if (!strings(output.goal).length) errors.push("goal is empty");
   if (String(output.taskStatus || "") !== "complete" && !strings(output.nextSteps).length) errors.push("non-complete task has no next steps");
   if (missingSourceFields.length) errors.push(`durable source fields became empty: ${missingSourceFields.join(", ")}`);
+  if (lostUserItems.length) errors.push(`active user durable items disappeared: ${lostUserItems.map(item => item.id).join(", ")}`);
   const sourceHasUnresolvedWork = UNRESOLVED_FIELDS.some(field => sources.some(source => strings(source[field]).length > 0));
   const outputTracksWork = [...UNRESOLVED_FIELDS, "completed"].some(field => strings(output[field]).length > 0);
   if (sourceHasUnresolvedWork && !outputTracksWork) errors.push("source work disappeared without a resulting state");
@@ -104,6 +121,8 @@ export function evaluateReflectionQuality(output, previous, observations) {
       duplicateItemCount: duplicateCount,
       duplicateFields,
       contradictionCount: contradictions.length,
+      durableItemCount: durableItems.length,
+      lostUserItemCount: lostUserItems.length,
     },
   };
 }

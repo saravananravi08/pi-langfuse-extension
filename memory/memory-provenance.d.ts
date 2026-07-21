@@ -35,4 +35,6 @@ export function buildPiTraceProvenance(
   entries: Array<Record<string, unknown>>,
   startEntryId: string,
   piSessionId: string,
+  endEntryId?: string,
+  allowNonUserStart?: boolean,
 ): { provenance?: PiTraceProvenance; errors: string[] };

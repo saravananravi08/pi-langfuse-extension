@@ -110,3 +110,12 @@ test('no uncovered observations reports zero new-observation tokens', () => {
   assert.deepEqual(memory.newObservations, []);
   assert.equal(memory.newObservationTokens, 0);
 });
+
+test('final trace observation supersedes non-overlapping in-turn checkpoints', () => {
+  const checkpoint = score('checkpoint', 'session-a', '/project-a', '2026-01-02T00:00:00Z', { segmentKind: 'checkpoint', traceId: 'trace-one' });
+  checkpoint.traceId = 'trace-one';
+  const final = score('final', 'session-a', '/project-a', '2026-01-03T00:00:00Z', { segmentKind: 'final', traceId: 'trace-one' });
+  final.traceId = 'trace-one';
+  const memory = buildActiveMemory([checkpoint, final], [], 'session-a', '/project-a');
+  assert.deepEqual(memory.newObservations.map(item => item.id), ['final']);
+});

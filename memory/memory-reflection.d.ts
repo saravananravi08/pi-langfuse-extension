@@ -29,6 +29,8 @@ export interface ReflectionQuality {
     duplicateItemCount: number;
     duplicateFields: string[];
     contradictionCount: number;
+    durableItemCount: number;
+    lostUserItemCount: number;
   };
 }
 

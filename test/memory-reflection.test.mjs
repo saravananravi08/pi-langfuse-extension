@@ -21,6 +21,7 @@ function fields(overrides = {}) {
     filesCreated: ['/repo/test.js'],
     filesDeleted: [],
     toolsUsed: ['read', 'edit'],
+    durableItems: [],
     ...overrides,
   };
 }
@@ -76,4 +77,15 @@ test('quality rejects excessive exact duplicates', () => {
   const result = evaluateReflectionQuality(output, null, []);
   assert.match(result.errors.join('; '), /duplicates/);
   assert.equal(result.metrics.duplicateItemCount, 3);
+});
+
+test('reflection cannot silently lose an active user-authority item', () => {
+  const decision = {
+    id: 'decision-refresh', kind: 'decision', topic: 'refresh', content: 'Do not refresh', status: 'active', authority: 'user',
+    sourceEntryIds: ['u1'], sourceScoreIds: ['s1'], updatedAt: '2026-01-01T00:00:00Z',
+  };
+  const source = fields({ durableItems: [decision] });
+  const result = evaluateReflectionQuality(fields({ durableItems: [] }), source, []);
+  assert.match(result.errors.join('; '), /active user durable items disappeared/);
+  assert.equal(result.metrics.lostUserItemCount, 1);
 });

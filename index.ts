@@ -33,6 +33,7 @@ import { createMemoryCache } from "./memory/memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory/memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
 import { buildMemoryContextCoverage, buildMemoryContextText, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
+import { alignDurableItems, buildRecentUserRequests, buildSemanticCoverage, detectExplicitCorrection, explainDurableItems, normalizeDurableItem, reduceDurableItems, sanitizeDurableItemSources, textSupportsClaim, validateDurableItemAuthority } from "./memory/memory-quality.js";
 import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory/memory-pi-entries.js";
 import { abortableSleep as sleep, isAbortError } from "./memory/memory-lifecycle.js";
 import { appendMemoryErrorLog, describeMemoryOutput } from "./memory/memory-error-log.js";
@@ -210,12 +211,15 @@ interface TraceSnapshot {
   model: string;
   provider: string;
   userPrompt: string;
+  userRequests?: Array<{ entryId: string; exactText: string }>;
   output?: string;
   steps: TraceStep[];
   piProvenance?: PiTraceProvenance;
   piProvenanceErrors: string[];
   piBranchEntryIds: string[];
   interrupted: boolean;
+  segmentIndex?: number;
+  segmentKind?: "checkpoint" | "final";
 }
 
 interface AgentContentPart {
@@ -249,6 +253,9 @@ let currentPiSessionFile: string = "";
 let memoryLifecycleController = new AbortController();
 const activeSpans: Map<string, SpanData> = new Map();
 const traceSteps: TraceStep[] = [];
+let memoryCheckpointIndex = 0;
+let memoryCheckpointStepOffset = 0;
+let memoryCheckpointLastEntryId = "";
 const memoryQueues = new Map<string, Promise<void>>();
 const sessionMemoryCache = createMemoryCache(300_000);
 let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
@@ -324,7 +331,11 @@ function computeEvaluationScores() {
 
 const MEMORY_SCORE_NAME = "memory_trace_observation";
 const REFLECTION_SCORE_NAME = "memory_session_reflection";
-const MEMORY_SCORE_VERSION = "v1";
+const MEMORY_SCORE_VERSION = "v2";
+const LEGACY_MEMORY_SCORE_VERSION = "v1";
+const MEMORY_CONTEXT_MAX_CHARS = 40_000;
+const MEMORY_CHECKPOINT_TOOL_RESULTS = 20;
+const MEMORY_CHECKPOINT_TEXT_TOKENS = 8_000;
 type ObserverApi = "anthropic" | "openai";
 const configuredObserverApi = process.env.PI_LANGFUSE_OBSERVER_API || config.observer?.api || (process.env.OPENAI_API_KEY ? "openai" : "anthropic");
 const OBSERVER_API = (configuredObserverApi.toLowerCase() === "openai" ? "openai" : "anthropic") as ObserverApi;
@@ -469,6 +480,23 @@ function contentText(content: AgentContentPart[] | undefined): string {
     .filter(part => part.type === "text" && part.text)
     .map(part => part.text)
     .join("\n");
+}
+
+function piMessageText(message: Record<string, unknown> | undefined): string {
+  if (typeof message?.content === "string") return message.content.trim();
+  return (Array.isArray(message?.content) ? message.content : [])
+    .filter((part: { type?: string; text?: string }) => part?.type === "text" && typeof part.text === "string")
+    .map((part: { text: string }) => part.text.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function exactUserRequestsFromBranch(branch: Array<Record<string, unknown>>, entryIds: string[]): Array<{ entryId: string; exactText: string }> {
+  const wanted = new Set(entryIds);
+  return branch
+    .filter(entry => wanted.has(String(entry.id || "")) && entry.type === "message" && (entry.message as Record<string, unknown> | undefined)?.role === "user")
+    .map(entry => ({ entryId: String(entry.id), exactText: piMessageText(entry.message as Record<string, unknown>) }))
+    .filter(item => item.exactText);
 }
 
 function buildObservationSteps(messages: ObservedAgentMessage[], existingSteps: TraceStep[]): TraceStep[] {
@@ -643,6 +671,10 @@ function buildTraceTimeline(snapshot: TraceSnapshot) {
     `Trace time: ${snapshot.traceTimestamp}`,
     `CWD: ${snapshot.cwd}`,
     `Model: ${snapshot.provider}/${snapshot.model}`,
+    `Segment: ${snapshot.segmentKind || "final"} ${snapshot.segmentIndex || 0}`,
+    `Pi user entry IDs: ${(snapshot.piProvenance?.userEntryIds || []).join(", ")}`,
+    `Pi assistant entry IDs: ${(snapshot.piProvenance?.assistantEntryIds || []).join(", ")}`,
+    `Pi tool-result entry IDs: ${(snapshot.piProvenance?.toolResultEntryIds || []).join(", ")}`,
     `User: ${clampText(snapshot.userPrompt, 8000)}`,
   ];
 
@@ -671,7 +703,7 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
   if (!OBSERVER_ENABLED || !OBSERVER_MODEL || !OBSERVER_API_KEY) return undefined;
 
   const timeline = buildTraceTimeline(snapshot);
-  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract trace-level memory and return ONLY valid JSON with this shape:
+  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract one episodic memory record and return ONLY valid JSON with this shape:
 {
   "observationsMarkdown": "Date: <date from trace>\\n* 🔴 (<time>) ...",
   "summary": "one short paragraph",
@@ -689,7 +721,14 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
   "filesModified": ["path changed"],
   "filesCreated": ["path created"],
   "filesDeleted": ["path deleted"],
-  "toolsUsed": ["tool name"]
+  "toolsUsed": ["tool name"],
+  "userRequests": [{"entryId":"exact Pi user entry ID","exactText":"exact supplied user text","normalizedIntent":"short intent","status":"answered | pending | corrected | superseded"}],
+  "questionsAnswered": [{"questionEntryId":"Pi user entry ID","question":"exact question","answerEntryId":"Pi assistant entry ID","answer":"concise answer"}],
+  "corrections": [{"topic":"stable topic","oldUnderstanding":"old state","newUnderstanding":"new user state","sourceEntryId":"Pi user entry ID"}],
+  "taskDelta": {"before":"state before","actions":["action"],"verifiedResults":["result"],"after":"state after"},
+  "commitments": [{"content":"commitment","sourceEntryIds":["Pi entry ID"]}],
+  "durableItems": [{"kind":"request | decision | constraint | fact | task | question | commitment","topic":"stable topic","content":"canonical state","status":"active | completed | superseded | revoked | proposed","authority":"user | verified-result | assistant-proposal","sourceEntryIds":["Pi entry ID"]}],
+  "evidence": [{"itemId":"durable item topic or ID","sourceEntryIds":["Pi entry ID"]}]
 }`;
 
   let parsed: Record<string, unknown> | undefined;
@@ -741,9 +780,80 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
     ...arrayOfStrings(parsed.toolsUsed),
     ...snapshot.steps.filter(step => step.type === "tool").map(step => step.name.replace(/^tool:/, "")),
   ]);
+  const generated = new Date().toISOString();
+  const scoreId = deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.traceId}:${snapshot.segmentKind || "final"}:${snapshot.segmentIndex || 0}`);
+  const provenance = snapshot.piProvenance;
+  const exactRequests = snapshot.userRequests?.length
+    ? snapshot.userRequests
+    : provenance?.userEntryId ? [{ entryId: provenance.userEntryId, exactText: snapshot.userPrompt }] : [];
+  const requestStatus = snapshot.interrupted || !snapshot.output ? "pending" : "answered";
+  const userRequests = exactRequests.map(request => ({
+    entryId: request.entryId,
+    exactText: request.exactText,
+    normalizedIntent: String((parsed.userRequests as Array<Record<string, unknown>> | undefined)?.find(item => item.entryId === request.entryId)?.normalizedIntent || request.exactText).trim(),
+    status: requestStatus,
+  }));
+  const answerEntryId = provenance?.assistantEntryIds?.at(-1) || "";
+  const questionsAnswered = snapshot.output && answerEntryId
+    ? userRequests.filter(request => /\?|^(?:what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did)\b/i.test(request.exactText)).map(request => ({
+        questionEntryId: request.entryId,
+        question: request.exactText,
+        answerEntryId,
+        answer: clampText(snapshot.output, 8_000),
+      }))
+    : [];
+  const parsedCorrections = Array.isArray(parsed.corrections) ? parsed.corrections as Array<Record<string, unknown>> : [];
+  const parsedDurableItems = Array.isArray(parsed.durableItems) ? parsed.durableItems : [];
+  const corrections = exactRequests.flatMap(request => {
+    if (!detectExplicitCorrection(request.exactText)) return [];
+    const extracted = parsedCorrections.find(item => item.sourceEntryId === request.entryId
+      && textSupportsClaim(request.exactText, item.newUnderstanding));
+    const relatedItem = parsedDurableItems.find((item: any) => item?.authority === "user"
+      && Array.isArray(item.sourceEntryIds) && item.sourceEntryIds.includes(request.entryId)
+      && textSupportsClaim(request.exactText, item.content));
+    const fallbackTopic = /refresh/i.test(request.exactText) ? "refresh-work" : request.exactText.slice(0, 120);
+    return [{
+      topic: String(extracted?.topic || (relatedItem as any)?.topic || fallbackTopic).trim(),
+      oldUnderstanding: String(extracted?.oldUnderstanding || "").trim(),
+      newUnderstanding: request.exactText,
+      authority: "user",
+      sourceEntryId: request.entryId,
+    }];
+  });
+  const modelDurableItems = parsedDurableItems
+    .map(item => normalizeDurableItem(item, { sourceScoreIds: [scoreId], updatedAt: generated }))
+    .map(item => sanitizeDurableItemSources(item, provenance as unknown as Record<string, unknown> | undefined))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item)
+      && validateDurableItemAuthority(item!, provenance as unknown as Record<string, unknown> | undefined)
+      && (item!.authority !== "user" || exactRequests.some(request => item!.sourceEntryIds.includes(request.entryId) && textSupportsClaim(request.exactText, item!.content))));
+  const requestItems = userRequests.map(request => normalizeDurableItem({
+    id: `request-${request.entryId}`,
+    kind: "request",
+    topic: request.normalizedIntent.slice(0, 160),
+    content: request.exactText,
+    status: request.status === "pending" ? "active" : "completed",
+    authority: "user",
+    sourceEntryIds: [request.entryId],
+  }, { sourceScoreIds: [scoreId], updatedAt: generated })).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  const correctionItems = corrections.map(correction => normalizeDurableItem({
+    kind: "decision",
+    topic: correction.topic,
+    content: correction.newUnderstanding,
+    status: "active",
+    authority: "user",
+    sourceEntryIds: [correction.sourceEntryId],
+  }, { sourceScoreIds: [scoreId], updatedAt: generated })).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  const durableItems = reduceDurableItems([], [...modelDurableItems, ...requestItems, ...correctionItems]).items;
+  const semantic = buildSemanticCoverage({
+    userRequests,
+    questionsAnswered,
+    corrections,
+    provenance,
+    valid: !snapshot.interrupted,
+  });
 
   return {
-    id: deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.traceId}`),
+    id: scoreId,
     name: MEMORY_SCORE_NAME,
     value: "observed",
     traceId: snapshot.traceId,
@@ -764,6 +874,7 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
       model: snapshot.model || null,
       provider: snapshot.provider || null,
       observationsMarkdown: String(parsed.observationsMarkdown).trim(),
+      episodeSummary: String(parsed.summary).trim(),
       summary: String(parsed.summary).trim(),
       goal: arrayOfStrings(parsed.goal),
       constraints: arrayOfStrings(parsed.constraints),
@@ -781,6 +892,17 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
       filesDeleted,
       filesTouched,
       toolsUsed,
+      userRequests,
+      questionsAnswered,
+      corrections,
+      taskDelta: parsed.taskDelta,
+      commitments: parsed.commitments,
+      durableItems,
+      evidence: parsed.evidence,
+      memoryStatus: "ready",
+      ...semantic,
+      segmentKind: snapshot.segmentKind || "final",
+      segmentIndex: snapshot.segmentIndex || 0,
       sourceStepIds: snapshot.steps.map(step => step.id),
       sourceStepCount: snapshot.steps.length,
       piProvenanceVersion: snapshot.piProvenance?.version || null,
@@ -795,7 +917,7 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
       piToolPairs: snapshot.piProvenance?.toolPairs || [],
       piUnexecutedToolCallIds: snapshot.piProvenance?.unexecutedToolCallIds || [],
       piProvenance: snapshot.piProvenance || null,
-      generatedAt: new Date().toISOString(),
+      generatedAt: generated,
     },
   };
 }
@@ -959,7 +1081,8 @@ Return ONLY valid JSON:
   "filesModified": ["path changed"],
   "filesCreated": ["path created"],
   "filesDeleted": ["path deleted"],
-  "toolsUsed": ["tool name"]
+  "toolsUsed": ["tool name"],
+  "durableItems": [{"id":"stable existing ID when available","kind":"request | decision | constraint | fact | task | question | commitment","topic":"stable topic","content":"canonical state","status":"active | completed | superseded | revoked | proposed","authority":"user | verified-result | assistant-proposal","sourceEntryIds":["exact Pi entry ID"]}]
 }
 
 Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
@@ -1001,6 +1124,12 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       }
       const validationError = validateMemoryOutput(candidate, "reflection");
       if (validationError) throw new MemoryOutputValidationError(`Invalid reflector schema: ${validationError}`);
+      const previousDurableItems = Array.isArray(previousFields?.durableItems) ? previousFields.durableItems : [];
+      const observationDurableItems = newObservationFields.flatMap(item => Array.isArray(item.durableItems) ? item.durableItems : []);
+      const reducedDurable = reduceDurableItems(
+        previousDurableItems,
+        alignDurableItems(previousDurableItems, observationDurableItems, Array.isArray(candidate.durableItems) ? candidate.durableItems : []),
+      );
       const canonical = {
         ...candidate,
         summary: String(candidate.summary).trim(),
@@ -1019,6 +1148,9 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         filesCreated: unique([...metadataStrings(previous, "filesCreated"), ...newObservationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(candidate.filesCreated)]),
         filesDeleted: unique([...metadataStrings(previous, "filesDeleted"), ...newObservationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(candidate.filesDeleted)]),
         toolsUsed: unique([...metadataStrings(previous, "toolsUsed"), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(candidate.toolsUsed)]),
+        durableItems: reducedDurable.items,
+        supersededItems: reducedDurable.superseded,
+        decisionConflicts: reducedDurable.conflicts,
       };
       const quality = evaluateReflectionQuality(canonical, previousFields, newObservationFields);
       if (quality.errors.length) throw new MemoryOutputValidationError(`Reflection quality failed: ${quality.errors.join("; ")}`);
@@ -1063,6 +1195,10 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   const coveredUntil = generatedAt(memory.newObservations[memory.newObservations.length - 1]!);
   const piReflectionProvenance = aggregatePiReflectionProvenance(previous?.metadata, memory.newObservations);
   const generated = new Date().toISOString();
+  const durableItems = Array.isArray(parsed.durableItems) ? parsed.durableItems : [];
+  const activeDurable = durableItems.filter((item: any) => item?.status === "active");
+  const semanticCoverageComplete = (!previous || previous.metadata?.semanticCoverageComplete === true)
+    && memory.newObservations.every(score => score.metadata?.replacementEligible === true && score.metadata?.memoryStatus === "ready");
   const metadata = {
     version: MEMORY_SCORE_VERSION,
     promptVersion: REFLECTION_PROMPT_VERSION,
@@ -1092,6 +1228,18 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     filesDeleted: unique([...metadataStrings(previous, "filesDeleted"), ...newObservationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(parsed.filesDeleted)]),
     filesTouched: unique([...metadataStrings(previous, "filesTouched"), ...newObservationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
     toolsUsed: unique([...metadataStrings(previous, "toolsUsed"), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
+    durableItems,
+    activeUserRequests: activeDurable.filter((item: any) => item.kind === "request"),
+    activeDecisions: activeDurable.filter((item: any) => item.kind === "decision"),
+    activeConstraints: activeDurable.filter((item: any) => item.kind === "constraint"),
+    verifiedFacts: activeDurable.filter((item: any) => item.kind === "fact" && item.authority === "verified-result"),
+    activeTasks: activeDurable.filter((item: any) => item.kind === "task"),
+    openQuestions: activeDurable.filter((item: any) => item.kind === "question"),
+    blockedItems: arrayOfStrings(parsed.openIssues),
+    supersededItems: Array.isArray((parsed as any).supersededItems) ? (parsed as any).supersededItems : [],
+    decisionConflicts: Array.isArray((parsed as any).decisionConflicts) ? (parsed as any).decisionConflicts : [],
+    memoryStatus: "ready",
+    semanticCoverageComplete,
     inputTokensEstimated: memory.activeTokens,
     outputTokensEstimated: estimateTokens(renderedMarkdown),
     compressionRatio: Number((estimateTokens(renderedMarkdown) / memory.activeTokens).toFixed(3)),
@@ -1153,7 +1301,7 @@ async function writeTraceMemoryObservation(snapshot: TraceSnapshot, signal?: Abo
   if (!score) return;
   await writeMemoryScore(score, signal);
   sessionMemoryCache.addObservation(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
-  if (!snapshot.interrupted) await maybeWriteSessionReflection(snapshot, score, signal);
+  if (!snapshot.interrupted && snapshot.segmentKind !== "checkpoint") await maybeWriteSessionReflection(snapshot, score, signal);
 }
 
 function enqueueTraceMemoryObservation(snapshot: TraceSnapshot, signal: AbortSignal): void {
@@ -1183,21 +1331,26 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
     fetchScoresByName(MEMORY_SCORE_NAME, signal),
     fetchScoresByName(REFLECTION_SCORE_NAME, signal),
   ]);
-  const scores = [...observations, ...reflections].filter(score => metadataString(score, "version") === MEMORY_SCORE_VERSION);
+  const scores = [...observations, ...reflections].filter(score => [MEMORY_SCORE_VERSION, LEGACY_MEMORY_SCORE_VERSION].includes(metadataString(score, "version")));
   lookupScoresCache = { scores, loadedAt: Date.now() };
   return scores;
 }
 
-function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string, branch: Array<Record<string, unknown>>) {
+function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string, branch: Array<Record<string, unknown>>, currentPrompt = "") {
   const branchScores = filterMemoryScoresForBranch(scores, branch);
+  const branchObservations = branchScores.filter(score => score.name === MEMORY_SCORE_NAME);
   const memory = buildActiveMemory(
-    branchScores.filter(score => score.name === MEMORY_SCORE_NAME),
+    branchObservations,
     branchScores.filter(score => score.name === REFLECTION_SCORE_NAME),
     sessionId,
     pathKey,
     MEMORY_SCORE_VERSION,
   );
+  const episodicMemory = buildActiveMemory(branchObservations, [], sessionId, pathKey, MEMORY_SCORE_VERSION);
+  const recentUserRequests = buildRecentUserRequests(branch, { maxMessages: 5, maxTokens: 2_000 });
   const payload = {
+    currentPrompt,
+    recentUserRequests,
     reflection: memory.latestReflection ? {
       scoreId: memory.latestReflection.id,
       generation: memory.latestReflection.metadata?.generation || null,
@@ -1207,7 +1360,7 @@ function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathK
       sourceTraceIds: metadataStrings(memory.latestReflection, "sourceTraceIds"),
       fields: reflectionFields(memory.latestReflection),
     } : undefined,
-    observations: memory.newObservations.map(score => ({
+    observations: episodicMemory.newObservations.map(score => ({
       scoreId: score.id,
       traceId: score.traceId || metadataString(score, "traceId") || null,
       generatedAt: generatedAt(score),
@@ -1273,6 +1426,58 @@ async function getLookupTrace(traceId: string, refresh: boolean, signal?: AbortS
   return value;
 }
 
+async function maybeEnqueueMemoryCheckpoint(ctx: { sessionManager: { getBranch(): unknown; getLeafId(): string | null | undefined }; cwd: string }): Promise<void> {
+  if (!currentTrace || !OBSERVER_ENABLED || activeSpans.size > 0) return;
+  const newSteps = traceSteps.slice(memoryCheckpointStepOffset);
+  const completedTools = newSteps.filter(step => step.type === "tool" && step.output !== undefined).length;
+  const textTokens = estimateTokens(newSteps.map(step => ({ input: step.input, output: step.output })));
+  const nearContextLimit = Boolean(memoryContextDisplay.actualInputTokens && memoryContextDisplay.contextWindow
+    && memoryContextDisplay.actualInputTokens / memoryContextDisplay.contextWindow >= 0.7);
+  if (completedTools < MEMORY_CHECKPOINT_TOOL_RESULTS && textTokens < MEMORY_CHECKPOINT_TEXT_TOKENS && !nearContextLimit) return;
+
+  const branch = ctx.sessionManager.getBranch() as Array<Record<string, unknown>>;
+  const endEntryId = ctx.sessionManager.getLeafId() || "";
+  const previousIndex = memoryCheckpointLastEntryId ? branch.findIndex(entry => entry.id === memoryCheckpointLastEntryId) : -1;
+  const startEntryId = memoryCheckpointLastEntryId
+    ? String(branch[previousIndex + 1]?.id || "")
+    : findPiTraceStartEntryId(branch, currentTraceParentEntryId);
+  if (!startEntryId || !endEntryId || startEntryId === endEntryId && branch.find(entry => entry.id === startEntryId)?.type !== "message") return;
+  const piProvenance = buildPiTraceProvenance(branch, startEntryId, currentPiSessionId, endEntryId, Boolean(memoryCheckpointLastEntryId));
+  if (!piProvenance.provenance?.complete) {
+    logMemoryError({
+      stage: "memory-checkpoint-provenance",
+      errors: piProvenance.errors,
+      traceId: currentTrace.id,
+      sessionId: currentSessionId,
+      startEntryId,
+      endEntryId,
+    });
+    return;
+  }
+
+  memoryCheckpointIndex++;
+  const snapshot: TraceSnapshot = {
+    traceId: currentTrace.id,
+    traceTimestamp: currentTraceTimestamp,
+    sessionId: currentSessionId,
+    cwd: currentCwd || ctx.cwd,
+    model: currentModel,
+    provider: currentProvider,
+    userPrompt: currentUserPrompt,
+    userRequests: exactUserRequestsFromBranch(branch, piProvenance.provenance.userEntryIds),
+    steps: newSteps,
+    piProvenance: piProvenance.provenance,
+    piProvenanceErrors: piProvenance.errors,
+    piBranchEntryIds: branch.map(entry => String(entry.id || "")).filter(Boolean),
+    interrupted: false,
+    segmentIndex: memoryCheckpointIndex,
+    segmentKind: "checkpoint",
+  };
+  memoryCheckpointStepOffset = traceSteps.length;
+  memoryCheckpointLastEntryId = endEntryId;
+  enqueueTraceMemoryObservation(snapshot, memoryLifecycleController.signal);
+}
+
 // ============================================
 // Extension
 // ============================================
@@ -1288,13 +1493,15 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("memory-context", {
     description: "Preview or toggle provenance-gated Langfuse context replacement",
     handler: async (args, ctx) => {
-      const action = args.trim().toLowerCase();
+      const rawAction = args.trim();
+      const explainQuery = rawAction.match(/^explain(?:\s+(.+))?$/i)?.[1]?.replace(/^['"]|['"]$/g, "") || "";
+      const action = /^explain\b/i.test(rawAction) ? "explain" : rawAction.toLowerCase();
       if (action === "status") {
         ctx.ui.notify(`Langfuse memory context replacement is ${memoryContextEnabled ? "on" : "off"}.`, "info");
         return;
       }
-      if (action && !["on", "off", "preview"].includes(action)) {
-        ctx.ui.notify("Usage: /memory-context [on|off|status|preview]", "warning");
+      if (action && !["on", "off", "preview", "explain"].includes(action)) {
+        ctx.ui.notify("Usage: /memory-context [on|off|status|preview|explain <topic>]", "warning");
         return;
       }
       const enabling = action === "on" || (action === "" && !memoryContextEnabled);
@@ -1309,10 +1516,25 @@ export default async function (pi: ExtensionAPI) {
       try {
         const scores = await getLookupScores(true, ctx.signal);
         const branch = ctx.sessionManager.getBranch() as unknown as SessionEntry[];
-        const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch as unknown as Array<Record<string, unknown>>);
-        const memoryText = buildMemoryContextText(state.payload);
         const messages = buildSessionContext(branch, ctx.sessionManager.getLeafId()).messages;
-        const plan = planMemoryContextReplacement(messages, branch as unknown as Array<Record<string, unknown>>, memoryText, state.coverage);
+        const prompt = [...messages].reverse().find(message => message?.role === "user");
+        const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch as unknown as Array<Record<string, unknown>>, piMessageText(prompt as unknown as Record<string, unknown>));
+        const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
+        const plan = planMemoryContextReplacement(messages, branch as unknown as Array<Record<string, unknown>>, memoryText, state.coverage, undefined, {
+          maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.7) : undefined,
+        });
+        if (action === "explain") {
+          const durableItems = (state.payload.reflection?.fields as Record<string, unknown> | undefined)?.durableItems;
+          const matches = explainDurableItems(Array.isArray(durableItems) ? durableItems : [], explainQuery);
+          ctx.ui.notify(JSON.stringify(redactSecrets({
+            query: explainQuery || null,
+            matches,
+            currentlyInjected: matches.filter(item => item.status === "active").map(item => item.id),
+            semanticCoverageFailures: state.coverage.semanticCoverageFailures,
+            lookupOnlyScoreIds: state.coverage.lookupOnlyScoreIds,
+          }), null, 2), matches.length ? "info" : "warning");
+          return;
+        }
         if (action === "preview") {
           ctx.ui.notify(formatMemoryContextPreview(plan), plan.safe ? "info" : "warning");
           return;
@@ -1469,13 +1691,22 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("context", async (event, ctx) => {
-    if (!memoryContextEnabled || !currentSessionId) return;
+    if (!currentSessionId) return;
+    try {
+      await maybeEnqueueMemoryCheckpoint(ctx);
+    } catch (error) {
+      logMemoryError({ stage: "memory-checkpoint", error: errorMessage(error), sessionId: currentSessionId, pathKey: ctx.cwd });
+    }
+    if (!memoryContextEnabled) return;
     try {
       const scores = await getLookupScores(false, ctx.signal);
       const branch = ctx.sessionManager.getBranch() as unknown as Array<Record<string, unknown>>;
-      const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch);
-      const memoryText = buildMemoryContextText(state.payload);
-      const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage);
+      const prompt = [...event.messages].reverse().find(message => message?.role === "user");
+      const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch, piMessageText(prompt as unknown as Record<string, unknown>));
+      const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
+      const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage, undefined, {
+        maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.7) : undefined,
+      });
       if (!plan.safe) {
         memoryContextEnabled = false;
         resetMemoryContextWidget(ctx.ui);
@@ -1535,6 +1766,9 @@ export default async function (pi: ExtensionAPI) {
       currentTraceTimestamp = new Date().toISOString();
       currentCwd = cwd;
       traceSteps.length = 0;
+      memoryCheckpointIndex = 0;
+      memoryCheckpointStepOffset = 0;
+      memoryCheckpointLastEntryId = "";
       
       // Fallback to ctx.model if not captured via model_select
       if (!currentModel && ctx.model) {
@@ -1632,12 +1866,15 @@ export default async function (pi: ExtensionAPI) {
         model: currentModel,
         provider: currentProvider,
         userPrompt: currentUserPrompt,
+        userRequests: exactUserRequestsFromBranch(piBranch, piProvenance.provenance?.userEntryIds || []),
         output,
         steps: buildObservationSteps(messages, traceSteps),
         piProvenance: piProvenance.provenance,
         piProvenanceErrors: piProvenance.errors,
         piBranchEntryIds: piBranch.map(entry => String(entry.id || "")).filter(Boolean),
         interrupted,
+        segmentKind: "final",
+        segmentIndex: 0,
       };
       enqueueTraceMemoryObservation(memorySnapshot, memoryLifecycleController.signal);
       

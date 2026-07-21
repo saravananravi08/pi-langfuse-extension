@@ -11,6 +11,8 @@ import {
 } from '../memory/memory-prompts.js';
 import { validateMemoryOutput } from '../memory/memory-validation.js';
 import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory/memory-reflection.js';
+import { alignDurableItems, reduceDurableItems } from '../memory/memory-quality.js';
+import { aggregatePiReflectionProvenance } from '../memory/memory-provenance.js';
 import {
   estimateTokens,
   generatedAt,
@@ -24,7 +26,7 @@ import {
 
 const OBSERVATION_SCORE_NAME = 'memory_trace_observation';
 const REFLECTION_SCORE_NAME = 'memory_session_reflection';
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CONFIG_PATH = process.env.LANGFUSE_CONFIG || join(homedir(), '.pi', 'agent', 'extensions', 'langfuse', 'config.json');
 const args = parseArgs(process.argv.slice(2));
 const sessionId = normalizeSessionId(args.session || args._[0]);
@@ -48,6 +50,7 @@ const minNewObservationTokens = positiveInteger(process.env.PI_LANGFUSE_REFLECTI
 const minNewObservations = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS || reflectionConfig.minNewObservations, 5);
 const auth = `Basic ${Buffer.from(`${config.publicKey}:${config.secretKey}`).toString('base64')}`;
 let lfRequestQueue = Promise.resolve();
+class MemoryOutputValidationError extends Error {}
 
 if (!reflectionEnabled) fail('Reflection disabled. Set memory.reflection.enabled=true or PI_LANGFUSE_REFLECTION_ENABLED=true.');
 if (!observerModel) fail('Missing reflector model. Configure observer.model or OBSERVER_MODEL.');
@@ -278,8 +281,6 @@ async function complete(system, user) {
   throw new Error('Reflector model connection failed after 3 attempts', { cause: lastError });
 }
 
-class MemoryOutputValidationError extends Error {}
-
 async function generateReflection(previous, scores, scope) {
   const previousFields = reflectionFields(previous);
   const newObservationFields = scores.map(observationFields);
@@ -312,7 +313,8 @@ Return ONLY valid JSON:
   "filesModified": ["path changed"],
   "filesCreated": ["path created"],
   "filesDeleted": ["path deleted"],
-  "toolsUsed": ["tool name"]
+  "toolsUsed": ["tool name"],
+  "durableItems": [{"id":"stable existing ID","kind":"request | decision | constraint | fact | task | question | commitment","topic":"stable topic","content":"canonical state","status":"active | completed | superseded | revoked | proposed","authority":"user | verified-result | assistant-proposal","sourceEntryIds":["exact Pi entry ID"]}]
 }
 
 Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
@@ -336,6 +338,12 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       }
       const validationError = validateMemoryOutput(candidate, 'reflection');
       if (validationError) throw new MemoryOutputValidationError(`Invalid reflector schema: ${validationError}`);
+      const previousDurableItems = Array.isArray(previousFields?.durableItems) ? previousFields.durableItems : [];
+      const observationDurableItems = newObservationFields.flatMap(item => Array.isArray(item.durableItems) ? item.durableItems : []);
+      const reducedDurable = reduceDurableItems(
+        previousDurableItems,
+        alignDurableItems(previousDurableItems, observationDurableItems, Array.isArray(candidate.durableItems) ? candidate.durableItems : []),
+      );
       const canonical = {
         ...candidate,
         summary: String(candidate.summary).trim(),
@@ -354,6 +362,9 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         filesCreated: unique([...metadataStrings(previous, 'filesCreated'), ...newObservationFields.flatMap(item => item.filesCreated), ...arrayOfStrings(candidate.filesCreated)]),
         filesDeleted: unique([...metadataStrings(previous, 'filesDeleted'), ...newObservationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(candidate.filesDeleted)]),
         toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(candidate.toolsUsed)]),
+        durableItems: reducedDurable.items,
+        supersededItems: reducedDurable.superseded,
+        decisionConflicts: reducedDurable.conflicts,
       };
       const quality = evaluateReflectionQuality(canonical, previousFields, newObservationFields);
       if (quality.errors.length) throw new MemoryOutputValidationError(`Reflection quality failed: ${quality.errors.join('; ')}`);
@@ -378,6 +389,11 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   const sourceObservationScoreIds = scores.map(score => score.id);
   const sourceTraceIds = unique(scores.map(score => score.traceId || metadataString(score, 'traceId')));
   const generated = new Date().toISOString();
+  const durableItems = Array.isArray(parsed.durableItems) ? parsed.durableItems : [];
+  const activeDurable = durableItems.filter(item => item?.status === 'active');
+  const semanticCoverageComplete = (!previous || previous.metadata?.semanticCoverageComplete === true)
+    && scores.every(score => score.metadata?.replacementEligible === true && score.metadata?.memoryStatus === 'ready');
+  const piReflectionProvenance = aggregatePiReflectionProvenance(previous?.metadata, scores);
   const metadata = {
     version: VERSION,
     promptVersion: PROMPT_VERSION,
@@ -407,6 +423,18 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     filesDeleted: unique([...metadataStrings(previous, 'filesDeleted'), ...newObservationFields.flatMap(item => item.filesDeleted), ...arrayOfStrings(parsed.filesDeleted)]),
     filesTouched: unique([...metadataStrings(previous, 'filesTouched'), ...newObservationFields.flatMap(item => item.filesTouched), ...arrayOfStrings(parsed.filesRead), ...arrayOfStrings(parsed.filesModified), ...arrayOfStrings(parsed.filesCreated), ...arrayOfStrings(parsed.filesDeleted)]),
     toolsUsed: unique([...metadataStrings(previous, 'toolsUsed'), ...newObservationFields.flatMap(item => item.toolsUsed), ...arrayOfStrings(parsed.toolsUsed)]),
+    durableItems,
+    activeUserRequests: activeDurable.filter(item => item.kind === 'request'),
+    activeDecisions: activeDurable.filter(item => item.kind === 'decision'),
+    activeConstraints: activeDurable.filter(item => item.kind === 'constraint'),
+    verifiedFacts: activeDurable.filter(item => item.kind === 'fact' && item.authority === 'verified-result'),
+    activeTasks: activeDurable.filter(item => item.kind === 'task'),
+    openQuestions: activeDurable.filter(item => item.kind === 'question'),
+    blockedItems: arrayOfStrings(parsed.openIssues),
+    supersededItems: parsed.supersededItems || [],
+    decisionConflicts: parsed.decisionConflicts || [],
+    memoryStatus: 'ready',
+    semanticCoverageComplete,
     inputTokensEstimated: inputTokens,
     outputTokensEstimated: estimateTokens(renderedMarkdown),
     compressionRatio: Number((estimateTokens(renderedMarkdown) / inputTokens).toFixed(3)),
@@ -416,6 +444,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     sourceObservationScoreIds,
     sourceReflectionScoreIds: previous ? [previous.id] : [],
     sourceObservationCount: sourceObservationScoreIds.length,
+    ...piReflectionProvenance,
     coveredUntil: generatedAt(scores[scores.length - 1]),
     generatedAt: generated,
   };

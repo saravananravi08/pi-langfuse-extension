@@ -104,3 +104,19 @@ test('rejects a non-user range boundary', () => {
   assert.equal(result.provenance.complete, false);
   assert.deepEqual(result.errors, ['range does not start with a user message']);
 });
+
+test('captures a bounded non-overlapping in-turn segment after a complete tool pair', () => {
+  const entries = [
+    entry('u1', null, 'user', 'run'),
+    entry('a1', 'u1', 'assistant', [{ type: 'toolCall', id: 'c1', name: 'read', arguments: {} }]),
+    entry('r1', 'a1', 'toolResult', [{ type: 'text', text: 'one' }], { toolCallId: 'c1' }),
+    entry('a2', 'r1', 'assistant', [{ type: 'toolCall', id: 'c2', name: 'bash', arguments: {} }]),
+    entry('r2', 'a2', 'toolResult', [{ type: 'text', text: 'two' }], { toolCallId: 'c2' }),
+  ];
+  const first = buildPiTraceProvenance(entries, 'u1', 'session', 'r1');
+  const second = buildPiTraceProvenance(entries, 'a2', 'session', 'r2', true);
+  assert.equal(first.provenance.complete, true);
+  assert.equal(second.provenance.complete, true);
+  assert.deepEqual(first.provenance.entryIds, ['u1', 'a1', 'r1']);
+  assert.deepEqual(second.provenance.entryIds, ['a2', 'r2']);
+});

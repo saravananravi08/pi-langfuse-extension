@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { auditObservationCoverage, auditPiProvenance } from '../memory/memory-audit.js';
+import { auditObservationCoverage, auditPiProvenance, auditSemanticCoverage } from '../memory/memory-audit.js';
 
 test('audits missing, incomplete, invalid, and overlapping Pi provenance', () => {
   const complete = {
@@ -74,6 +74,21 @@ test('reports duplicates, prompt versions, and non-deterministic IDs', () => {
   assert.deepEqual(report.duplicateTraceIds, ['a']);
   assert.deepEqual(report.nonDeterministicScoreIds, ['unexpected']);
   assert.deepEqual(report.promptVersions, { 'observer-v2': 1, 'observer-v1': 1 });
+});
+
+test('reports semantic lookup-only scores and active decision conflicts', () => {
+  const ready = {
+    id: 'ready', name: 'memory_trace_observation', metadata: {
+      memoryStatus: 'ready', replacementEligible: true,
+      semanticCoverage: { userRequests: 1, preservedUserRequests: 1, corrections: 0, preservedCorrections: 0, questions: 0, preservedQuestions: 0 },
+    },
+  };
+  const lookupOnly = { id: 'lookup-only', name: 'memory_trace_observation', metadata: { memoryStatus: 'ready', replacementEligible: false } };
+  const conflict = { id: 'conflict', name: 'memory_session_reflection', metadata: { memoryStatus: 'ready', semanticCoverageComplete: true, decisionConflicts: [{}] } };
+  const report = auditSemanticCoverage([ready, lookupOnly, conflict]);
+  assert.equal(report.semanticCoverageFailures, 1);
+  assert.deepEqual(report.lookupOnlyScoreIds, ['lookup-only']);
+  assert.deepEqual(report.activeDecisionConflictScoreIds, ['conflict']);
 });
 
 test('isolates totals by cwd and ignores unrelated score versions', () => {

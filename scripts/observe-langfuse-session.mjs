@@ -5,18 +5,20 @@ import { homedir } from 'node:os';
 import crypto from 'node:crypto';
 import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory/memory-prompts.js';
 import { validateMemoryOutput } from '../memory/memory-validation.js';
-import { auditObservationCoverage, auditPiProvenance } from '../memory/memory-audit.js';
+import { auditObservationCoverage, auditPiProvenance, auditSemanticCoverage } from '../memory/memory-audit.js';
 import { buildPiTraceProvenance } from '../memory/memory-provenance.js';
 import { findPiSessionFile } from '../memory/memory-pi-entries.js';
+import { buildSemanticCoverage, detectExplicitCorrection, normalizeDurableItem, prepareMetadataReplacement, reduceDurableItems, sanitizeDurableItemSources, textSupportsClaim, validateDurableItemAuthority } from '../memory/memory-quality.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
-const VERSION = 'v1';
+const VERSION = 'v2';
 let OBSERVER_API = 'anthropic';
 let OBSERVER_ENABLED = true;
 let OBSERVER_MODEL = '';
 let OBSERVER_BASE_URL = '';
 let OBSERVER_API_KEY = '';
+let piSessionData;
 const AGENT_ROOT = process.env.PI_CODING_AGENT_DIR || resolve(homedir(), '.pi', 'agent');
 const LANGFUSE_CONFIG = process.env.LANGFUSE_CONFIG || join(AGENT_ROOT, 'extensions', 'langfuse', 'config.json');
 
@@ -49,23 +51,25 @@ console.log(`model=${OBSERVER_MODEL}`);
 console.log(`dryRun=${dryRun} force=${force} audit=${auditMode} backfill=${backfill} includePreCoverage=${includePreCoverage}`);
 
 let traces = await fetchAllTraces(sessionId);
+if (args.trace) traces = traces.filter(trace => trace.id === String(args.trace));
 console.log(`traces=${traces.length}`);
 
 if (auditMode) {
   const traceIds = new Set(traces.map(trace => trace.id));
   const observationScores = (await fetchScoresByName(SCORE_NAME)).filter(score => traceIds.has(score.traceId || score.metadata?.traceId));
+  const currentObservationScores = observationScores.filter(score => score.metadata?.version === VERSION);
   const audit = auditObservationCoverage(traces, observationScores, {
     scoreName: SCORE_NAME,
     version: VERSION,
-    expectedScoreId: traceId => deterministicUuid(`${SCORE_NAME}:${VERSION}:${traceId}`),
+    expectedScoreId: traceId => deterministicUuid(`${SCORE_NAME}:${VERSION}:${traceId}:final:0`),
   });
-  console.log(JSON.stringify({ sessionId, ...audit, piProvenance: auditPiProvenance(observationScores) }, null, 2));
+  console.log(JSON.stringify({ sessionId, ...audit, piProvenance: auditPiProvenance(currentObservationScores), semantic: auditSemanticCoverage(currentObservationScores) }, null, 2));
   if (!backfill) process.exit(0);
   const missing = new Set([
     ...audit.eligibleMissingTraceIds,
     ...(includePreCoverage ? audit.preCoverageTraceIds : []),
   ]);
-  traces = traces.filter(trace => missing.has(trace.id));
+  if (!force) traces = traces.filter(trace => missing.has(trace.id));
   console.log(`backfillEligible=${traces.length}`);
 }
 
@@ -85,13 +89,14 @@ for (const trace of traces.slice(0, limit)) {
 
     const observations = await fetchAllObservations(trace.id);
     const sourceObservations = observations.filter(o => !String(o.name || '').startsWith('memory:'));
-    const timeline = buildTimeline(fullTrace, sourceObservations);
-    const memory = await observeTrace(fullTrace, sourceObservations, timeline);
-    const piProvenance = backfill ? mapTracePiProvenance(fullTrace) : undefined;
+    const piProvenance = mapTracePiProvenance(fullTrace);
     if (backfill && !piProvenance?.complete) throw new Error('cannot deterministically map trace to complete Pi provenance');
-    const metadata = buildScoreMetadata(fullTrace, sourceObservations, memory, timeline, piProvenance);
+    const timeline = buildTimeline(fullTrace, sourceObservations, piProvenance);
+    const memory = await observeTrace(fullTrace, sourceObservations, timeline);
     const comment = firstLine(memory.summary || stripXml(memory.observationsMarkdown) || 'Trace observed');
-    const scoreId = deterministicUuid(`${SCORE_NAME}:${VERSION}:${trace.id}`);
+    const scoreId = deterministicUuid(`${SCORE_NAME}:${VERSION}:${trace.id}:final:0`);
+    let metadata = buildScoreMetadata(fullTrace, sourceObservations, memory, timeline, piProvenance, scoreId);
+    if (existing?.metadata) metadata = prepareMetadataReplacement(metadata, existing.metadata);
 
     if (dryRun) {
       console.log(`dry ${trace.timestamp} ${trace.id}`);
@@ -206,13 +211,16 @@ async function writeScore({ traceId, scoreId, comment, metadata }) {
   }, 'Langfuse score write');
 }
 
-function buildTimeline(trace, observations) {
+function buildTimeline(trace, observations, piProvenance) {
   const lines = [];
   lines.push(`Trace ${trace.id}`);
   lines.push(`Session: ${trace.sessionId || ''}`);
   lines.push(`Time: ${trace.timestamp || ''}`);
   lines.push(`CWD: ${trace.metadata?.cwd || ''}`);
   lines.push(`Model: ${trace.metadata?.provider || ''}/${trace.metadata?.model || ''}`);
+  lines.push(`Pi user entry IDs: ${(piProvenance?.userEntryIds || []).join(', ')}`);
+  lines.push(`Pi assistant entry IDs: ${(piProvenance?.assistantEntryIds || []).join(', ')}`);
+  lines.push(`Pi tool-result entry IDs: ${(piProvenance?.toolResultEntryIds || []).join(', ')}`);
   lines.push(`User: ${stringifyValue(trace.input, 8000)}`);
   if (trace.output) lines.push(`Final assistant output: ${stringifyValue(trace.output, 8000)}`);
   lines.push('');
@@ -248,7 +256,14 @@ async function observeTrace(trace, observations, timeline) {
   "filesModified": ["path changed"],
   "filesCreated": ["path created"],
   "filesDeleted": ["path deleted"],
-  "toolsUsed": ["tool name"]
+  "toolsUsed": ["tool name"],
+  "userRequests": [{"entryId":"exact Pi user entry ID","exactText":"exact user text","normalizedIntent":"short intent","status":"answered | pending | corrected | superseded"}],
+  "questionsAnswered": [{"questionEntryId":"Pi user entry ID","question":"exact question","answerEntryId":"Pi assistant entry ID","answer":"concise answer"}],
+  "corrections": [{"topic":"stable topic","oldUnderstanding":"old state","newUnderstanding":"new user state","sourceEntryId":"Pi user entry ID"}],
+  "taskDelta": {"before":"state before","actions":["action"],"verifiedResults":["result"],"after":"state after"},
+  "commitments": [{"content":"commitment","sourceEntryIds":["Pi entry ID"]}],
+  "durableItems": [{"kind":"request | decision | constraint | fact | task | question | commitment","topic":"stable topic","content":"canonical state","status":"active | completed | superseded | revoked | proposed","authority":"user | verified-result | assistant-proposal","sourceEntryIds":["Pi entry ID"]}],
+  "evidence": [{"itemId":"item ID","sourceEntryIds":["Pi entry ID"]}]
 }`;
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -326,6 +341,13 @@ function parseObserverJson(text) {
     filesCreated: arrayOfStrings(parsed.filesCreated),
     filesDeleted: arrayOfStrings(parsed.filesDeleted),
     toolsUsed: arrayOfStrings(parsed.toolsUsed),
+    userRequests: parsed.userRequests,
+    questionsAnswered: parsed.questionsAnswered,
+    corrections: parsed.corrections,
+    taskDelta: parsed.taskDelta,
+    commitments: parsed.commitments,
+    durableItems: parsed.durableItems,
+    evidence: parsed.evidence,
     rawModelOutput: text,
   };
 }
@@ -374,8 +396,6 @@ function parseRetryAfter(text) {
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-let piSessionData;
 
 function mapTracePiProvenance(trace) {
   if (!piSessionData) piSessionData = loadPiSessionData();
@@ -429,10 +449,42 @@ function textValue(value) {
   return '';
 }
 
-function buildScoreMetadata(trace, observations, memory, timeline, piProvenance) {
+function buildScoreMetadata(trace, observations, memory, timeline, piProvenance, scoreId) {
   const derivedFiles = deriveFileOperations(observations);
   const filesRead = unique([...derivedFiles.filesRead, ...memory.filesRead]);
   const filesModified = unique([...derivedFiles.filesModified, ...memory.filesModified]);
+  const generatedAt = new Date().toISOString();
+  const exactText = textValue(trace.input);
+  const userEntryId = piProvenance?.userEntryId || '';
+  const userRequests = userEntryId ? [{ entryId: userEntryId, exactText, normalizedIntent: memory.userRequests.find(item => item.entryId === userEntryId)?.normalizedIntent || exactText, status: trace.metadata?.completed === false ? 'pending' : 'answered' }] : [];
+  const answerEntryId = piProvenance?.assistantEntryIds?.at(-1) || '';
+  const questionsAnswered = answerEntryId && trace.output && /\?|^(?:what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did)\b/i.test(exactText)
+    ? [{ questionEntryId: userEntryId, question: exactText, answerEntryId, answer: clamp(textValue(trace.output), 8000) }]
+    : [];
+  const extractedCorrection = memory.corrections.find(item => item.sourceEntryId === userEntryId && textSupportsClaim(exactText, item.newUnderstanding));
+  const relatedItem = memory.durableItems.find(item => item?.authority === 'user'
+    && Array.isArray(item.sourceEntryIds) && item.sourceEntryIds.includes(userEntryId)
+    && textSupportsClaim(exactText, item.content));
+  const corrections = userEntryId && detectExplicitCorrection(exactText) ? [{
+    topic: String(extractedCorrection?.topic || relatedItem?.topic || (/refresh/i.test(exactText) ? 'refresh-work' : exactText.slice(0, 120))),
+    oldUnderstanding: String(extractedCorrection?.oldUnderstanding || ''),
+    newUnderstanding: exactText,
+    authority: 'user', sourceEntryId: userEntryId,
+  }] : [];
+  const modelItems = memory.durableItems
+    .map(item => normalizeDurableItem(item, { sourceScoreIds: [scoreId], updatedAt: generatedAt }))
+    .map(item => sanitizeDurableItemSources(item, piProvenance))
+    .filter(item => item && validateDurableItemAuthority(item, piProvenance)
+      && (item.authority !== 'user' || (item.sourceEntryIds.includes(userEntryId) && textSupportsClaim(exactText, item.content))));
+  const requestItems = userRequests.map(request => normalizeDurableItem({
+    id: `request-${request.entryId}`, kind: 'request', topic: request.normalizedIntent.slice(0, 160), content: request.exactText,
+    status: request.status === 'pending' ? 'active' : 'completed', authority: 'user', sourceEntryIds: [request.entryId],
+  }, { sourceScoreIds: [scoreId], updatedAt: generatedAt })).filter(Boolean);
+  const correctionItems = corrections.map(correction => normalizeDurableItem({
+    kind: 'decision', topic: correction.topic, content: correction.newUnderstanding, status: 'active', authority: 'user', sourceEntryIds: [correction.sourceEntryId],
+  }, { sourceScoreIds: [scoreId], updatedAt: generatedAt })).filter(Boolean);
+  const durableItems = reduceDurableItems([], [...modelItems, ...requestItems, ...correctionItems]).items;
+  const semantic = buildSemanticCoverage({ userRequests, questionsAnswered, corrections, provenance: piProvenance, valid: trace.metadata?.completed !== false });
   return trimMetadata({
     version: VERSION,
     promptVersion: PROMPT_VERSION,
@@ -448,6 +500,7 @@ function buildScoreMetadata(trace, observations, memory, timeline, piProvenance)
     model: trace.metadata?.model || null,
     provider: trace.metadata?.provider || null,
     observationsMarkdown: memory.observationsMarkdown,
+    episodeSummary: memory.summary,
     summary: memory.summary,
     goal: memory.goal,
     constraints: memory.constraints,
@@ -465,10 +518,31 @@ function buildScoreMetadata(trace, observations, memory, timeline, piProvenance)
     filesDeleted: memory.filesDeleted,
     filesTouched: unique([...filesRead, ...filesModified, ...memory.filesCreated, ...memory.filesDeleted]),
     toolsUsed: memory.toolsUsed.length ? memory.toolsUsed : unique(observations.map(o => o.metadata?.tool || (String(o.name || '').startsWith('tool:') ? String(o.name).slice(5) : '')).filter(Boolean)),
+    userRequests,
+    questionsAnswered,
+    corrections,
+    taskDelta: memory.taskDelta,
+    commitments: memory.commitments,
+    durableItems,
+    evidence: memory.evidence,
+    memoryStatus: 'ready',
+    ...semantic,
+    segmentKind: 'final',
+    segmentIndex: 0,
     sourceObservationIds: observations.map(o => o.id).filter(Boolean),
     sourceObservationCount: observations.length,
     timelinePreview: clamp(timeline, 6000),
-    generatedAt: new Date().toISOString(),
+    generatedAt,
+    piProvenanceVersion: piProvenance?.version || null,
+    piProvenanceStatus: piProvenance?.complete ? 'complete' : 'incomplete',
+    piSessionId: piProvenance?.piSessionId || null,
+    piUserEntryId: piProvenance?.userEntryId || null,
+    piFirstEntryId: piProvenance?.firstEntryId || null,
+    piLastEntryId: piProvenance?.lastEntryId || null,
+    piEntryIds: piProvenance?.entryIds || [],
+    piMessageEntryIds: piProvenance?.messageEntryIds || [],
+    piToolPairs: piProvenance?.toolPairs || [],
+    piUnexecutedToolCallIds: piProvenance?.unexecutedToolCallIds || [],
     piProvenance,
   });
 }

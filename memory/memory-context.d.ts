@@ -19,6 +19,9 @@ export interface MemoryContextCoverage {
   toolPairs: Array<Record<string, unknown>>;
   unexecutedToolCallIds: string[];
   overlappingEntryIds: string[];
+  semanticCoverageFailures: string[];
+  replacementEligibleScoreIds: string[];
+  lookupOnlyScoreIds: string[];
   coveredThroughEntryId: string | null;
 }
 
@@ -30,6 +33,10 @@ export interface MemoryContextPlan {
   coveredThroughEntryId: string | null;
   droppedEntryIds: string[];
   retainedEntryIds: string[];
+  recentRetainedEntryIds: string[];
+  semanticCoverageFailures: string[];
+  replacementEligibleScoreIds: string[];
+  lookupOnlyScoreIds: string[];
   unmappedMessageIndexes: number[];
   retainedUnmappedTailIndexes: number[];
   toolPairs: Array<Record<string, unknown>>;
@@ -45,7 +52,7 @@ export interface MemoryContextPlan {
 
 export const MEMORY_CUSTOM_TYPE: "langfuse-memory-context";
 export function filterMemoryScoresForBranch<T extends MemoryContextScore>(scores: T[], branchEntries: Array<string | Record<string, unknown>>): T[];
-export function buildMemoryContextText(memory: ContextMemoryPayload, maxChars?: number): string;
+export function buildMemoryContextText(memory: ContextMemoryPayload & { currentPrompt?: string; recentUserRequests?: unknown[] }, options?: number | { maxChars?: number; currentPrompt?: string; recentUserRequests?: unknown[] }): string;
 export function buildMemoryContextCoverage(
   reflection: MemoryContextScore | undefined,
   observations: MemoryContextScore[],
@@ -57,6 +64,7 @@ export function planMemoryContextReplacement(
   memoryText: string,
   coverage: MemoryContextCoverage,
   timestamp?: number,
+  options?: { recentTurnCount?: number; recentRawTokenBudget?: number; maxReplacementTokens?: number },
 ): MemoryContextPlan;
 export function formatMemoryContextPreview(plan: MemoryContextPlan, maxIds?: number): string;
 export function formatMemoryContextStatus(status: {

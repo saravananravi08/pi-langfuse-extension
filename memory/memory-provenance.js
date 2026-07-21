@@ -62,17 +62,21 @@ export function findPiTraceStartEntryId(entries, parentEntryId) {
   return entries.slice(parentIndex + 1).find(entry => entry?.type === "message" && entry.message?.role === "user")?.id || "";
 }
 
-export function buildPiTraceProvenance(entries, startEntryId, piSessionId) {
+export function buildPiTraceProvenance(entries, startEntryId, piSessionId, endEntryId = "", allowNonUserStart = false) {
   const errors = [];
   const startIndex = entries.findIndex(entry => entry?.id === startEntryId);
   if (!startEntryId || startIndex < 0) {
     return { provenance: undefined, errors: [startEntryId ? "start entry is not on current branch" : "start entry id is missing"] };
   }
 
-  const range = entries.slice(startIndex);
+  const requestedEndIndex = endEntryId ? entries.findIndex(entry => entry?.id === endEntryId) : entries.length - 1;
+  if (requestedEndIndex < startIndex) {
+    return { provenance: undefined, errors: [endEntryId ? "end entry is not after start entry" : "range end is missing"] };
+  }
+  const range = entries.slice(startIndex, requestedEndIndex + 1);
   const first = range[0];
   const last = range.at(-1);
-  if (first?.type !== "message" || first.message?.role !== "user") errors.push("range does not start with a user message");
+  if (!allowNonUserStart && (first?.type !== "message" || first.message?.role !== "user")) errors.push("range does not start with a user message");
 
   const messageEntries = range.filter(entry => entry?.type === "message");
   const userEntries = messageEntries.filter(entry => entry.message?.role === "user");

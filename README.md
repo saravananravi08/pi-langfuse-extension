@@ -20,11 +20,14 @@ Langfuse integration for [Pi Coding Agent](https://github.com/mariozechner/pi-co
 
 ### 🧠 Observational Memory
 
-- Creates an asynchronous `memory_trace_observation` score after each completed agent turn.
-- Consolidates active observations into append-only `memory_session_reflection` scores.
-- Keeps the latest reflection plus observations after its `coveredUntil` boundary as active memory.
+- Creates asynchronous episodic `memory_trace_observation` scores with exact user requests, question/answer pairs, corrections, durable items, and Pi provenance.
+- Consolidates active observations into append-only canonical `memory_session_reflection` scores.
+- Keeps exact recent user requests as deterministic working memory.
+- Reduces durable state by authority: user corrections > user state > verified results > assistant proposals.
+- Retrieves prompt-relevant episodes automatically instead of injecting every observation.
+- Creates safe in-turn checkpoints after 20 completed tool calls, 8k new textual tokens, or 70% context usage.
 - Exposes scoped recall through the `langfuse_memory_lookup` tool.
-- Optionally replaces covered model-visible history through `/memory-context on`.
+- Optionally replaces structurally and semantically covered model-visible history through `/memory-context on`.
 - Records exact Pi session entries and complete tool-call/result pairs as provenance.
 - Provides read-only audits, controlled backfill, redacted diagnostics, and bounded source retrieval.
 
@@ -61,10 +64,14 @@ Observations and reflections are Langfuse scores, not additions to raw trace eve
 - Covered ranges must belong to the current Pi session and active branch.
 - Observations from abandoned sibling branches remain available for lookup but are excluded from active context and reflection inputs.
 - Entry ranges must be complete, contiguous, non-overlapping, and exactly mapped.
+- Semantic coverage must preserve every user request, correction, and question before raw messages become replaceable.
+- The latest two raw user turns are retained where they fit; oversized turns keep the exact request and newest complete tail.
+- Legacy observation schemas remain lookup-only until append-only migration.
 - Tool calls and results remain complete pairs.
 - Calls emitted by errored or aborted assistant responses are accepted only when proven unexecuted.
 - Current trailing user messages and pending parallel tool results are retained safely.
 - Invalid or incomplete provenance disables replacement immediately.
+- Replacement remains disabled when transformed context still exceeds 70% of the selected model window, leaving Pi compaction as fallback.
 - Lookup output and diagnostic logs redact secret-like values.
 - Session changes and shutdown abort queued or running memory work.
 
@@ -186,11 +193,12 @@ pi "your prompt"
 ### Memory context commands
 
 ```text
-/memory-context preview  Show scores, covered/retained entries, tool pairs, and token estimates
-/memory-context on       Enable provenance-gated model-visible context replacement
-/memory-context off      Restore full Pi model context
-/memory-context status   Show current setting
-/memory-context          Toggle on/off
+/memory-context preview          Show structural/semantic coverage, retained entries, tool pairs, and token estimates
+/memory-context explain <topic>  Show winning/superseded durable state and exact provenance
+/memory-context on               Enable provenance-gated model-visible context replacement
+/memory-context off              Restore full Pi model context
+/memory-context status           Show current setting
+/memory-context                  Toggle on/off
 ```
 
 While replacement is active, Pi shows compact status such as:
@@ -255,7 +263,7 @@ PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
 PI_LANGFUSE_MEMORY_ERROR_LOG=~/.pi/agent/logs/langfuse-memory-errors.jsonl
 ```
 
-Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). Observer and reflector outputs must pass structured schema validation before storage. Reflection Markdown is rendered deterministically from canonical structured fields after retention, duplication, and contradiction checks.
+Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). `observer-v3` and `reflection-v4` outputs must pass structured schema, authority, semantic-coverage, retention, duplication, and contradiction checks. Reflection Markdown is rendered deterministically from canonical fields. Default injected memory is bounded to approximately 10k estimated textual tokens.
 
 ## 🗃️ Langfuse Data Model
 
@@ -272,13 +280,15 @@ Trace: pi-agent
 │  ├─ arguments and result
 │  └─ error state
 └─ Score: memory_trace_observation
-   ├─ structured task checkpoint
-   ├─ files, tools, decisions, issues, next steps
+   ├─ exact user requests and question/answer pairs
+   ├─ corrections, durable items, task delta, files, and tools
+   ├─ replacementEligible + semanticCoverage
    └─ exact pi-entry-v1 provenance
 
 Session score: memory_session_reflection
 ├─ generation and coveredUntil
-├─ consolidated structured memory
+├─ canonical durable state with authority/status/source IDs
+├─ active/superseded decisions and constraints
 ├─ source observation/reflection score IDs
 ├─ source trace IDs
 └─ aggregated Pi entry ranges and tool pairs
@@ -294,7 +304,7 @@ Active memory is scoped by Langfuse session ID and cwd/path key. Remote reads ar
 node scripts/observe-langfuse-session.mjs <session-id> --audit
 ```
 
-`--audit` does not write. It reports missing observations, historical pre-coverage traces, incomplete or invalid Pi provenance, duplicate scores, overlapping entries, deterministic-ID mismatches, and prompt versions.
+`--audit` does not write. It reports missing observations, historical pre-coverage traces, incomplete or invalid Pi provenance, semantic-coverage failures, active decision conflicts, duplicate scores, overlapping entries, deterministic-ID mismatches, and prompt versions.
 
 ### Controlled observation backfill
 
@@ -310,8 +320,11 @@ Additional controls:
 
 ```bash
 node scripts/observe-langfuse-session.mjs <session-id> --dry-run --limit 1
+node scripts/observe-langfuse-session.mjs <session-id> --trace <trace-id> --audit --backfill
 node scripts/observe-langfuse-session.mjs <session-id> --force
 ```
+
+Version-2 migration is append-only. Use `--trace` for a targeted repair or `--include-pre-coverage` for an explicitly reviewed historical migration.
 
 ### Reflection inspection or generation
 
@@ -343,7 +356,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 
 ## ⚠️ Operational Limits
 
-- Older sessions without exact `pi-entry-v1` provenance may remain lookup-only and block context replacement.
+- Version-1 observations and sessions without complete structural and semantic provenance remain lookup-only until append-only version-2 migration.
 - Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
 - Request throttling is coordinated within one Pi process; multiple concurrent Pi processes do not yet share a global rate limiter.
 - Pi auto-compaction behavior is unchanged.
@@ -361,7 +374,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 
 - Set `observer.enabled=true`.
 - Configure `observer.model` and `observer.apiKey`.
-- Wait for the agent turn to finish; observation runs asynchronously after `agent_end`.
+- Final observation runs asynchronously after `agent_end`; long turns can also emit non-overlapping in-turn checkpoints.
 - Transient `408`, `429`, and `5xx` responses retry up to eight times with bounded exponential or provider-directed backoff.
 - If all retries fail, run the read-only audit, then controlled `--backfill` after the provider recovers.
 - Inspect the private diagnostic log.
