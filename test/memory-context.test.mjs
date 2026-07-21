@@ -88,6 +88,39 @@ test('excludes abandoned sibling-branch memory but keeps partial mappings fail-c
   assert.deepEqual(filtered.map(score => score.id), ['current', 'partial', 'reflection-current']);
 });
 
+test('uses complete legacy provenance for compatibility without overlapping v2 ranges', () => {
+  const legacy = {
+    id: 'legacy-reflection',
+    metadata: {
+      piProvenanceComplete: true,
+      sourcePiRanges: [{ observationScoreId: 'legacy-observation', ...provenance }],
+      sourcePiSessionIds: ['pi-session'],
+      sourcePiToolPairs: provenance.toolPairs,
+    },
+  };
+  const legacyOnly = buildMemoryContextCoverage(undefined, [], 'pi-session', legacy);
+  assert.equal(legacyOnly.safe, true);
+  assert.deepEqual(legacyOnly.compatibilityScoreIds, ['legacy-reflection']);
+  assert.deepEqual(legacyOnly.entryIds, provenance.entryIds);
+
+  const legacyTail = observation('legacy-tail', {
+    ...provenance,
+    firstEntryId: 'u3',
+    lastEntryId: 'a3',
+    entryIds: ['u3', 'a3'],
+    messageEntryIds: ['u3', 'a3'],
+    toolPairs: [],
+  });
+  const withTail = buildMemoryContextCoverage(undefined, [], 'pi-session', legacy, [legacyTail]);
+  assert.equal(withTail.safe, true);
+  assert.deepEqual(withTail.compatibilityScoreIds, ['legacy-reflection', 'legacy-tail']);
+
+  const v2Preferred = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session', legacy);
+  assert.equal(v2Preferred.safe, true);
+  assert.deepEqual(v2Preferred.compatibilityScoreIds, []);
+  assert.equal(v2Preferred.overlappingEntryIds.length, 0);
+});
+
 test('drops only exactly covered entries and preserves current turn and complete tool pairs', () => {
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, 123);

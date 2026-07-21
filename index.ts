@@ -1370,16 +1370,19 @@ async function getContextScores(sessionId: string, pathKey: string, branch: Arra
   );
   const v2Reflection = latestReflection(compatibleReflections.filter(score => metadataString(score, "version") === MEMORY_SCORE_VERSION));
   const legacyReflection = latestReflection(compatibleReflections.filter(score => metadataString(score, "version") === LEGACY_MEMORY_SCORE_VERSION));
-  const coveredScoreIds = new Set(
-    (Array.isArray(v2Reflection?.metadata?.sourcePiRanges) ? v2Reflection.metadata.sourcePiRanges : [])
+  const coveredScoreIds = new Set([v2Reflection, legacyReflection].flatMap(reflection =>
+    (Array.isArray(reflection?.metadata?.sourcePiRanges) ? reflection.metadata.sourcePiRanges : [])
       .map((range: any) => String(range?.observationScoreId || ""))
-      .filter(Boolean),
+      .filter(Boolean)),
   );
   const traceRefs = await fetchTraceScoreRefsForSession(sessionId, signal);
-  const newObservationScoreIds = traceRefs.map(trace => {
-    const scoreId = deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${trace.id}:final:0`);
+  const newObservationScoreIds = traceRefs.flatMap(trace => [MEMORY_SCORE_VERSION, LEGACY_MEMORY_SCORE_VERSION].map(version => {
+    const seed = version === LEGACY_MEMORY_SCORE_VERSION
+      ? `${MEMORY_SCORE_NAME}:${version}:${trace.id}`
+      : `${MEMORY_SCORE_NAME}:${version}:${trace.id}:final:0`;
+    const scoreId = deterministicUuid(seed);
     return trace.scores.includes(scoreId) && !coveredScoreIds.has(scoreId) ? scoreId : "";
-  }).filter(Boolean);
+  })).filter(Boolean);
   const observations = newObservationScoreIds.length
     ? await fetchScoresByIds(newObservationScoreIds, MEMORY_SCORE_NAME, signal)
     : [];
@@ -1423,7 +1426,7 @@ function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathK
       coveredUntil: metadataString(legacyMemory.latestReflection, "coveredUntil") || null,
       fields: reflectionFields(legacyMemory.latestReflection),
     } : undefined,
-    observations: episodicMemory.newObservations.map(score => ({
+    observations: [...episodicMemory.newObservations, ...legacyMemory.newObservations].map(score => ({
       scoreId: score.id,
       traceId: score.traceId || metadataString(score, "traceId") || null,
       generatedAt: generatedAt(score),
@@ -1432,7 +1435,7 @@ function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathK
   };
   return {
     payload,
-    coverage: buildMemoryContextCoverage(memory.latestReflection, memory.newObservations, piSessionId),
+    coverage: buildMemoryContextCoverage(memory.latestReflection, memory.newObservations, piSessionId, legacyMemory.latestReflection, legacyMemory.newObservations),
   };
 }
 

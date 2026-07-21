@@ -66,7 +66,7 @@ Observations and reflections are Langfuse scores, not additions to raw trace eve
 - Entry ranges must be complete, contiguous, non-overlapping, and exactly mapped.
 - Semantic coverage must preserve every user request, correction, and question before raw messages become replaceable.
 - The latest two raw user turns are retained where they fit; oversized turns keep the exact request and newest complete tail.
-- Legacy observation schemas never authorize raw-history removal, but their latest branch-compatible reflection remains available as lower-priority project context. New v2 state and current user input override conflicts.
+- A latest branch-compatible v1 reflection and deterministic v1 observations after it may replace only exact, complete Pi-provenance ranges. V2 ranges win on overlap; v1 semantic details remain lower-priority context, and recent exact turns are retained.
 - Tool calls and results remain complete pairs.
 - Calls emitted by errored or aborted assistant responses are accepted only when proven unexecuted.
 - Current trailing user messages and pending parallel tool results are retained safely.
@@ -356,7 +356,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 
 ## ⚠️ Operational Limits
 
-- Version-1 observations and sessions without complete structural and semantic provenance remain lookup-only until append-only version-2 migration.
+- Version-1 reflections or tail observations without complete Pi provenance remain lookup-only. Complete branch-compatible v1 ranges support migration-free structural compatibility; v2 remains semantic authority.
 - Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
 - Request throttling is coordinated within one Pi process; multiple concurrent Pi processes do not yet share a global rate limiter.
 - Pi auto-compaction behavior is unchanged.

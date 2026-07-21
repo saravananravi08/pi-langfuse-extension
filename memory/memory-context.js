@@ -60,7 +60,7 @@ export function filterMemoryScoresForBranch(scores, branchEntries) {
   });
 }
 
-export function buildMemoryContextCoverage(reflection, observations, expectedPiSessionId = "") {
+export function buildMemoryContextCoverage(reflection, observations, expectedPiSessionId = "", legacyReflection, legacyObservations = []) {
   const reasons = [];
   const scoreIds = [];
   const ranges = [];
@@ -70,6 +70,7 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
   const semanticCoverageFailures = [];
   const replacementEligibleScoreIds = [];
   const lookupOnlyScoreIds = [];
+  const compatibilityScoreIds = [];
 
   if (reflection) {
     const value = metadata(reflection);
@@ -125,6 +126,43 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
     if (provenance.piSessionId) piSessionIds.push(provenance.piSessionId);
   }
 
+  const compatibilityEntryIds = new Set(ranges.flatMap(range => Array.isArray(range?.entryIds) ? range.entryIds : []));
+  const legacy = metadata(legacyReflection);
+  if (legacyReflection && legacy.piProvenanceComplete === true && Array.isArray(legacy.sourcePiRanges)) {
+    const compatibleRanges = legacy.sourcePiRanges.filter(range => {
+      const entryIds = Array.isArray(range?.entryIds) ? range.entryIds.filter(Boolean) : [];
+      return entryIds.length && !entryIds.some(entryId => compatibilityEntryIds.has(entryId));
+    });
+    if (compatibleRanges.length) {
+      scoreIds.push(legacyReflection.id);
+      compatibilityScoreIds.push(legacyReflection.id);
+      ranges.push(...compatibleRanges);
+      for (const range of compatibleRanges) for (const entryId of range.entryIds || []) compatibilityEntryIds.add(entryId);
+      if (Array.isArray(legacy.sourcePiToolPairs)) toolPairs.push(...legacy.sourcePiToolPairs);
+      if (Array.isArray(legacy.sourcePiUnexecutedToolCallIds)) unexecutedToolCallIds.push(...legacy.sourcePiUnexecutedToolCallIds);
+      if (Array.isArray(legacy.sourcePiSessionIds)) piSessionIds.push(...legacy.sourcePiSessionIds);
+    }
+  }
+  for (const observation of legacyObservations) {
+    const value = metadata(observation);
+    const provenance = value.piProvenance;
+    const entryIds = Array.isArray(provenance?.entryIds) ? provenance.entryIds.filter(Boolean) : [];
+    if (!provenance?.complete || !entryIds.length || entryIds.some(entryId => compatibilityEntryIds.has(entryId))) continue;
+    scoreIds.push(observation.id);
+    compatibilityScoreIds.push(observation.id);
+    ranges.push({
+      observationScoreId: observation.id,
+      traceId: observation.traceId || value.traceId || null,
+      firstEntryId: provenance.firstEntryId,
+      lastEntryId: provenance.lastEntryId,
+      entryIds,
+    });
+    for (const entryId of entryIds) compatibilityEntryIds.add(entryId);
+    if (Array.isArray(provenance.toolPairs)) toolPairs.push(...provenance.toolPairs);
+    if (Array.isArray(provenance.unexecutedToolCallIds)) unexecutedToolCallIds.push(...provenance.unexecutedToolCallIds);
+    if (provenance.piSessionId) piSessionIds.push(provenance.piSessionId);
+  }
+
   if (!scoreIds.length) reasons.push("no active memory scores");
   const seenEntries = new Map();
   const overlappingEntryIds = [];
@@ -161,6 +199,7 @@ export function buildMemoryContextCoverage(reflection, observations, expectedPiS
     semanticCoverageFailures: unique(semanticCoverageFailures),
     replacementEligibleScoreIds: unique(replacementEligibleScoreIds),
     lookupOnlyScoreIds: unique(lookupOnlyScoreIds),
+    compatibilityScoreIds: unique(compatibilityScoreIds),
     coveredThroughEntryId: ranges.at(-1)?.lastEntryId || null,
   };
 }
@@ -350,6 +389,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     semanticCoverageFailures: coverage?.semanticCoverageFailures || [],
     replacementEligibleScoreIds: coverage?.replacementEligibleScoreIds || [],
     lookupOnlyScoreIds: coverage?.lookupOnlyScoreIds || [],
+    compatibilityScoreIds: coverage?.compatibilityScoreIds || [],
     coveredThroughEntryId: coverage?.coveredThroughEntryId || null,
     droppedEntryIds,
     retainedEntryIds,
@@ -415,6 +455,7 @@ export function formatMemoryContextPreview(plan, maxIds = 20) {
     semanticCoverageFailures: plan.semanticCoverageFailures || [],
     replacementEligibleScoreIds: plan.replacementEligibleScoreIds || [],
     lookupOnlyScoreIds: plan.lookupOnlyScoreIds || [],
+    compatibilityScoreIds: plan.compatibilityScoreIds || [],
     tokens: {
       original: plan.originalTokensEstimated,
       memory: plan.memoryTokensEstimated,

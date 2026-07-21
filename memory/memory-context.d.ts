@@ -23,6 +23,7 @@ export interface MemoryContextCoverage {
   semanticCoverageFailures: string[];
   replacementEligibleScoreIds: string[];
   lookupOnlyScoreIds: string[];
+  compatibilityScoreIds: string[];
   coveredThroughEntryId: string | null;
 }
 
@@ -38,6 +39,7 @@ export interface MemoryContextPlan {
   semanticCoverageFailures: string[];
   replacementEligibleScoreIds: string[];
   lookupOnlyScoreIds: string[];
+  compatibilityScoreIds: string[];
   unmappedMessageIndexes: number[];
   retainedUnmappedTailIndexes: number[];
   toolPairs: Array<Record<string, unknown>>;
@@ -60,6 +62,8 @@ export function buildMemoryContextCoverage(
   reflection: MemoryContextScore | undefined,
   observations: MemoryContextScore[],
   expectedPiSessionId?: string,
+  legacyReflection?: MemoryContextScore,
+  legacyObservations?: MemoryContextScore[],
 ): MemoryContextCoverage;
 export function planMemoryContextReplacement(
   messages: unknown[],
