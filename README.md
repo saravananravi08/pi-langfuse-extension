@@ -199,7 +199,7 @@ While replacement is active, Pi shows compact status such as:
 Memory 24.9%/272k · est 7.1k · $1.235
 ```
 
-The percentage is actual provider input usage against the selected model's context window. `est` is the estimated textual replacement-message size. Cost is cumulative main-model cost reported by the provider; it is omitted when the provider supplies no pricing. Binary image data is excluded and reported separately, for example `est 7.1k + 2 images`, because image token accounting varies by provider and model.
+The percentage is actual provider input usage against the selected model's context window. `est` is the estimated textual replacement-message size. Cost is cumulative main-model cost reported by the provider; OAuth subscription models show `$0.000 (sub)`, matching Pi, and cost is omitted when neither pricing nor subscription status is available. Binary image data is excluded and reported separately, for example `est 7.1k + 2 images`, because image token accounting varies by provider and model.
 
 ### Scoped memory lookup
 

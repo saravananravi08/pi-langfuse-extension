@@ -65,4 +65,5 @@ export function formatMemoryContextStatus(status: {
   replacementTokensEstimated?: number;
   replacementImageCount?: number;
   modelCost?: number;
+  modelCostSubscription?: boolean;
 }): string;

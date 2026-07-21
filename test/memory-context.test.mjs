@@ -188,6 +188,10 @@ test('formats actual provider usage separately from replacement-message estimate
     formatMemoryContextStatus({ actualInputTokens: 67_728, contextWindow: 272_000, replacementTokensEstimated: 7_128, modelCost: 1.23456 }),
     'Memory 24.9%/272k · est 7.1k · $1.235',
   );
+  assert.equal(
+    formatMemoryContextStatus({ actualInputTokens: 67_728, contextWindow: 272_000, replacementTokensEstimated: 7_128, modelCost: 0, modelCostSubscription: true }),
+    'Memory 24.9%/272k · est 7.1k · $0.000 (sub)',
+  );
 });
 
 test('preview exposes score, entry, tool-pair, and token decisions', () => {

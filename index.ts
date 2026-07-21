@@ -260,6 +260,7 @@ let memoryContextDisplay: {
   replacementTokensEstimated?: number;
   replacementImageCount?: number;
   modelCost?: number;
+  modelCostSubscription?: boolean;
 } = {};
 let modelCostTotal = 0;
 let lastMemoryContextErrorAt = 0;
@@ -1453,7 +1454,11 @@ export default async function (pi: ExtensionAPI) {
       return total + (Number.isFinite(cost) ? Number(cost) : 0);
     }, 0);
     memoryContextEnabled = false;
-    memoryContextDisplay = { contextWindow: ctx.model?.contextWindow, modelCost: modelCostTotal };
+    memoryContextDisplay = {
+      contextWindow: ctx.model?.contextWindow,
+      modelCost: modelCostTotal,
+      modelCostSubscription: ctx.model ? ctx.modelRegistry.isUsingOAuth(ctx.model) : false,
+    };
     lastMemoryContextErrorAt = 0;
     for (const entry of ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: { enabled?: boolean } }>) {
       if (entry.type === "custom" && entry.customType === "langfuse-memory-context-state") {
@@ -1514,6 +1519,7 @@ export default async function (pi: ExtensionAPI) {
         ...memoryContextDisplay,
         actualInputTokens: undefined,
         contextWindow: event.model?.contextWindow,
+        modelCostSubscription: event.model ? ctx.modelRegistry.isUsingOAuth(event.model) : false,
       };
       updateMemoryContextWidget(ctx.ui);
     }

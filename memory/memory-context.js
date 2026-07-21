@@ -300,7 +300,9 @@ export function formatMemoryContextStatus(status) {
     ? formatTokens(status.replacementTokensEstimated)
     : "?";
   const images = status.replacementImageCount > 0 ? ` + ${status.replacementImageCount} image${status.replacementImageCount === 1 ? "" : "s"}` : "";
-  const cost = Number.isFinite(status.modelCost) && status.modelCost > 0 ? ` · $${status.modelCost.toFixed(3)}` : "";
+  const cost = Number.isFinite(status.modelCost) && (status.modelCost > 0 || status.modelCostSubscription)
+    ? ` · $${status.modelCost.toFixed(3)}${status.modelCostSubscription ? " (sub)" : ""}`
+    : "";
   if (!Number.isFinite(status.actualInputTokens)) return `Memory ON · awaiting usage · est ${replacement}${images}${cost}`;
   const percent = status.contextWindow > 0 ? ((status.actualInputTokens / status.contextWindow) * 100).toFixed(1) : "?";
   return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}${images}${cost}`;
