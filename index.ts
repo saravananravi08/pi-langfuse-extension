@@ -42,6 +42,7 @@ import {
   buildActiveMemory,
   estimateTokens,
   generatedAt,
+  latestReflection,
   metadataString,
   metadataStrings,
   observationFields,
@@ -259,6 +260,7 @@ let memoryCheckpointLastEntryId = "";
 const memoryQueues = new Map<string, Promise<void>>();
 const sessionMemoryCache = createMemoryCache(300_000);
 let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
+const contextScoresCache = new Map<string, { scores: MemoryScore[]; loadedAt: number }>();
 const lookupTraceCache = new Map<string, { value: Record<string, unknown>; loadedAt: number }>();
 let memoryContextEnabled = false;
 let memoryContextDisplay: {
@@ -987,15 +989,21 @@ async function langfuseGet(path: string, signal?: AbortSignal): Promise<Record<s
   return raw ? JSON.parse(raw) : {};
 }
 
-async function fetchScoreIdsForSession(sessionId: string, signal?: AbortSignal): Promise<string[]> {
-  const ids: string[] = [];
+async function fetchTraceScoreRefsForSession(sessionId: string, signal?: AbortSignal): Promise<Array<{ id: string; scores: string[] }>> {
+  const traces: Array<{ id: string; scores: string[] }> = [];
   for (let page = 1; ; page++) {
     const params = new URLSearchParams({ sessionId, page: String(page), limit: "100", fields: "core,scores" });
-    const response = await langfuseGet(`/api/public/traces?${params}`, signal) as { data?: Array<{ scores?: string[] }>; meta?: { totalPages?: number } };
-    for (const trace of response.data || []) ids.push(...(trace.scores || []));
+    const response = await langfuseGet(`/api/public/traces?${params}`, signal) as { data?: Array<{ id?: string; scores?: string[] }>; meta?: { totalPages?: number } };
+    for (const trace of response.data || []) {
+      if (trace.id) traces.push({ id: trace.id, scores: trace.scores || [] });
+    }
     if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
   }
-  return unique(ids);
+  return traces;
+}
+
+async function fetchScoreIdsForSession(sessionId: string, signal?: AbortSignal): Promise<string[]> {
+  return unique((await fetchTraceScoreRefsForSession(sessionId, signal)).flatMap(trace => trace.scores));
 }
 
 async function fetchScoresByIds(ids: string[], name: string, signal?: AbortSignal): Promise<MemoryScore[]> {
@@ -1298,6 +1306,7 @@ async function writeMemoryScore(score: Record<string, unknown>, signal?: AbortSi
     signal,
   });
   lookupScoresCache = undefined;
+  contextScoresCache.clear();
 }
 
 async function writeTraceMemoryObservation(snapshot: TraceSnapshot, signal?: AbortSignal): Promise<void> {
@@ -1338,6 +1347,45 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
   ]);
   const scores = [...observations, ...reflections].filter(score => [MEMORY_SCORE_VERSION, LEGACY_MEMORY_SCORE_VERSION].includes(metadataString(score, "version")));
   lookupScoresCache = { scores, loadedAt: Date.now() };
+  return scores;
+}
+
+async function getContextScores(sessionId: string, pathKey: string, branch: Array<Record<string, unknown>>, refresh: boolean, signal?: AbortSignal): Promise<MemoryScore[]> {
+  const cacheKey = `${sessionId}:${pathKey}:${String(branch.at(-1)?.id || "")}`;
+  const cached = contextScoresCache.get(cacheKey);
+  if (!refresh && cached && Date.now() - cached.loadedAt < 300_000) return cached.scores;
+
+  const params = new URLSearchParams({
+    name: REFLECTION_SCORE_NAME,
+    dataType: "CATEGORICAL",
+    sessionId,
+    page: "1",
+    limit: "10",
+    orderBy: "createdAt.desc",
+  });
+  const response = await langfuseGet(`/api/public/v2/scores?${params}`, signal) as { data?: MemoryScore[] };
+  const compatibleReflections = filterMemoryScoresForBranch(
+    (response.data || []).filter(score => sameMemoryScope(score, sessionId, pathKey, metadataString(score, "version"))),
+    branch,
+  );
+  const v2Reflection = latestReflection(compatibleReflections.filter(score => metadataString(score, "version") === MEMORY_SCORE_VERSION));
+  const legacyReflection = latestReflection(compatibleReflections.filter(score => metadataString(score, "version") === LEGACY_MEMORY_SCORE_VERSION));
+  const coveredScoreIds = new Set(
+    (Array.isArray(v2Reflection?.metadata?.sourcePiRanges) ? v2Reflection.metadata.sourcePiRanges : [])
+      .map((range: any) => String(range?.observationScoreId || ""))
+      .filter(Boolean),
+  );
+  const traceRefs = await fetchTraceScoreRefsForSession(sessionId, signal);
+  const newObservationScoreIds = traceRefs.map(trace => {
+    const scoreId = deterministicUuid(`${MEMORY_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${trace.id}:final:0`);
+    return trace.scores.includes(scoreId) && !coveredScoreIds.has(scoreId) ? scoreId : "";
+  }).filter(Boolean);
+  const observations = newObservationScoreIds.length
+    ? await fetchScoresByIds(newObservationScoreIds, MEMORY_SCORE_NAME, signal)
+    : [];
+  const scores = [v2Reflection, legacyReflection, ...observations]
+    .filter((score): score is MemoryScore => Boolean(score));
+  contextScoresCache.set(cacheKey, { scores, loadedAt: Date.now() });
   return scores;
 }
 
@@ -1529,8 +1577,9 @@ export default async function (pi: ExtensionAPI) {
       }
 
       try {
-        const scores = await getLookupScores(true, ctx.signal);
+        ctx.ui.notify("Loading latest branch memory…", "info");
         const branch = ctx.sessionManager.getBranch() as unknown as SessionEntry[];
+        const scores = await getContextScores(currentSessionId, ctx.cwd, branch as unknown as Array<Record<string, unknown>>, action === "preview", ctx.signal);
         const messages = buildSessionContext(branch, ctx.sessionManager.getLeafId()).messages;
         const prompt = [...messages].reverse().find(message => message?.role === "user");
         const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch as unknown as Array<Record<string, unknown>>, piMessageText(prompt as unknown as Record<string, unknown>));
@@ -1714,8 +1763,8 @@ export default async function (pi: ExtensionAPI) {
     }
     if (!memoryContextEnabled) return;
     try {
-      const scores = await getLookupScores(false, ctx.signal);
       const branch = ctx.sessionManager.getBranch() as unknown as Array<Record<string, unknown>>;
+      const scores = await getContextScores(currentSessionId, ctx.cwd, branch, false, ctx.signal);
       const prompt = [...event.messages].reverse().find(message => message?.role === "user");
       const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch, piMessageText(prompt as unknown as Record<string, unknown>));
       const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
