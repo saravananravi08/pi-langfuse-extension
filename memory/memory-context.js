@@ -300,9 +300,10 @@ export function formatMemoryContextStatus(status) {
     ? formatTokens(status.replacementTokensEstimated)
     : "?";
   const images = status.replacementImageCount > 0 ? ` + ${status.replacementImageCount} image${status.replacementImageCount === 1 ? "" : "s"}` : "";
-  if (!Number.isFinite(status.actualInputTokens)) return `Memory ON · awaiting usage · est ${replacement}${images}`;
+  const cost = Number.isFinite(status.modelCost) && status.modelCost > 0 ? ` · $${status.modelCost.toFixed(3)}` : "";
+  if (!Number.isFinite(status.actualInputTokens)) return `Memory ON · awaiting usage · est ${replacement}${images}${cost}`;
   const percent = status.contextWindow > 0 ? ((status.actualInputTokens / status.contextWindow) * 100).toFixed(1) : "?";
-  return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}${images}`;
+  return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}${images}${cost}`;
 }
 
 export function formatMemoryContextPreview(plan, maxIds = 20) {

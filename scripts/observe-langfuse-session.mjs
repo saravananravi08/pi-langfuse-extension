@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
 import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory/memory-prompts.js';
 import { validateMemoryOutput } from '../memory/memory-validation.js';
 import { auditObservationCoverage, auditPiProvenance } from '../memory/memory-audit.js';
+import { buildPiTraceProvenance } from '../memory/memory-provenance.js';
+import { findPiSessionFile } from '../memory/memory-pi-entries.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
@@ -15,7 +17,8 @@ let OBSERVER_ENABLED = true;
 let OBSERVER_MODEL = '';
 let OBSERVER_BASE_URL = '';
 let OBSERVER_API_KEY = '';
-const LANGFUSE_CONFIG = process.env.LANGFUSE_CONFIG || join(homedir(), '.pi', 'agent', 'extensions', 'langfuse', 'config.json');
+const AGENT_ROOT = process.env.PI_CODING_AGENT_DIR || resolve(homedir(), '.pi', 'agent');
+const LANGFUSE_CONFIG = process.env.LANGFUSE_CONFIG || join(AGENT_ROOT, 'extensions', 'langfuse', 'config.json');
 
 const args = parseArgs(process.argv.slice(2));
 const sessionId = normalizeSessionId(args.session || args._[0] || DEFAULT_SESSION_ID);
@@ -84,7 +87,9 @@ for (const trace of traces.slice(0, limit)) {
     const sourceObservations = observations.filter(o => !String(o.name || '').startsWith('memory:'));
     const timeline = buildTimeline(fullTrace, sourceObservations);
     const memory = await observeTrace(fullTrace, sourceObservations, timeline);
-    const metadata = buildScoreMetadata(fullTrace, sourceObservations, memory, timeline);
+    const piProvenance = backfill ? mapTracePiProvenance(fullTrace) : undefined;
+    if (backfill && !piProvenance?.complete) throw new Error('cannot deterministically map trace to complete Pi provenance');
+    const metadata = buildScoreMetadata(fullTrace, sourceObservations, memory, timeline, piProvenance);
     const comment = firstLine(memory.summary || stripXml(memory.observationsMarkdown) || 'Trace observed');
     const scoreId = deterministicUuid(`${SCORE_NAME}:${VERSION}:${trace.id}`);
 
@@ -334,7 +339,7 @@ function extractJson(text) {
   return text.slice(start, end + 1);
 }
 
-async function fetchTextWithRetry(url, options, label, attempts = 5) {
+async function fetchTextWithRetry(url, options, label, attempts = 8) {
   let lastText = '';
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -344,7 +349,7 @@ async function fetchTextWithRetry(url, options, label, attempts = 5) {
     } catch (error) {
       lastError = error;
       if (attempt < attempts) {
-        await sleep(Math.min(attempt * 2, 10) * 1000);
+        await sleep(Math.min(2 ** (attempt - 1), 60) * 1000);
         continue;
       }
       break;
@@ -353,8 +358,8 @@ async function fetchTextWithRetry(url, options, label, attempts = 5) {
     lastText = text;
     if (res.ok) return text;
     if ((res.status === 408 || res.status === 429 || res.status >= 500) && attempt < attempts) {
-      const retryAfter = Number(res.headers.get('retry-after')) || parseRetryAfter(text) || attempt * 2;
-      await sleep(retryAfter * 1000);
+      const retryAfter = Number(res.headers.get('retry-after')) || parseRetryAfter(text) || Math.min(2 ** (attempt - 1), 60);
+      await sleep(Math.min(retryAfter, 120) * 1000);
       continue;
     }
     throw new Error(`${label} ${res.status}: ${text.slice(0, 1000)}`);
@@ -370,7 +375,61 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function buildScoreMetadata(trace, observations, memory, timeline) {
+let piSessionData;
+
+function mapTracePiProvenance(trace) {
+  if (!piSessionData) piSessionData = loadPiSessionData();
+  if (!piSessionData) return undefined;
+  const traceInput = textValue(trace.input);
+  const traceOutput = textValue(trace.output);
+  const traceTime = Date.parse(trace.timestamp || '');
+  const ranges = new Map();
+
+  for (const branch of piSessionData.branches) {
+    for (let i = 0; i < branch.length; i++) {
+      const entry = branch[i];
+      if (entry.type !== 'message' || entry.message?.role !== 'user' || textValue(entry.message.content) !== traceInput) continue;
+      const entryTime = Date.parse(entry.timestamp || '');
+      if (Number.isFinite(traceTime) && Number.isFinite(entryTime) && Math.abs(traceTime - entryTime) > 10_000) continue;
+      let end = i + 1;
+      while (end < branch.length && !(branch[end].type === 'message' && branch[end].message?.role === 'user')) end++;
+      const range = branch.slice(i, end);
+      const finalAssistant = range.filter(item => item.type === 'message' && item.message?.role === 'assistant').at(-1);
+      if (traceOutput && textValue(finalAssistant?.message?.content) !== traceOutput) continue;
+      ranges.set(range.map(item => item.id).join(':'), range);
+    }
+  }
+
+  if (ranges.size !== 1) return undefined;
+  const range = [...ranges.values()][0];
+  const result = buildPiTraceProvenance(range, range[0]?.id, piSessionData.piSessionId);
+  return result.errors.length === 0 ? result.provenance : undefined;
+}
+
+function loadPiSessionData() {
+  const sessionFile = findPiSessionFile(join(AGENT_ROOT, 'sessions'), sessionId);
+  if (!sessionFile) return undefined;
+  const lines = readFileSync(sessionFile, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const header = lines.find(entry => entry.type === 'session');
+  const entries = lines.filter(entry => entry.type !== 'session' && entry.id);
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const parentIds = new Set(entries.map(entry => entry.parentId).filter(Boolean));
+  const leaves = entries.filter(entry => !parentIds.has(entry.id));
+  const branches = leaves.map(leaf => {
+    const branch = [];
+    for (let entry = leaf; entry; entry = entry.parentId ? byId.get(entry.parentId) : undefined) branch.unshift(entry);
+    return branch;
+  });
+  return { piSessionId: header?.id || null, branches };
+}
+
+function textValue(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) return value.filter(part => part?.type === 'text' && part.text).map(part => part.text).join('\n').trim();
+  return '';
+}
+
+function buildScoreMetadata(trace, observations, memory, timeline, piProvenance) {
   const derivedFiles = deriveFileOperations(observations);
   const filesRead = unique([...derivedFiles.filesRead, ...memory.filesRead]);
   const filesModified = unique([...derivedFiles.filesModified, ...memory.filesModified]);
@@ -410,6 +469,7 @@ function buildScoreMetadata(trace, observations, memory, timeline) {
     sourceObservationCount: observations.length,
     timelinePreview: clamp(timeline, 6000),
     generatedAt: new Date().toISOString(),
+    piProvenance,
   });
 }
 

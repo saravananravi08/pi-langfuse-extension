@@ -259,7 +259,9 @@ let memoryContextDisplay: {
   contextWindow?: number;
   replacementTokensEstimated?: number;
   replacementImageCount?: number;
+  modelCost?: number;
 } = {};
+let modelCostTotal = 0;
 let lastMemoryContextErrorAt = 0;
 const PI_SESSIONS_ROOT = join(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "sessions");
 const MEMORY_CONTEXT_STATUS = "langfuse-memory-context-usage";
@@ -336,6 +338,7 @@ const REFLECTION_ENABLED = process.env.PI_LANGFUSE_REFLECTION_ENABLED
 const REFLECTION_THRESHOLD_TOKENS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_THRESHOLD_TOKENS || reflectionConfig?.thresholdTokens, 20_000);
 const REFLECTION_MIN_NEW_TOKENS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS || reflectionConfig?.minNewObservationTokens, 8_000);
 const REFLECTION_MIN_NEW_OBSERVATIONS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS || reflectionConfig?.minNewObservations, 5);
+const OBSERVER_REQUEST_MAX_ATTEMPTS = 8;
 
 interface MemoryScore {
   id: string;
@@ -415,12 +418,12 @@ function detectDegenerateRepetition(text: string): boolean {
 
 function retryAfterMs(response: Response, raw: string, attempt: number): number {
   const seconds = Number(response.headers.get("retry-after"));
-  if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 30) * 1000;
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds, 120) * 1000;
   try {
     const providerSeconds = Number(JSON.parse(raw)?.details?.retryAfterSeconds);
-    if (Number.isFinite(providerSeconds) && providerSeconds > 0) return Math.min(providerSeconds, 30) * 1000;
+    if (Number.isFinite(providerSeconds) && providerSeconds > 0) return Math.min(providerSeconds, 120) * 1000;
   } catch {}
-  return attempt * 1000;
+  return Math.min(2 ** (attempt - 1), 60) * 1000;
 }
 
 function deriveFileOperations(steps: TraceStep[]) {
@@ -548,7 +551,7 @@ async function observerComplete(
     ...diagnostics,
   };
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= OBSERVER_REQUEST_MAX_ATTEMPTS; attempt++) {
     signal?.throwIfAborted();
     let response: Response;
     try {
@@ -565,12 +568,12 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "connection",
         attempt,
-        maxAttempts: 3,
+        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
         ...requestErrorDetails(error),
       });
-      if (attempt === 3) break;
-      console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/3); details: ${MEMORY_ERROR_LOG_PATH}`);
-      await sleep(attempt * 1000, signal);
+      if (attempt === OBSERVER_REQUEST_MAX_ATTEMPTS) break;
+      console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/${OBSERVER_REQUEST_MAX_ATTEMPTS}); details: ${MEMORY_ERROR_LOG_PATH}`);
+      await sleep(Math.min(2 ** (attempt - 1), 60) * 1000, signal);
       continue;
     }
 
@@ -582,14 +585,14 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "http",
         attempt,
-        maxAttempts: 3,
+        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
         status: response.status,
         retryable,
         retryDelayMs,
         responseChars: raw.length,
       });
-      if (retryable && attempt < 3) {
-        console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/3); details: ${MEMORY_ERROR_LOG_PATH}`);
+      if (retryable && attempt < OBSERVER_REQUEST_MAX_ATTEMPTS) {
+        console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/${OBSERVER_REQUEST_MAX_ATTEMPTS}); details: ${MEMORY_ERROR_LOG_PATH}`);
         await sleep(retryDelayMs, signal);
         continue;
       }
@@ -604,7 +607,7 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "invalid-response-json",
         attempt,
-        maxAttempts: 3,
+        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
         responseChars: raw.length,
         ...requestErrorDetails(error),
       });
@@ -621,7 +624,7 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "empty-response",
         attempt,
-        maxAttempts: 3,
+        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
         responseChars: raw.length,
       });
       throw new Error(`${label} model returned no text`);
@@ -629,7 +632,7 @@ async function observerComplete(
     return text.trim();
   }
 
-  throw new Error(`${label} model connection failed after 3 attempts`, { cause: lastError });
+  throw new Error(`${label} model connection failed after ${OBSERVER_REQUEST_MAX_ATTEMPTS} attempts`, { cause: lastError });
 }
 
 function buildTraceTimeline(snapshot: TraceSnapshot) {
@@ -1445,8 +1448,12 @@ export default async function (pi: ExtensionAPI) {
     }
     // Reset state for new session
     resetSessionState();
+    modelCostTotal = (ctx.sessionManager.getEntries() as Array<{ type?: string; message?: { role?: string; usage?: { cost?: { total?: number } } } }>).reduce((total, entry) => {
+      const cost = entry.type === "message" && entry.message?.role === "assistant" ? entry.message.usage?.cost?.total : 0;
+      return total + (Number.isFinite(cost) ? Number(cost) : 0);
+    }, 0);
     memoryContextEnabled = false;
-    memoryContextDisplay = { contextWindow: ctx.model?.contextWindow };
+    memoryContextDisplay = { contextWindow: ctx.model?.contextWindow, modelCost: modelCostTotal };
     lastMemoryContextErrorAt = 0;
     for (const entry of ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: { enabled?: boolean } }>) {
       if (entry.type === "custom" && entry.customType === "langfuse-memory-context-state") {
@@ -1771,6 +1778,11 @@ export default async function (pi: ExtensionAPI) {
     const modelId = message.model || currentModel;
     const provider = currentProvider;
     const cost = usage?.cost;
+    if (Number.isFinite(cost?.total)) modelCostTotal += Number(cost?.total);
+    if (memoryContextEnabled) {
+      memoryContextDisplay = { ...memoryContextDisplay, modelCost: modelCostTotal };
+      updateMemoryContextWidget(ctx.ui);
+    }
 
     if (usage) {
       try {

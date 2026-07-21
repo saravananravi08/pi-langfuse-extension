@@ -196,10 +196,10 @@ pi "your prompt"
 While replacement is active, Pi shows compact status such as:
 
 ```text
-Memory 24.9%/272k · est 7.1k
+Memory 24.9%/272k · est 7.1k · $1.235
 ```
 
-The percentage is actual provider input usage against the selected model's context window. `est` is the estimated textual replacement-message size. Binary image data is excluded and reported separately, for example `est 7.1k + 2 images`, because image token accounting varies by provider and model.
+The percentage is actual provider input usage against the selected model's context window. `est` is the estimated textual replacement-message size. Cost is cumulative main-model cost reported by the provider; it is omitted when the provider supplies no pricing. Binary image data is excluded and reported separately, for example `est 7.1k + 2 images`, because image token accounting varies by provider and model.
 
 ### Scoped memory lookup
 
@@ -304,7 +304,7 @@ node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill
 node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill --include-pre-coverage
 ```
 
-Backfill writes only deterministic eligible mappings. `--include-pre-coverage` explicitly includes older historical traces.
+Backfill writes only eligible traces that map uniquely to complete Pi provenance. `--include-pre-coverage` explicitly includes older historical traces.
 
 Additional controls:
 
@@ -362,6 +362,8 @@ The file is created with `0600` permissions. Records contain safe request, valid
 - Set `observer.enabled=true`.
 - Configure `observer.model` and `observer.apiKey`.
 - Wait for the agent turn to finish; observation runs asynchronously after `agent_end`.
+- Transient `408`, `429`, and `5xx` responses retry up to eight times with bounded exponential or provider-directed backoff.
+- If all retries fail, run the read-only audit, then controlled `--backfill` after the provider recovers.
 - Inspect the private diagnostic log.
 
 ### No `memory_session_reflection`
