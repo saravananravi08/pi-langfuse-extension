@@ -46,7 +46,13 @@ function recent(items, limit) {
 function durableLines(items, predicate) {
   return (Array.isArray(items) ? items : [])
     .filter(predicate)
-    .map(item => `[${item.authority}/${item.status}] ${item.topic}: ${item.content} (sources: ${(item.sourceEntryIds || []).join(", ")})`);
+    .map(item => {
+      const sourceEntryIds = Array.isArray(item.sourceEntryIds) ? item.sourceEntryIds.filter(Boolean) : [];
+      const visibleSources = sourceEntryIds.slice(-3);
+      const omitted = sourceEntryIds.length - visibleSources.length;
+      const sources = `${visibleSources.join(", ")}${omitted > 0 ? ` (+${omitted} older)` : ""}`;
+      return `[${item.authority}/${item.status}] ${item.topic}: ${item.content} (sources: ${sources})`;
+    });
 }
 
 export function renderReflectionMarkdown(fields) {

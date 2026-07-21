@@ -51,6 +51,18 @@ test('bounds rendered historical file lists while canonical fields remain untouc
   assert.equal(value.filesRead.length, 60);
 });
 
+test('bounds rendered durable provenance while canonical source IDs remain complete', () => {
+  const sourceEntryIds = ['u1', 'u2', 'u3', 'u4', 'u5'];
+  const durableItems = [{
+    id: 'decision-1', kind: 'decision', topic: 'scope', content: 'Keep full provenance', status: 'active', authority: 'user', sourceEntryIds,
+  }];
+  const value = fields({ durableItems });
+  const markdown = renderReflectionMarkdown(value);
+  assert.doesNotMatch(markdown, /u1, u2/);
+  assert.match(markdown, /u3, u4, u5 \(\+2 older\)/);
+  assert.deepEqual(value.durableItems[0].sourceEntryIds, sourceEntryIds);
+});
+
 test('renders empty sections without inventing content', () => {
   const markdown = renderReflectionMarkdown(fields({ openIssues: [], filesDeleted: [] }));
   assert.match(markdown, /### Blocked\n\n## Key Decisions/);
