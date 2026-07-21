@@ -437,7 +437,7 @@ export function buildMemoryContextText(memory, options = {}) {
   const maxChars = Math.max(4_000, Number(config.maxChars) || 40_000);
   const recentUserRequests = config.recentUserRequests || memory.recentUserRequests || [];
   const currentPrompt = String(config.currentPrompt || memory.currentPrompt || "");
-  if (!memory.reflection && memory.observations.length === 0 && recentUserRequests.length === 0) return "";
+  if (!memory.reflection && !memory.legacyReflection && memory.observations.length === 0 && recentUserRequests.length === 0) return "";
 
   const queryKind = classifyMemoryQuery(currentPrompt);
   const fields = memory.reflection?.fields || {};
@@ -478,6 +478,23 @@ export function buildMemoryContextText(memory, options = {}) {
       verifiedFacts: fields.verifiedFacts,
       blockedItems: fields.blockedItems,
     }), null, 2), 12_000)}`);
+  }
+  if (memory.legacyReflection) {
+    const legacy = memory.legacyReflection.fields || {};
+    sections.push(`## Compatible Legacy Project Details\nLower-priority historical context only. Current request and v2 user-authority state override conflicts.\n${clamp(JSON.stringify(redactSecrets({
+      scoreId: memory.legacyReflection.scoreId,
+      generation: memory.legacyReflection.generation,
+      summary: legacy.summary,
+      goal: legacy.goal,
+      currentTask: legacy.currentTask,
+      taskStatus: legacy.taskStatus,
+      completed: legacy.completed,
+      inProgress: legacy.inProgress,
+      openIssues: legacy.openIssues,
+      decisions: legacy.decisions,
+      nextSteps: legacy.nextSteps,
+      criticalContext: legacy.criticalContext,
+    }), null, 2), 8_000)}`);
   }
   if (relevantObservations.length) {
     sections.push(`## Relevant Retrieved Episodes\n${clamp(JSON.stringify(redactSecrets(relevantObservations), null, 2), 12_000)}`);

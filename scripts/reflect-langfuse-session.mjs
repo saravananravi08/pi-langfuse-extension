@@ -83,7 +83,11 @@ if (piBranch.length) {
   observations = filterMemoryScoresForBranch(observations, piBranch);
   reflections = filterMemoryScoresForBranch(reflections, piBranch);
 }
-const previous = latestReflection(reflections);
+const requestedBaseReflectionId = String(args['base-reflection'] || '');
+const previous = requestedBaseReflectionId
+  ? reflections.find(score => score.id === requestedBaseReflectionId)
+  : latestReflection(reflections);
+if (requestedBaseReflectionId && !previous) fail(`Compatible base reflection not found: ${requestedBaseReflectionId}`);
 const coveredUntil = metadataString(previous, 'coveredUntil');
 let newObservations = coveredUntil ? observations.filter(score => generatedAt(score) > coveredUntil) : observations;
 if (Number.isFinite(limit)) newObservations = newObservations.slice(0, limit);
@@ -474,7 +478,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     generatedAt: generated,
   };
   return {
-    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${VERSION}:${scope.sessionId}:${scope.pathKey}:${scope.branchLeafEntryId || 'unscoped'}:${generation}`),
+    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${VERSION}:${scope.sessionId}:${scope.pathKey}:${scope.branchLeafEntryId || 'unscoped'}:${generation}:${sourceObservationScoreIds.join(',')}`),
     name: REFLECTION_SCORE_NAME,
     value: 'reflected',
     sessionId: scope.sessionId,

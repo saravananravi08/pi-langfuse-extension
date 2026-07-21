@@ -59,6 +59,17 @@ test('builds bounded untrusted memory with provenance and newest observations', 
   assert.doesNotMatch(text, /example-credential/);
 });
 
+test('includes compatible legacy details without granting replacement authority', () => {
+  const text = buildMemoryContextText({
+    reflection: { scoreId: 'v2', fields: { summary: 'current state' } },
+    legacyReflection: { scoreId: 'v1', generation: 5, fields: { summary: 'older project detail', decisions: ['legacy decision'] } },
+    observations: [],
+  });
+  assert.match(text, /Compatible Legacy Project Details/);
+  assert.match(text, /older project detail/);
+  assert.match(text, /lower-priority historical context/i);
+});
+
 test('excludes abandoned sibling-branch memory but keeps partial mappings fail-closed', () => {
   const sibling = observation('sibling', {
     ...provenance, firstEntryId: 'sibling-user', lastEntryId: 'sibling-answer',

@@ -1259,7 +1259,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     generatedAt: generated,
   };
   const score = {
-    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.sessionId}:${snapshot.cwd}:${snapshot.piBranchEntryIds.at(-1) || 'unscoped'}:${generation}`),
+    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.sessionId}:${snapshot.cwd}:${snapshot.piBranchEntryIds.at(-1) || 'unscoped'}:${generation}:${sourceObservationScoreIds.join(',')}`),
     name: REFLECTION_SCORE_NAME,
     value: "reflected",
     sessionId: snapshot.sessionId,
@@ -1344,14 +1344,16 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
 function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string, branch: Array<Record<string, unknown>>, currentPrompt = "") {
   const branchScores = filterMemoryScoresForBranch(scores, branch);
   const branchObservations = branchScores.filter(score => score.name === MEMORY_SCORE_NAME);
+  const branchReflections = branchScores.filter(score => score.name === REFLECTION_SCORE_NAME);
   const replacementObservations = branchObservations.filter(replacementEligibleObservation);
   const memory = buildActiveMemory(
     replacementObservations,
-    branchScores.filter(score => score.name === REFLECTION_SCORE_NAME),
+    branchReflections,
     sessionId,
     pathKey,
     MEMORY_SCORE_VERSION,
   );
+  const legacyMemory = buildActiveMemory(branchObservations, branchReflections, sessionId, pathKey, LEGACY_MEMORY_SCORE_VERSION);
   const episodicMemory = buildActiveMemory(replacementObservations, [], sessionId, pathKey, MEMORY_SCORE_VERSION);
   const recentUserRequests = buildRecentUserRequests(branch, { maxMessages: 5, maxTokens: 2_000 });
   const payload = {
@@ -1365,6 +1367,13 @@ function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathK
       sourceObservationScoreIds: metadataStrings(memory.latestReflection, "sourceObservationScoreIds"),
       sourceTraceIds: metadataStrings(memory.latestReflection, "sourceTraceIds"),
       fields: reflectionFields(memory.latestReflection),
+    } : undefined,
+    legacyReflection: legacyMemory.latestReflection ? {
+      scoreId: legacyMemory.latestReflection.id,
+      generation: legacyMemory.latestReflection.metadata?.generation || null,
+      generatedAt: generatedAt(legacyMemory.latestReflection),
+      coveredUntil: metadataString(legacyMemory.latestReflection, "coveredUntil") || null,
+      fields: reflectionFields(legacyMemory.latestReflection),
     } : undefined,
     observations: episodicMemory.newObservations.map(score => ({
       scoreId: score.id,
@@ -1527,7 +1536,7 @@ export default async function (pi: ExtensionAPI) {
         const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch as unknown as Array<Record<string, unknown>>, piMessageText(prompt as unknown as Record<string, unknown>));
         const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
         const plan = planMemoryContextReplacement(messages, branch as unknown as Array<Record<string, unknown>>, memoryText, state.coverage, undefined, {
-          maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.7) : undefined,
+          maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.8) : undefined,
         });
         if (action === "explain") {
           const durableItems = (state.payload.reflection?.fields as Record<string, unknown> | undefined)?.durableItems;
@@ -1711,7 +1720,7 @@ export default async function (pi: ExtensionAPI) {
       const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch, piMessageText(prompt as unknown as Record<string, unknown>));
       const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
       const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage, undefined, {
-        maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.7) : undefined,
+        maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.8) : undefined,
       });
       if (!plan.safe) {
         memoryContextEnabled = false;

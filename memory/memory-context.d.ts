@@ -1,5 +1,6 @@
 export interface ContextMemoryPayload {
   reflection?: Record<string, unknown>;
+  legacyReflection?: Record<string, unknown>;
   observations: Array<Record<string, unknown>>;
 }
 

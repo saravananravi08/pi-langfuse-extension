@@ -66,12 +66,12 @@ Observations and reflections are Langfuse scores, not additions to raw trace eve
 - Entry ranges must be complete, contiguous, non-overlapping, and exactly mapped.
 - Semantic coverage must preserve every user request, correction, and question before raw messages become replaceable.
 - The latest two raw user turns are retained where they fit; oversized turns keep the exact request and newest complete tail.
-- Legacy observation schemas remain lookup-only until append-only migration.
+- Legacy observation schemas never authorize raw-history removal, but their latest branch-compatible reflection remains available as lower-priority project context. New v2 state and current user input override conflicts.
 - Tool calls and results remain complete pairs.
 - Calls emitted by errored or aborted assistant responses are accepted only when proven unexecuted.
 - Current trailing user messages and pending parallel tool results are retained safely.
 - Invalid or incomplete provenance disables replacement immediately.
-- Replacement remains disabled when transformed context still exceeds 70% of the selected model window, leaving Pi compaction as fallback.
+- In-turn checkpoints start near 70% of the selected model window. Validated replacement may use up to 80%, leaving headroom for continued work and Pi compaction.
 - Lookup output and diagnostic logs redact secret-like values.
 - Session changes and shutdown abort queued or running memory work.
 
