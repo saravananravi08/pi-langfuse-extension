@@ -320,7 +320,7 @@ async function observerComplete(system, user) {
 
 function parseObserverJson(text) {
   const jsonText = extractJson(text);
-  const parsed = JSON.parse(jsonText);
+  const parsed = normalizeObserverStringArrays(JSON.parse(jsonText));
   const validationError = validateMemoryOutput(parsed, 'observer');
   if (validationError) throw new Error(`Invalid observer schema: ${validationError}`);
   return {
@@ -350,6 +350,19 @@ function parseObserverJson(text) {
     evidence: parsed.evidence,
     rawModelOutput: text,
   };
+}
+
+function normalizeObserverStringArrays(parsed) {
+  const fields = ['goal', 'constraints', 'completed', 'inProgress', 'openIssues', 'decisions', 'nextSteps', 'criticalContext', 'filesRead', 'filesModified', 'filesCreated', 'filesDeleted', 'toolsUsed'];
+  for (const field of fields) {
+    if (!Array.isArray(parsed?.[field])) continue;
+    parsed[field] = parsed[field].map(item => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return '';
+      return String(item.content || item.text || item.decision || item.description || item.path || item.name || item.value || '').trim();
+    }).filter(Boolean);
+  }
+  return parsed;
 }
 
 function extractJson(text) {
@@ -412,10 +425,18 @@ function mapTracePiProvenance(trace) {
       const entryTime = Date.parse(entry.timestamp || '');
       if (Number.isFinite(traceTime) && Number.isFinite(entryTime) && Math.abs(traceTime - entryTime) > 10_000) continue;
       let end = i + 1;
-      while (end < branch.length && !(branch[end].type === 'message' && branch[end].message?.role === 'user')) end++;
+      if (traceOutput) {
+        while (end < branch.length) {
+          const candidate = branch[end];
+          end++;
+          if (candidate.type === 'message' && candidate.message?.role === 'assistant' && textValue(candidate.message.content) === traceOutput) break;
+        }
+        const finalAssistant = branch[end - 1];
+        if (finalAssistant?.type !== 'message' || finalAssistant.message?.role !== 'assistant' || textValue(finalAssistant.message.content) !== traceOutput) continue;
+      } else {
+        while (end < branch.length && !(branch[end].type === 'message' && branch[end].message?.role === 'user')) end++;
+      }
       const range = branch.slice(i, end);
-      const finalAssistant = range.filter(item => item.type === 'message' && item.message?.role === 'assistant').at(-1);
-      if (traceOutput && textValue(finalAssistant?.message?.content) !== traceOutput) continue;
       ranges.set(range.map(item => item.id).join(':'), range);
     }
   }

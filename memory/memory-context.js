@@ -310,7 +310,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
 
   let safe = Boolean(memoryText) && coverage?.safe === true && reasons.length === 0;
   if (!memoryText) reasons.push("active memory text is empty");
-  const injected = {
+  let injected = {
     role: "custom",
     customType: MEMORY_CUSTOM_TYPE,
     content: memoryText,
@@ -319,10 +319,22 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
   };
   let replacementMessages = safe ? [injected, ...retained] : withoutOldMemory;
   const originalEstimate = estimateContext(withoutOldMemory);
-  const memoryEstimate = estimateContext(injected);
+  let memoryEstimate = estimateContext(injected);
+  const originalMemoryTokensEstimated = memoryEstimate.tokens;
   const retainedEstimate = estimateContext(retained);
   let replacementEstimate = estimateContext(replacementMessages);
   const maxReplacementTokens = Number(options.maxReplacementTokens) || 0;
+  let memoryTruncated = false;
+  if (safe && maxReplacementTokens > 0 && replacementEstimate.tokens > maxReplacementTokens) {
+    const availableMemoryTokens = maxReplacementTokens - retainedEstimate.tokens - 256;
+    if (availableMemoryTokens >= 1_000 && memoryEstimate.tokens > availableMemoryTokens) {
+      injected = { ...injected, content: clamp(memoryText, Math.max(4_000, availableMemoryTokens * 4)) };
+      memoryEstimate = estimateContext(injected);
+      replacementMessages = [injected, ...retained];
+      replacementEstimate = estimateContext(replacementMessages);
+      memoryTruncated = true;
+    }
+  }
   if (safe && maxReplacementTokens > 0 && replacementEstimate.tokens > maxReplacementTokens) {
     reasons.push(`replacement estimate ${replacementEstimate.tokens} exceeds safe ${maxReplacementTokens}-token context budget`);
     safe = false;
@@ -347,6 +359,8 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     toolPairs: coverage?.toolPairs || [],
     originalTokensEstimated: originalEstimate.tokens,
     memoryTokensEstimated: memoryEstimate.tokens,
+    originalMemoryTokensEstimated,
+    memoryTruncated,
     retainedTokensEstimated: retainedEstimate.tokens,
     replacementTokensEstimated: safe ? replacementEstimate.tokens : originalEstimate.tokens,
     originalImageCount: originalEstimate.imageCount,
@@ -404,6 +418,8 @@ export function formatMemoryContextPreview(plan, maxIds = 20) {
     tokens: {
       original: plan.originalTokensEstimated,
       memory: plan.memoryTokensEstimated,
+      originalMemory: plan.originalMemoryTokensEstimated,
+      memoryTruncated: plan.memoryTruncated,
       retained: plan.retainedTokensEstimated,
       replacement: plan.replacementTokensEstimated,
     },

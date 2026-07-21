@@ -38,6 +38,11 @@ function section(heading, items, ordered = false) {
   return body ? `${heading}\n${body}` : heading;
 }
 
+function recent(items, limit) {
+  const values = strings(items);
+  return values.length > limit ? values.slice(-limit) : values;
+}
+
 function durableLines(items, predicate) {
   return (Array.isArray(items) ? items : [])
     .filter(predicate)
@@ -55,7 +60,7 @@ export function renderReflectionMarkdown(fields) {
     ["## Progress", markdownItems(progress), section("### Done", fields.completed), section("### In Progress", fields.inProgress), section("### Blocked", fields.openIssues)].filter(Boolean).join("\n"),
     section("## Key Decisions", fields.decisions),
     section("## Next Steps", fields.nextSteps, true),
-    [section("## Critical Context", fields.criticalContext), section("### Files Read", fields.filesRead), section("### Files Modified", fields.filesModified), section("### Files Created", fields.filesCreated), section("### Files Deleted", fields.filesDeleted), section("### Tools Used", fields.toolsUsed)].join("\n"),
+    [section("## Critical Context", fields.criticalContext), section("### Files Read", recent(fields.filesRead, 50)), section("### Files Modified", recent(fields.filesModified, 50)), section("### Files Created", recent(fields.filesCreated, 30)), section("### Files Deleted", recent(fields.filesDeleted, 30)), section("### Tools Used", recent(fields.toolsUsed, 30))].join("\n"),
   ].join("\n\n");
 }
 

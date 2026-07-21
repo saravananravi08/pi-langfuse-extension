@@ -42,6 +42,15 @@ test('renders stable checkpoint headings from canonical fields', () => {
   assert.match(first, /### Files Modified\n- \/repo\/index\.ts/);
 });
 
+test('bounds rendered historical file lists while canonical fields remain untouched', () => {
+  const filesRead = Array.from({ length: 60 }, (_, index) => `/repo/file-${index}.ts`);
+  const value = fields({ filesRead });
+  const markdown = renderReflectionMarkdown(value);
+  assert.doesNotMatch(markdown, /file-0\.ts/);
+  assert.match(markdown, /file-59\.ts/);
+  assert.equal(value.filesRead.length, 60);
+});
+
 test('renders empty sections without inventing content', () => {
   const markdown = renderReflectionMarkdown(fields({ openIssues: [], filesDeleted: [] }));
   assert.match(markdown, /### Blocked\n\n## Key Decisions/);

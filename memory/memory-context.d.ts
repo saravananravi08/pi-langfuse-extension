@@ -42,6 +42,8 @@ export interface MemoryContextPlan {
   toolPairs: Array<Record<string, unknown>>;
   originalTokensEstimated: number;
   memoryTokensEstimated: number;
+  originalMemoryTokensEstimated: number;
+  memoryTruncated: boolean;
   retainedTokensEstimated: number;
   replacementTokensEstimated: number;
   originalImageCount: number;

@@ -926,6 +926,10 @@ function memoryScopeKey(sessionId: string, pathKey: string): string {
   return `${sessionId}:${pathKey}`;
 }
 
+function replacementEligibleObservation(score: MemoryScore): boolean {
+  return score.metadata?.memoryStatus === "ready" && score.metadata?.replacementEligible === true;
+}
+
 let langfuseRequestQueue = Promise.resolve();
 
 function langfuseRetryAfterMs(response: Response, raw: string, attempt: number): number {
@@ -1036,7 +1040,7 @@ async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservatio
   const branchObservations = filterMemoryScoresForBranch(cached.observations, snapshot.piBranchEntryIds);
   const branchReflections = filterMemoryScoresForBranch(cached.reflections, snapshot.piBranchEntryIds);
   const memory = buildActiveMemory(
-    branchObservations,
+    branchObservations.filter(replacementEligibleObservation),
     branchReflections,
     snapshot.sessionId,
     snapshot.cwd,
@@ -1053,7 +1057,7 @@ async function writeSessionReflection(snapshot: TraceSnapshot, memory: ActiveSes
   const previous = memory.latestReflection;
   const previousFields = reflectionFields(previous);
   const newObservationFields = memory.newObservations.map(observationFields);
-  const targetTokens = Math.max(2_000, Math.min(8_000, Math.floor(memory.activeTokens * 0.5)));
+  const targetTokens = Math.max(2_000, Math.min(10_000, Math.floor(memory.activeTokens * 0.5)));
   const user = `Consolidate the delimited memory into one updated coding checkpoint.
 
 <previous-reflection>
@@ -1101,7 +1105,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       const text = await observerComplete(
         REFLECTION_SYSTEM_PROMPT,
         `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1] || "Use concise, dense language."}${correction}`,
-        6000,
+        12000,
         "Reflector",
         0,
         {
@@ -1158,7 +1162,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !markdown.includes(heading));
       if (missingHeading) throw new MemoryOutputValidationError(`Rendered reflection missing ${missingHeading}`);
       const outputTokens = estimateTokens(markdown);
-      if (outputTokens > targetTokens) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
+      if (outputTokens > Math.ceil(targetTokens * 1.02)) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
       parsed = canonical;
       renderedMarkdown = markdown;
       qualityMetrics = quality.metrics;
@@ -1210,6 +1214,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     sessionId: snapshot.sessionId,
     cwd: snapshot.cwd || null,
     pathKey: snapshot.cwd || null,
+    branchLeafEntryId: snapshot.piBranchEntryIds.at(-1) || null,
     reflectionMarkdown: renderedMarkdown,
     summary: String(parsed.summary).trim(),
     goal: arrayOfStrings(parsed.goal),
@@ -1254,7 +1259,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     generatedAt: generated,
   };
   const score = {
-    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.sessionId}:${snapshot.cwd}:${generation}`),
+    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${MEMORY_SCORE_VERSION}:${snapshot.sessionId}:${snapshot.cwd}:${snapshot.piBranchEntryIds.at(-1) || 'unscoped'}:${generation}`),
     name: REFLECTION_SCORE_NAME,
     value: "reflected",
     sessionId: snapshot.sessionId,
@@ -1339,14 +1344,15 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
 function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string, branch: Array<Record<string, unknown>>, currentPrompt = "") {
   const branchScores = filterMemoryScoresForBranch(scores, branch);
   const branchObservations = branchScores.filter(score => score.name === MEMORY_SCORE_NAME);
+  const replacementObservations = branchObservations.filter(replacementEligibleObservation);
   const memory = buildActiveMemory(
-    branchObservations,
+    replacementObservations,
     branchScores.filter(score => score.name === REFLECTION_SCORE_NAME),
     sessionId,
     pathKey,
     MEMORY_SCORE_VERSION,
   );
-  const episodicMemory = buildActiveMemory(branchObservations, [], sessionId, pathKey, MEMORY_SCORE_VERSION);
+  const episodicMemory = buildActiveMemory(replacementObservations, [], sessionId, pathKey, MEMORY_SCORE_VERSION);
   const recentUserRequests = buildRecentUserRequests(branch, { maxMessages: 5, maxTokens: 2_000 });
   const payload = {
     currentPrompt,

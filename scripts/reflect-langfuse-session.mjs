@@ -13,6 +13,8 @@ import { validateMemoryOutput } from '../memory/memory-validation.js';
 import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory/memory-reflection.js';
 import { alignDurableItems, reduceDurableItems } from '../memory/memory-quality.js';
 import { aggregatePiReflectionProvenance } from '../memory/memory-provenance.js';
+import { findPiSessionFile } from '../memory/memory-pi-entries.js';
+import { filterMemoryScoresForBranch } from '../memory/memory-context.js';
 import {
   estimateTokens,
   generatedAt,
@@ -62,17 +64,25 @@ const [allObservations, allReflections] = await Promise.all([
   fetchScoresByName(REFLECTION_SCORE_NAME),
 ]);
 const sessionObservations = allObservations
-  .filter(score => metadataString(score, 'version') === VERSION && metadataString(score, 'sessionId') === sessionId)
+  .filter(score => metadataString(score, 'version') === VERSION
+    && metadataString(score, 'sessionId') === sessionId
+    && score.metadata?.memoryStatus === 'ready'
+    && score.metadata?.replacementEligible === true)
   .sort((a, b) => generatedAt(a).localeCompare(generatedAt(b)));
 if (!sessionObservations.length) fail(`No ${OBSERVATION_SCORE_NAME} scores found for session ${sessionId}.`);
 
 const pathKey = String(args.path || metadataString(sessionObservations[sessionObservations.length - 1], 'pathKey') || '');
-const observations = sessionObservations.filter(score => !pathKey || metadataString(score, 'pathKey') === pathKey);
-const reflections = allReflections.filter(score =>
+let observations = sessionObservations.filter(score => !pathKey || metadataString(score, 'pathKey') === pathKey);
+let reflections = allReflections.filter(score =>
   metadataString(score, 'version') === VERSION
   && metadataString(score, 'sessionId') === sessionId
   && (!pathKey || metadataString(score, 'pathKey') === pathKey)
 );
+const piBranch = loadPiBranch(sessionId, String(args['branch-leaf'] || ''));
+if (piBranch.length) {
+  observations = filterMemoryScoresForBranch(observations, piBranch);
+  reflections = filterMemoryScoresForBranch(reflections, piBranch);
+}
 const previous = latestReflection(reflections);
 const coveredUntil = metadataString(previous, 'coveredUntil');
 let newObservations = coveredUntil ? observations.filter(score => generatedAt(score) > coveredUntil) : observations;
@@ -91,6 +101,7 @@ const thresholdMet = reflectionThresholdMet({ newObservations, activeTokens, new
 console.log(JSON.stringify({
   sessionId,
   pathKey,
+  branchLeafEntryId: piBranch.at(-1)?.id || null,
   previousReflectionId: previous?.id || null,
   previousGeneration: Number(previous?.metadata?.generation || 0),
   coveredUntil: coveredUntil || null,
@@ -112,7 +123,7 @@ if (!thresholdMet && !force) {
   process.exit(0);
 }
 
-const reflection = await generateReflection(previous, newObservations, { sessionId, pathKey });
+const reflection = await generateReflection(previous, newObservations, { sessionId, pathKey, branchLeafEntryId: piBranch.at(-1)?.id || '' });
 if (dryRun) {
   console.log(JSON.stringify(reflection, null, 2));
 } else {
@@ -139,6 +150,19 @@ function parseArgs(argv) {
 
 function normalizeSessionId(value) {
   return String(value || '').replace(/^\/?sessions\//, '').replace(/\.jsonl$/, '');
+}
+
+function loadPiBranch(id, requestedLeafId) {
+  const sessionFile = findPiSessionFile(join(homedir(), '.pi', 'agent', 'sessions'), id);
+  if (!sessionFile) return [];
+  const entries = readFileSync(sessionFile, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.id);
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const parentIds = new Set(entries.map(entry => entry.parentId).filter(Boolean));
+  const leaf = requestedLeafId ? byId.get(requestedLeafId) : entries.filter(entry => !parentIds.has(entry.id)).at(-1);
+  if (!leaf) fail(`Pi branch leaf not found: ${requestedLeafId}`);
+  const branch = [];
+  for (let entry = leaf; entry; entry = entry.parentId ? byId.get(entry.parentId) : undefined) branch.unshift(entry);
+  return branch;
 }
 
 function positiveInteger(value, fallback) {
@@ -245,8 +269,8 @@ async function complete(system, user) {
   const headers = { Authorization: `Bearer ${observerApiKey}`, 'Content-Type': 'application/json' };
   if (observerApi === 'anthropic') headers['anthropic-version'] = '2023-06-01';
   const body = observerApi === 'openai'
-    ? { model: observerModel, temperature: 0, max_tokens: 6000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }
-    : { model: observerModel, temperature: 0, max_tokens: 6000, stream: false, system, messages: [{ role: 'user', content: user }] };
+    ? { model: observerModel, temperature: 0, max_tokens: 12000, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }
+    : { model: observerModel, temperature: 0, max_tokens: 12000, stream: false, system, messages: [{ role: 'user', content: user }] };
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt++) {
     let response;
@@ -285,7 +309,7 @@ async function generateReflection(previous, scores, scope) {
   const previousFields = reflectionFields(previous);
   const newObservationFields = scores.map(observationFields);
   const inputTokens = estimateTokens(`${JSON.stringify(previousFields, null, 2)}\n\n${JSON.stringify(newObservationFields, null, 2)}`);
-  const targetTokens = Math.max(2_000, Math.min(8_000, Math.floor(inputTokens * 0.5)));
+  const targetTokens = Math.max(2_000, Math.min(10_000, Math.floor(inputTokens * 0.5)));
   const user = `Consolidate the delimited memory into one updated coding checkpoint.
 
 <previous-reflection>
@@ -372,7 +396,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !markdown.includes(heading));
       if (missingHeading) throw new MemoryOutputValidationError(`Rendered reflection missing ${missingHeading}`);
       const outputTokens = estimateTokens(markdown);
-      if (outputTokens > targetTokens) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
+      if (outputTokens > Math.ceil(targetTokens * 1.02)) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
       parsed = canonical;
       renderedMarkdown = markdown;
       qualityMetrics = quality.metrics;
@@ -405,6 +429,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     sessionId: scope.sessionId,
     cwd: scope.pathKey || null,
     pathKey: scope.pathKey || null,
+    branchLeafEntryId: scope.branchLeafEntryId || null,
     reflectionMarkdown: renderedMarkdown,
     summary: String(parsed.summary).trim(),
     goal: arrayOfStrings(parsed.goal),
@@ -449,7 +474,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     generatedAt: generated,
   };
   return {
-    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${VERSION}:${scope.sessionId}:${scope.pathKey}:${generation}`),
+    id: deterministicUuid(`${REFLECTION_SCORE_NAME}:${VERSION}:${scope.sessionId}:${scope.pathKey}:${scope.branchLeafEntryId || 'unscoped'}:${generation}`),
     name: REFLECTION_SCORE_NAME,
     value: 'reflected',
     sessionId: scope.sessionId,

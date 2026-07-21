@@ -216,6 +216,22 @@ test('preview exposes score, entry, tool-pair, and token decisions', () => {
   assert.equal(preview.images.replacement, 0);
 });
 
+test('shrinks injected memory to fit remaining safe context budget', () => {
+  const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
+  const plan = planMemoryContextReplacement(
+    [user1, call1, result1, answer1, user2],
+    branch,
+    `important memory\n${'detail '.repeat(8_000)}`,
+    coverage,
+    undefined,
+    { recentTurnCount: 1, maxReplacementTokens: 1_500 },
+  );
+  assert.equal(plan.safe, true);
+  assert.equal(plan.memoryTruncated, true);
+  assert.ok(plan.memoryTokensEstimated < plan.originalMemoryTokensEstimated);
+  assert.ok(plan.replacementTokensEstimated <= 1_500);
+});
+
 test('does not bypass Pi compaction when replacement remains above safe context budget', () => {
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, undefined, { maxReplacementTokens: 1 });
