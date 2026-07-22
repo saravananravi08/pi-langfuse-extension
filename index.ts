@@ -1375,11 +1375,6 @@ async function getContextScores(sessionId: string, pathKey: string, branch: Arra
       .map((range: any) => String(range?.observationScoreId || ""))
       .filter(Boolean)),
   );
-  const recentCoveredScoreIds = [v2Reflection, legacyReflection].flatMap(reflection =>
-    (Array.isArray(reflection?.metadata?.sourcePiRanges) ? reflection.metadata.sourcePiRanges : [])
-      .slice(-22)
-      .map((range: any) => String(range?.observationScoreId || ""))
-      .filter(Boolean));
   const traceRefs = await fetchTraceScoreRefsForSession(sessionId, signal);
   const newObservationScoreIds = traceRefs.flatMap(trace => [MEMORY_SCORE_VERSION, LEGACY_MEMORY_SCORE_VERSION].map(version => {
     const seed = version === LEGACY_MEMORY_SCORE_VERSION
@@ -1388,9 +1383,8 @@ async function getContextScores(sessionId: string, pathKey: string, branch: Arra
     const scoreId = deterministicUuid(seed);
     return trace.scores.includes(scoreId) && !coveredScoreIds.has(scoreId) ? scoreId : "";
   })).filter(Boolean);
-  const contextObservationScoreIds = unique([...recentCoveredScoreIds, ...newObservationScoreIds]);
-  const observations = contextObservationScoreIds.length
-    ? await fetchScoresByIds(contextObservationScoreIds, MEMORY_SCORE_NAME, signal)
+  const observations = newObservationScoreIds.length
+    ? await fetchScoresByIds(newObservationScoreIds, MEMORY_SCORE_NAME, signal)
     : [];
   const scores = [v2Reflection, legacyReflection, ...observations]
     .filter((score): score is MemoryScore => Boolean(score));

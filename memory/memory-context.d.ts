@@ -31,10 +31,10 @@ export interface TemporalMemoryTurn {
   userEntryId: string;
   textEntryIds: string[];
   lastTextEntryId: string;
-  observationScoreId: string;
+  observationScoreId: string | null;
   branchIndex: number;
   generatedAt: string;
-  observation: Record<string, unknown>;
+  observation: Record<string, unknown> | null;
 }
 
 export interface MemoryContextPlan {
@@ -48,6 +48,7 @@ export interface MemoryContextPlan {
   recentRetainedEntryIds: string[];
   textRetainedEntryIds: string[];
   temporalTurnCount: number;
+  compactedToolCallIds: string[];
   semanticCoverageFailures: string[];
   replacementEligibleScoreIds: string[];
   lookupOnlyScoreIds: string[];

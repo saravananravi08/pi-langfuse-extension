@@ -42,6 +42,7 @@ const branch = [
 const provenance = {
   version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true,
   firstEntryId: 'u1', lastEntryId: 'a2', entryIds: ['u1', 'a1', 'r1', 'a2'],
+  userEntryId: 'u1', userEntryIds: ['u1'],
   toolPairs: [{ toolCallId: 'call-1', assistantEntryId: 'a1', toolResultEntryId: 'r1' }],
 };
 
@@ -180,6 +181,77 @@ test('aligns recent text-only turns with their observations in chronological ord
   assert.deepEqual(plan.messages.slice(1).map(message => message.role), ['user', 'assistant', 'custom', 'user']);
   assert.equal(plan.messages[3].customType, 'langfuse-memory-turn-observation');
   assert.match(plan.messages[3].content, /Old turn completed/);
+
+  const coveredTimeline = buildTemporalTurnTimeline(branch, [], { maxTurns: 20 });
+  const coveredPlan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, undefined, {
+    recentTurnCount: 1,
+    temporalTurns: coveredTimeline,
+  });
+  assert.deepEqual(coveredPlan.messages.slice(1).map(message => message.role), ['user', 'assistant', 'user']);
+  assert.equal(coveredPlan.messages.some(message => message.customType === 'langfuse-memory-turn-observation'), false);
+});
+
+test('compacts completed recent tool payloads while preserving complete pairs and final text', () => {
+  const largeCall = { role: 'assistant', content: [{ type: 'toolCall', id: 'large-call', name: 'write', arguments: { path: '/tmp/a', content: 'x'.repeat(6_000) } }], timestamp: 2 };
+  const largeResult = { role: 'toolResult', toolCallId: 'large-call', content: [{ type: 'text', text: 'y'.repeat(6_000) }], timestamp: 3 };
+  const messages = [user1, largeCall, largeResult, answer1, user2];
+  const entries = [entry('u1', null, user1), entry('a1', 'u1', largeCall), entry('r1', 'a1', largeResult), entry('a2', 'r1', answer1), entry('u2', 'a2', user2)];
+  const largeProvenance = { ...provenance, toolPairs: [{ toolCallId: 'large-call', assistantEntryId: 'a1', toolResultEntryId: 'r1' }] };
+  const coverage = buildMemoryContextCoverage(undefined, [observation('large', largeProvenance)], 'pi-session');
+  const plan = planMemoryContextReplacement(messages, entries, 'memory', coverage, undefined, { recentTurnCount: 2 });
+  assert.equal(plan.safe, true);
+  const compactedCall = plan.messages.find(message => message.role === 'assistant' && message.content?.some(part => part.id === 'large-call'));
+  const compactedResult = plan.messages.find(message => message.role === 'toolResult' && message.toolCallId === 'large-call');
+  assert.match(compactedCall.content[0].arguments.content, /compacted chars=6000/);
+  assert.match(compactedResult.content[0].text, /compacted chars=6000/);
+  assert.deepEqual(plan.compactedToolCallIds, ['large-call']);
+  assert.ok(plan.messages.some(message => message.role === 'assistant' && message.content?.[0]?.text === 'old answer'));
+});
+
+test('compacts checkpoint-covered tool pairs inside an active long turn', () => {
+  const user = { role: 'user', content: 'continue long work', timestamp: 1 };
+  const call = { role: 'assistant', content: [{ type: 'toolCall', id: 'checkpoint-call', name: 'bash', arguments: { command: 'x'.repeat(5_000) } }], timestamp: 2 };
+  const result = { role: 'toolResult', toolCallId: 'checkpoint-call', content: [{ type: 'text', text: 'y'.repeat(5_000) }], timestamp: 3 };
+  const entries = [entry('u20', null, user), entry('a20', 'u20', call), entry('r20', 'a20', result)];
+  const checkpointProvenance = {
+    version: 'pi-entry-v1', piSessionId: 'pi-session', complete: true,
+    firstEntryId: 'u20', lastEntryId: 'r20', entryIds: ['u20', 'a20', 'r20'], userEntryId: 'u20', userEntryIds: ['u20'],
+    toolPairs: [{ toolCallId: 'checkpoint-call', assistantEntryId: 'a20', toolResultEntryId: 'r20' }],
+  };
+  const coverage = buildMemoryContextCoverage(undefined, [observation('checkpoint', checkpointProvenance)], 'pi-session');
+  const plan = planMemoryContextReplacement([user, call, result], entries, 'memory', coverage);
+  assert.equal(plan.safe, true);
+  assert.deepEqual(plan.compactedToolCallIds, ['checkpoint-call']);
+  assert.match(plan.messages.find(message => message.role === 'toolResult').content[0].text, /compacted chars=5000/);
+});
+
+test('reduces the temporal window from twenty toward ten as complete turns', () => {
+  const messages = [];
+  const entries = [];
+  const entryIds = [];
+  let parentId = null;
+  for (let index = 0; index < 20; index++) {
+    const user = { role: 'user', content: `user-${index}`, timestamp: index * 2 + 1 };
+    const assistant = { role: 'assistant', content: [{ type: 'text', text: `${index}:` + 'z'.repeat(3_000) }], timestamp: index * 2 + 2 };
+    const userId = `u${index}`;
+    const assistantId = `a${index}`;
+    entries.push(entry(userId, parentId, user), entry(assistantId, userId, assistant));
+    messages.push(user, assistant);
+    entryIds.push(userId, assistantId);
+    parentId = assistantId;
+  }
+  const coverage = {
+    safe: true, reasons: [], entryIds,
+    ranges: [{ observationScoreId: 'all', firstEntryId: entryIds[0], lastEntryId: entryIds.at(-1), entryIds }],
+  };
+  const temporalTurns = buildTemporalTurnTimeline(entries, [], { maxTurns: 20 });
+  const plan = planMemoryContextReplacement(messages, entries, 'memory', coverage, undefined, {
+    temporalTurns,
+    maxReplacementTokens: 10_000,
+  });
+  assert.equal(plan.safe, true);
+  assert.ok(plan.temporalTurnCount >= 10 && plan.temporalTurnCount < 20);
+  assert.equal(plan.textRetainedEntryIds.length, (plan.temporalTurnCount - 2) * 2);
 });
 
 test('retains trailing parallel tool results while Pi session entries catch up', () => {
