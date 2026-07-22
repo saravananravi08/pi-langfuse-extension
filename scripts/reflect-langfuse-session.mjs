@@ -400,7 +400,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !markdown.includes(heading));
       if (missingHeading) throw new MemoryOutputValidationError(`Rendered reflection missing ${missingHeading}`);
       const outputTokens = estimateTokens(markdown);
-      if (outputTokens > Math.ceil(targetTokens * 1.02)) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
+      if (outputTokens > 12_000) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds 12000-token storage limit`);
       parsed = canonical;
       renderedMarkdown = markdown;
       qualityMetrics = quality.metrics;
