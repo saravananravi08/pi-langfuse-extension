@@ -208,6 +208,29 @@ test('compacts completed recent tool payloads while preserving complete pairs an
   assert.ok(plan.messages.some(message => message.role === 'assistant' && message.content?.[0]?.text === 'old answer'));
 });
 
+test('compacts huge details in the second recent completed turn', () => {
+  const lookupCall = { role: 'assistant', content: [{ type: 'toolCall', id: 'lookup-call', name: 'langfuse_memory_lookup', arguments: { query: 'history' } }], timestamp: 2 };
+  const lookupResult = {
+    role: 'toolResult', toolCallId: 'lookup-call', toolName: 'langfuse_memory_lookup',
+    content: [{ type: 'text', text: 'bounded result' }], details: { payload: 'd'.repeat(420_000) }, timestamp: 3,
+  };
+  const secondUser = { role: 'user', content: 'next turn', timestamp: 5 };
+  const secondAnswer = { role: 'assistant', content: [{ type: 'text', text: 'next answer' }], timestamp: 6 };
+  const messages = [user1, lookupCall, lookupResult, answer1, secondUser, secondAnswer];
+  const entries = [
+    entry('u1', null, user1), entry('a1', 'u1', lookupCall), entry('r1', 'a1', lookupResult), entry('a2', 'r1', answer1),
+    entry('u2', 'a2', secondUser), entry('a3', 'u2', secondAnswer),
+  ];
+  const lookupProvenance = { ...provenance, toolPairs: [{ toolCallId: 'lookup-call', assistantEntryId: 'a1', toolResultEntryId: 'r1' }] };
+  const coverage = buildMemoryContextCoverage(undefined, [observation('lookup', lookupProvenance)], 'pi-session');
+  const plan = planMemoryContextReplacement(messages, entries, 'memory', coverage, undefined, { recentTurnCount: 2 });
+  assert.equal(plan.safe, true);
+  const retainedResult = plan.messages.find(message => message.role === 'toolResult');
+  assert.deepEqual(retainedResult.details, { compacted: true });
+  assert.deepEqual(plan.compactedToolCallIds, ['lookup-call']);
+  assert.ok(plan.replacementTokensEstimated < 5_000);
+});
+
 test('compacts checkpoint-covered tool pairs inside an active long turn', () => {
   const user = { role: 'user', content: 'continue long work', timestamp: 1 };
   const call = { role: 'assistant', content: [{ type: 'toolCall', id: 'checkpoint-call', name: 'bash', arguments: { command: 'x'.repeat(5_000) } }], timestamp: 2 };

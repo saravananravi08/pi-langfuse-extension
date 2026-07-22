@@ -357,7 +357,8 @@ The file is created with `0600` permissions. Records contain safe request, valid
 ## ⚠️ Operational Limits
 
 - Version-1 reflections or tail observations without complete Pi provenance remain lookup-only. Complete branch-compatible v1 ranges support migration-free structural compatibility; v2 remains semantic authority.
-- Context replacement orders the latest reflection and 20 recent text turns, reducing toward 10 whole turns when needed. Only observations not already covered by the reflection are inserted after their matching turns. The previous completed turn uses deterministic bounded tool payloads; the active pending tail remains raw. Older thinking, images, and tool payloads are removed from model-visible context.
+- Context replacement orders the latest reflection and 20 recent text turns, reducing toward 10 whole turns when needed. Only observations not already covered by the reflection are inserted after their matching turns. Every retained completed tool pair uses deterministic bounded payloads; only the active uncheckpointed tail and exact errors remain raw. Older thinking, images, and tool payloads are removed from model-visible context.
+- `langfuse_memory_lookup` model output is capped at 12,000 characters by default or 24,000 with explicit source/Pi-entry retrieval; internal tool details contain only bounded accounting metadata.
 - Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
 - Request throttling is coordinated within one Pi process; multiple concurrent Pi processes do not yet share a global rate limiter.
 - Pi auto-compaction behavior is unchanged.

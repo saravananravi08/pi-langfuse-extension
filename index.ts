@@ -1723,10 +1723,21 @@ export default async function (pi: ExtensionAPI) {
         sourceDetailsLimited: Boolean(params.includeSource),
         piEntriesLimited: Boolean(params.includePiEntries),
       }) as Record<string, unknown>;
-      const text = clampText(payload, 48_000);
+      const outputLimit = params.includeSource || params.includePiEntries ? 24_000 : 12_000;
+      const payloadChars = JSON.stringify(payload).length;
+      const text = clampText(payload, outputLimit);
       return {
         content: [{ type: "text", text }],
-        details: payload,
+        details: {
+          scope: payload.scope,
+          query: payload.query,
+          resultCount: results.length,
+          scoreIds: matches.map(({ score }) => score.id),
+          sourceTraceCount: sourceTraces.length,
+          piEntryGroupCount: piEntries.length,
+          outputChars: text.length,
+          outputTruncated: payloadChars > outputLimit,
+        },
       };
     },
   });

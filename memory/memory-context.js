@@ -85,7 +85,11 @@ function compactCompletedTurnMessage(message) {
     if (part?.type === "text" && typeof part.text === "string") return { ...part, text: compactString(part.text) };
     return part;
   });
-  return { ...message, content };
+  return {
+    ...message,
+    content,
+    ...(message.details === undefined ? {} : { details: { compacted: true } }),
+  };
 }
 
 function temporalObservationMessage(turn, timestamp) {
@@ -412,25 +416,25 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
   const recentRawTokenBudget = Math.max(1_000, Number(options.recentRawTokenBudget) || 12_000);
   const userIndexes = withoutOldMemory.map((message, index) => message?.role === "user" ? index : -1).filter(index => index >= 0);
   const latestUserIndex = userIndexes.at(-1);
-  const latestTurnComplete = latestUserIndex !== undefined
-    && withoutOldMemory.slice(latestUserIndex + 1).some(message => message?.role === "assistant" && textOnlyMessage(message));
-  const compactTurnStart = latestTurnComplete ? latestUserIndex : userIndexes.at(-2);
-  const compactTurnEnd = compactTurnStart === undefined
-    ? -1
-    : (userIndexes.find(index => index > compactTurnStart) ?? withoutOldMemory.length);
-  const compactIndexes = new Set(compactTurnStart === undefined
-    ? []
-    : Array.from({ length: compactTurnEnd - compactTurnStart }, (_, offset) => compactTurnStart + offset));
-  if (!latestTurnComplete && latestUserIndex !== undefined) {
-    for (let index = latestUserIndex + 1; index < withoutOldMemory.length; index++) {
-      const message = withoutOldMemory[index];
-      const entryId = mappedEntryIds[index];
-      if (!entryId || !coveredEntryIds.has(entryId)) continue;
-      const callIds = toolCallIds(message);
-      const completeAssistantCalls = callIds.length > 0 && callIds.every(id => originalResults.has(id));
-      const completeResult = message?.role === "toolResult" && originalCalls.has(message.toolCallId);
-      if (completeAssistantCalls || completeResult) compactIndexes.add(index);
-    }
+  const turnRanges = userIndexes.map(start => {
+    const end = userIndexes.find(index => index > start) ?? withoutOldMemory.length;
+    const assistants = withoutOldMemory.slice(start + 1, end).filter(message => message?.role === "assistant");
+    const lastAssistant = assistants.at(-1);
+    return { start, end, complete: Boolean(lastAssistant && toolCallIds(lastAssistant).length === 0 && textOnlyMessage(lastAssistant)) };
+  });
+  const latestTurnComplete = turnRanges.at(-1)?.complete === true;
+  const compactIndexes = new Set(turnRanges.filter(turn => turn.complete).slice(-2)
+    .flatMap(turn => Array.from({ length: turn.end - turn.start }, (_, offset) => turn.start + offset)));
+  const activeTurnStart = latestTurnComplete ? withoutOldMemory.length : latestUserIndex ?? withoutOldMemory.length;
+  for (let index = 0; index < withoutOldMemory.length; index++) {
+    const message = withoutOldMemory[index];
+    const entryId = mappedEntryIds[index];
+    const checkpointCovered = Boolean(entryId && coveredEntryIds.has(entryId));
+    if (index >= activeTurnStart && !checkpointCovered) continue;
+    const callIds = toolCallIds(message);
+    const completeAssistantCalls = callIds.length > 0 && callIds.every(id => originalResults.has(id));
+    const completeResult = message?.role === "toolResult" && originalCalls.has(message.toolCallId);
+    if (completeAssistantCalls || completeResult) compactIndexes.add(index);
   }
   const compactForContext = index => compactIndexes.has(index)
     ? compactCompletedTurnMessage(withoutOldMemory[index])
