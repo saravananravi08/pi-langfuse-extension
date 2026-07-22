@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { evaluateReflectionQuality, renderReflectionMarkdown } from '../memory/memory-reflection.js';
+import { evaluateReflectionQuality, normalizeReflectionTaskStatus, renderReflectionMarkdown } from '../memory/memory-reflection.js';
 import { REQUIRED_REFLECTION_HEADINGS } from '../memory/memory-prompts.js';
 
 function fields(overrides = {}) {
@@ -68,6 +68,35 @@ test('renders empty sections without inventing content', () => {
   assert.match(markdown, /### Blocked\n\n## Key Decisions/);
   assert.match(markdown, /### Files Deleted\n### Tools Used/);
   assert.doesNotMatch(markdown, /None|N\/A/);
+});
+
+test('keeps rendered checkpoints within budget without mutating canonical fields', () => {
+  const completed = Array.from({ length: 80 }, (_, index) => `Outcome ${index}: ${'verified detail '.repeat(20)}`);
+  const value = fields({
+    constraints: ['Preserve authoritative user state'],
+    inProgress: ['Critical migration remains active'],
+    openIssues: ['Deployment is blocked on credentials'],
+    nextSteps: ['Obtain credentials before deployment'],
+    completed,
+  });
+  const canonical = structuredClone(value);
+  const markdown = renderReflectionMarkdown(value, { maxTokens: 1_000 });
+
+  assert.ok(Math.ceil(markdown.length / 4) <= 1_000);
+  assert.match(markdown, /Critical migration remains active/);
+  assert.match(markdown, /Deployment is blocked on credentials/);
+  assert.match(markdown, /older completed outcomes omitted/);
+  assert.doesNotMatch(markdown, /Outcome 0:/);
+  assert.deepEqual(value, canonical);
+  for (const heading of REQUIRED_REFLECTION_HEADINGS) assert.match(markdown, new RegExp(heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+});
+
+test('normalizes contradictory complete status conservatively', () => {
+  const value = fields({ taskStatus: 'complete', openIssues: ['Still blocked'] });
+  const normalized = normalizeReflectionTaskStatus(value);
+  assert.equal(normalized.taskStatus, 'active');
+  assert.equal(value.taskStatus, 'complete');
+  assert.equal(normalizeReflectionTaskStatus(fields({ taskStatus: 'complete', inProgress: [], openIssues: [] })).taskStatus, 'complete');
 });
 
 test('quality preserves durable source field categories', () => {

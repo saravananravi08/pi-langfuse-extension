@@ -38,36 +38,89 @@ function section(heading, items, ordered = false) {
   return body ? `${heading}\n${body}` : heading;
 }
 
-function recent(items, limit) {
-  const values = strings(items);
-  return values.length > limit ? values.slice(-limit) : values;
+function uniqueStrings(value) {
+  return [...new Set(strings(value))];
 }
 
-function durableLines(items, predicate) {
-  return (Array.isArray(items) ? items : [])
-    .filter(predicate)
-    .map(item => {
-      const sourceEntryIds = Array.isArray(item.sourceEntryIds) ? item.sourceEntryIds.filter(Boolean) : [];
-      const visibleSources = sourceEntryIds.slice(-3);
-      const omitted = sourceEntryIds.length - visibleSources.length;
-      const sources = `${visibleSources.join(", ")}${omitted > 0 ? ` (+${omitted} older)` : ""}`;
-      return `[${item.authority}/${item.status}] ${item.topic}: ${item.content} (sources: ${sources})`;
-    });
+function durableLine(item) {
+  const sourceEntryIds = Array.isArray(item.sourceEntryIds) ? item.sourceEntryIds.filter(Boolean) : [];
+  const visibleSources = sourceEntryIds.slice(-3);
+  const omitted = sourceEntryIds.length - visibleSources.length;
+  const sources = `${visibleSources.join(", ")}${omitted > 0 ? ` (+${omitted} older)` : ""}`;
+  return `[${item.authority}/${item.status}] ${item.topic}: ${item.content} (sources: ${sources})`;
 }
 
-export function renderReflectionMarkdown(fields) {
+function omission(count, label) {
+  return count > 0 ? [`${count} ${label} omitted from rendered checkpoint; retained in canonical memory.`] : [];
+}
+
+function renderBudgetState(fields, selected, includeCurrentTask) {
+  const visible = (field, label) => {
+    const all = uniqueStrings(fields[field]);
+    const values = all.filter(item => selected[field].has(item));
+    return [...values, ...omission(all.length - values.length, label)];
+  };
+  const durable = (predicate, label) => {
+    const all = (Array.isArray(fields.durableItems) ? fields.durableItems : []).filter(predicate);
+    const values = all.filter(item => selected.durableItems.has(item)).map(durableLine);
+    return [...values, ...omission(all.length - values.length, label)];
+  };
   const progress = [];
-  if (String(fields.currentTask || "").trim()) progress.push(`Current task: ${String(fields.currentTask).trim()}`);
+  const currentTask = String(fields.currentTask || "").trim();
+  if (currentTask) progress.push(includeCurrentTask ? `Current task: ${currentTask}` : "Current task omitted from rendered checkpoint; retained in canonical memory.");
   if (String(fields.taskStatus || "").trim()) progress.push(`Status: ${String(fields.taskStatus).trim()}`);
 
   return [
-    section("## Goal", fields.goal),
-    [section("## Constraints & Preferences", fields.constraints), section("### Active User Requests", durableLines(fields.durableItems, item => item.status === "active" && item.kind === "request")), section("### Active Decisions", durableLines(fields.durableItems, item => item.status === "active" && item.kind === "decision")), section("### Active Constraints", durableLines(fields.durableItems, item => item.status === "active" && item.kind === "constraint"))].join("\n"),
-    ["## Progress", markdownItems(progress), section("### Done", fields.completed), section("### In Progress", fields.inProgress), section("### Blocked", fields.openIssues)].filter(Boolean).join("\n"),
-    section("## Key Decisions", fields.decisions),
-    section("## Next Steps", fields.nextSteps, true),
-    [section("## Critical Context", fields.criticalContext), section("### Files Read", recent(fields.filesRead, 50)), section("### Files Modified", recent(fields.filesModified, 50)), section("### Files Created", recent(fields.filesCreated, 30)), section("### Files Deleted", recent(fields.filesDeleted, 30)), section("### Tools Used", recent(fields.toolsUsed, 30))].join("\n"),
+    section("## Goal", visible("goal", "goals")),
+    [section("## Constraints & Preferences", visible("constraints", "constraints")), section("### Active User Requests", durable(item => item.status === "active" && item.kind === "request", "active user requests")), section("### Active Decisions", durable(item => item.status === "active" && item.kind === "decision", "active decisions")), section("### Active Constraints", durable(item => item.status === "active" && item.kind === "constraint", "active constraints"))].join("\n"),
+    ["## Progress", markdownItems(progress), section("### Done", visible("completed", "older completed outcomes")), section("### In Progress", visible("inProgress", "in-progress items")), section("### Blocked", visible("openIssues", "open issues"))].filter(Boolean).join("\n"),
+    section("## Key Decisions", visible("decisions", "older decisions")),
+    section("## Next Steps", visible("nextSteps", "next steps"), true),
+    [section("## Critical Context", visible("criticalContext", "older context items")), section("### Files Read", visible("filesRead", "older files read")), section("### Files Modified", visible("filesModified", "older modified files")), section("### Files Created", visible("filesCreated", "older created files")), section("### Files Deleted", visible("filesDeleted", "older deleted files")), section("### Tools Used", visible("toolsUsed", "older tools"))].join("\n"),
   ].join("\n\n");
+}
+
+export function renderReflectionMarkdown(fields, options = {}) {
+  const maxTokens = Math.max(1_000, Number(options.maxTokens) || 10_000);
+  const selected = Object.fromEntries(ARRAY_FIELDS.map(field => [field, new Set()]));
+  selected.durableItems = new Set();
+  let includeCurrentTask = false;
+  const fits = () => Math.ceil(renderBudgetState(fields, selected, includeCurrentTask).length / 4) <= maxTokens;
+  const add = (field, item) => {
+    if (field === "currentTask") includeCurrentTask = true;
+    else selected[field].add(item);
+    if (fits()) return;
+    if (field === "currentTask") includeCurrentTask = false;
+    else selected[field].delete(item);
+  };
+  const activeDurable = (Array.isArray(fields.durableItems) ? fields.durableItems : [])
+    .filter(item => item?.status === "active" && ["request", "constraint", "decision"].includes(item.kind));
+  const recent = (field, limit) => uniqueStrings(fields[field]).slice(-limit).reverse();
+  const groups = [
+    ["currentTask", String(fields.currentTask || "").trim() ? [String(fields.currentTask).trim()] : []],
+    ["goal", uniqueStrings(fields.goal)],
+    ["durableItems", activeDurable.filter(item => item.kind === "request")],
+    ["constraints", uniqueStrings(fields.constraints)],
+    ["durableItems", activeDurable.filter(item => item.kind !== "request")],
+    ["inProgress", uniqueStrings(fields.inProgress)],
+    ["openIssues", uniqueStrings(fields.openIssues)],
+    ["nextSteps", uniqueStrings(fields.nextSteps)],
+    ["decisions", recent("decisions", 30)],
+    ["completed", recent("completed", 40)],
+    ["criticalContext", recent("criticalContext", 40)],
+    ["filesModified", recent("filesModified", 50)],
+    ["filesCreated", recent("filesCreated", 30)],
+    ["filesDeleted", recent("filesDeleted", 30)],
+    ["filesRead", recent("filesRead", 50)],
+    ["toolsUsed", recent("toolsUsed", 30)],
+  ];
+  for (const [field, items] of groups) for (const item of items) add(field, item);
+  return renderBudgetState(fields, selected, includeCurrentTask);
+}
+
+export function normalizeReflectionTaskStatus(fields) {
+  if (fields.taskStatus !== "complete" || (!strings(fields.inProgress).length && !strings(fields.openIssues).length)) return fields;
+  return { ...fields, taskStatus: "active" };
 }
 
 export function evaluateReflectionQuality(output, previous, observations) {

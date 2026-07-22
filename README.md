@@ -263,7 +263,7 @@ PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
 PI_LANGFUSE_MEMORY_ERROR_LOG=~/.pi/agent/logs/langfuse-memory-errors.jsonl
 ```
 
-Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). `observer-v3` and `reflection-v4` outputs must pass structured schema, authority, semantic-coverage, retention, duplication, and contradiction checks. Reflection Markdown is rendered deterministically from canonical fields. Default injected memory is bounded to approximately 10k estimated textual tokens.
+Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). `observer-v3` and `reflection-v5` outputs must pass structured schema, authority, semantic-coverage, retention, duplication, and contradiction checks. Reflection Markdown is rendered deterministically within the computed target (maximum 10k estimated tokens), while complete canonical fields remain in Langfuse metadata. Default injected memory is bounded to approximately 10k estimated textual tokens.
 
 ## 🗃️ Langfuse Data Model
 

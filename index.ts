@@ -30,7 +30,7 @@ import {
 } from "./memory/memory-prompts.js";
 import { validateMemoryOutput } from "./memory/memory-validation.js";
 import { createMemoryCache } from "./memory/memory-cache.js";
-import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory/memory-reflection.js";
+import { evaluateReflectionQuality, normalizeReflectionTaskStatus, renderReflectionMarkdown } from "./memory/memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
 import { buildMemoryContextCoverage, buildMemoryContextText, buildTemporalTurnTimeline, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
 import { alignDurableItems, buildRecentUserRequests, buildSemanticCoverage, detectExplicitCorrection, explainDurableItems, normalizeDurableItem, reduceDurableItems, sanitizeDurableItemSources, textSupportsClaim, validateDurableItemAuthority } from "./memory/memory-quality.js";
@@ -1097,6 +1097,7 @@ Return ONLY valid JSON:
   "durableItems": [{"id":"stable existing ID when available","kind":"request | decision | constraint | fact | task | question | commitment","topic":"stable topic","content":"canonical state","status":"active | completed | superseded | revoked | proposed","authority":"user | verified-result | assistant-proposal","sourceEntryIds":["exact Pi entry ID"]}]
 }
 
+If taskStatus is complete, inProgress and openIssues MUST both be empty.
 Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   const compressionGuidance = REFLECTION_COMPRESSION_GUIDANCE;
   let parsed: Record<string, unknown> | undefined;
@@ -1113,7 +1114,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       const text = await observerComplete(
         REFLECTION_SYSTEM_PROMPT,
         `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1] || "Use concise, dense language."}${correction}`,
-        12000,
+        targetTokens,
         "Reflector",
         0,
         {
@@ -1142,7 +1143,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         previousDurableItems,
         alignDurableItems(previousDurableItems, observationDurableItems, Array.isArray(candidate.durableItems) ? candidate.durableItems : []),
       );
-      const canonical = {
+      const canonical = normalizeReflectionTaskStatus({
         ...candidate,
         summary: String(candidate.summary).trim(),
         goal: arrayOfStrings(candidate.goal),
@@ -1163,14 +1164,14 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         durableItems: reducedDurable.items,
         supersededItems: reducedDurable.superseded,
         decisionConflicts: reducedDurable.conflicts,
-      };
+      });
       const quality = evaluateReflectionQuality(canonical, previousFields, newObservationFields);
       if (quality.errors.length) throw new MemoryOutputValidationError(`Reflection quality failed: ${quality.errors.join("; ")}`);
-      const markdown = renderReflectionMarkdown(canonical);
+      const markdown = renderReflectionMarkdown(canonical, { maxTokens: targetTokens });
       const missingHeading = REQUIRED_REFLECTION_HEADINGS.find(heading => !markdown.includes(heading));
       if (missingHeading) throw new MemoryOutputValidationError(`Rendered reflection missing ${missingHeading}`);
       const outputTokens = estimateTokens(markdown);
-      if (outputTokens > 12_000) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds 12000-token storage limit`);
+      if (outputTokens > targetTokens) throw new MemoryOutputValidationError(`Reflection ${outputTokens} tokens exceeds ${targetTokens}-token target`);
       parsed = canonical;
       renderedMarkdown = markdown;
       qualityMetrics = quality.metrics;

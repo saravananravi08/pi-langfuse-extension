@@ -34,5 +34,6 @@ export interface ReflectionQuality {
   };
 }
 
-export function renderReflectionMarkdown(fields: Record<string, unknown>): string;
+export function renderReflectionMarkdown(fields: Record<string, unknown>, options?: { maxTokens?: number }): string;
+export function normalizeReflectionTaskStatus(fields: Record<string, unknown>): Record<string, unknown>;
 export function evaluateReflectionQuality(output: Record<string, unknown>, previous: Record<string, unknown> | null, observations: Record<string, unknown>[]): ReflectionQuality;

@@ -1,5 +1,5 @@
 export const OBSERVER_PROMPT_VERSION = "observer-v3";
-export const REFLECTION_PROMPT_VERSION = "reflection-v4";
+export const REFLECTION_PROMPT_VERSION = "reflection-v5";
 
 export const OBSERVER_SYSTEM_PROMPT = `You are the memory observer for an AI coding assistant.
 
