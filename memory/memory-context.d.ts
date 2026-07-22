@@ -62,6 +62,8 @@ export interface MemoryContextPlan {
   memoryTruncated: boolean;
   retainedTokensEstimated: number;
   replacementTokensEstimated: number;
+  candidateReplacementTokensEstimated: number;
+  maxReplacementTokens: number;
   originalImageCount: number;
   memoryImageCount: number;
   retainedImageCount: number;
@@ -87,7 +89,7 @@ export function planMemoryContextReplacement(
   timestamp?: number,
   options?: { recentTurnCount?: number; recentRawTokenBudget?: number; maxReplacementTokens?: number; temporalTurns?: TemporalMemoryTurn[] },
 ): MemoryContextPlan;
-export function formatMemoryContextPreview(plan: MemoryContextPlan, maxIds?: number): string;
+export function formatMemoryContextPreview(plan: MemoryContextPlan): string;
 export function formatMemoryContextStatus(status: {
   actualInputTokens?: number;
   contextWindow?: number;

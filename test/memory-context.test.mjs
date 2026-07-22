@@ -376,18 +376,16 @@ test('formats actual provider usage separately from replacement-message estimate
   );
 });
 
-test('preview exposes score, entry, tool-pair, and token decisions', () => {
+test('preview is concise and omits internal IDs', () => {
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage);
-  const preview = JSON.parse(formatMemoryContextPreview(plan));
-  assert.equal(preview.safe, true);
-  assert.deepEqual(preview.scoreIds, ['score-1']);
-  assert.equal(preview.droppedEntryCount, 0);
-  assert.equal(preview.retainedEntryCount, 5);
-  assert.equal(preview.recentRetainedEntryCount, 5);
-  assert.equal(preview.toolPairCount, 1);
-  assert.ok(preview.tokens.replacement > 0);
-  assert.equal(preview.images.replacement, 0);
+  const preview = formatMemoryContextPreview(plan);
+  assert.match(preview, /^Memory preview: SAFE/m);
+  assert.match(preview, /Tokens: .* → .*/);
+  assert.match(preview, /History: 0 replaced · 5 raw/);
+  assert.match(preview, /Tools: .* · 1 pairs verified/);
+  assert.doesNotMatch(preview, /score-1|call-1|\bu1\b/);
+  assert.ok(preview.split('\n').length <= 6);
 });
 
 test('shrinks injected memory to fit remaining safe context budget', () => {

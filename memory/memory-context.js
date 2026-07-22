@@ -550,6 +550,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
   const originalMemoryTokensEstimated = memoryEstimate.tokens;
   let retainedEstimate = estimateContext(retained);
   let replacementEstimate = estimateContext(replacementMessages);
+  let candidateReplacementTokensEstimated = replacementEstimate.tokens;
   const maxReplacementTokens = Number(options.maxReplacementTokens) || 0;
   while (safe && maxReplacementTokens > 0 && replacementEstimate.tokens > maxReplacementTokens && temporalTurns.length > 10) {
     temporalTurns = temporalTurns.slice(1);
@@ -558,6 +559,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     retainedEstimate = estimateContext(retained);
     replacementMessages = [injected, ...retained];
     replacementEstimate = estimateContext(replacementMessages);
+    candidateReplacementTokensEstimated = replacementEstimate.tokens;
   }
   let memoryTruncated = false;
   if (safe && maxReplacementTokens > 0 && replacementEstimate.tokens > maxReplacementTokens) {
@@ -567,6 +569,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
       memoryEstimate = estimateContext(injected);
       replacementMessages = [injected, ...retained];
       replacementEstimate = estimateContext(replacementMessages);
+      candidateReplacementTokensEstimated = replacementEstimate.tokens;
       memoryTruncated = true;
     }
   }
@@ -602,6 +605,8 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     memoryTruncated,
     retainedTokensEstimated: retainedEstimate.tokens,
     replacementTokensEstimated: safe ? replacementEstimate.tokens : originalEstimate.tokens,
+    candidateReplacementTokensEstimated,
+    maxReplacementTokens,
     originalImageCount: originalEstimate.imageCount,
     memoryImageCount: memoryEstimate.imageCount,
     retainedImageCount: retainedEstimate.imageCount,
@@ -635,46 +640,23 @@ export function formatMemoryContextStatus(status) {
   return `Memory ${percent}%/${formatTokens(status.contextWindow)} · est ${replacement}${images}${cost}`;
 }
 
-export function formatMemoryContextPreview(plan, maxIds = 20) {
-  const limited = values => values.length > maxIds ? [...values.slice(0, maxIds), `... ${values.length - maxIds} more`] : values;
-  return JSON.stringify({
-    safe: plan.safe,
-    reasons: plan.reasons,
-    scoreIds: plan.scoreIds,
-    coveredThroughEntryId: plan.coveredThroughEntryId,
-    droppedEntryCount: plan.droppedEntryIds.length,
-    droppedEntryIds: limited(plan.droppedEntryIds),
-    retainedEntryCount: plan.retainedEntryIds.length,
-    retainedEntryIds: limited(plan.retainedEntryIds),
-    recentRetainedEntryCount: plan.recentRetainedEntryIds.length,
-    recentRetainedEntryIds: limited(plan.recentRetainedEntryIds),
-    textRetainedEntryCount: plan.textRetainedEntryIds.length,
-    textRetainedEntryIds: limited(plan.textRetainedEntryIds),
-    temporalTurnCount: plan.temporalTurnCount || 0,
-    compactedToolPairCount: (plan.compactedToolCallIds || []).length,
-    compactedToolCallIds: limited(plan.compactedToolCallIds || []),
-    retainedUnmappedTailMessageIndexes: plan.retainedUnmappedTailIndexes,
-    toolPairCount: plan.toolPairs.length,
-    toolPairs: plan.toolPairs.slice(0, maxIds),
-    semanticCoverageFailures: plan.semanticCoverageFailures || [],
-    replacementEligibleScoreIds: plan.replacementEligibleScoreIds || [],
-    lookupOnlyScoreIds: plan.lookupOnlyScoreIds || [],
-    compatibilityScoreIds: plan.compatibilityScoreIds || [],
-    tokens: {
-      original: plan.originalTokensEstimated,
-      memory: plan.memoryTokensEstimated,
-      originalMemory: plan.originalMemoryTokensEstimated,
-      memoryTruncated: plan.memoryTruncated,
-      retained: plan.retainedTokensEstimated,
-      replacement: plan.replacementTokensEstimated,
-    },
-    images: {
-      original: plan.originalImageCount,
-      memory: plan.memoryImageCount,
-      retained: plan.retainedImageCount,
-      replacement: plan.replacementImageCount,
-    },
-  }, null, 2);
+export function formatMemoryContextPreview(plan) {
+  const candidate = Number.isFinite(plan.candidateReplacementTokensEstimated)
+    ? plan.candidateReplacementTokensEstimated
+    : plan.replacementTokensEstimated;
+  const reduction = plan.originalTokensEstimated > 0
+    ? Math.max(0, ((plan.originalTokensEstimated - candidate) / plan.originalTokensEstimated) * 100).toFixed(1)
+    : "0.0";
+  const lines = [
+    `Memory preview: ${plan.safe ? "SAFE" : "BLOCKED"}`,
+    `Tokens: ${formatTokens(plan.originalTokensEstimated)} → ${formatTokens(candidate)} (${reduction}% less)${plan.maxReplacementTokens ? ` · limit ${formatTokens(plan.maxReplacementTokens)}` : ""}`,
+    `Context: ${plan.temporalTurnCount || 0} turns · ${formatTokens(plan.memoryTokensEstimated)} memory · ${formatTokens(plan.retainedTokensEstimated)} retained`,
+    `History: ${plan.droppedEntryIds.length} replaced · ${plan.retainedEntryIds.length} raw · ${plan.textRetainedEntryIds.length} text-only`,
+    `Tools: ${(plan.compactedToolCallIds || []).length} compacted · ${plan.toolPairs.length} pairs verified`,
+  ];
+  if (!plan.safe && plan.reasons.length) lines.splice(1, 0, `Reason: ${plan.reasons.join("; ")}`);
+  if (plan.replacementImageCount > 0) lines.push(`Images retained: ${plan.replacementImageCount}`);
+  return lines.join("\n");
 }
 
 export function buildMemoryContextText(memory, options = {}) {
