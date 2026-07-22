@@ -36,6 +36,7 @@ export interface MemoryContextPlan {
   droppedEntryIds: string[];
   retainedEntryIds: string[];
   recentRetainedEntryIds: string[];
+  textRetainedEntryIds: string[];
   semanticCoverageFailures: string[];
   replacementEligibleScoreIds: string[];
   lookupOnlyScoreIds: string[];

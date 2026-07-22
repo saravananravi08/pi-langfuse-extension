@@ -27,6 +27,15 @@ function exactMessageKey(message) {
   return JSON.stringify(message);
 }
 
+function textOnlyMessage(message) {
+  if (!["user", "assistant"].includes(message?.role)) return null;
+  if (typeof message.content === "string") return message.content ? { role: message.role, content: message.content, timestamp: message.timestamp } : null;
+  const content = (Array.isArray(message.content) ? message.content : [])
+    .filter(part => part?.type === "text" && typeof part.text === "string" && part.text.length)
+    .map(part => ({ type: "text", text: part.text }));
+  return content.length ? { role: message.role, content, timestamp: message.timestamp } : null;
+}
+
 function estimateContext(value) {
   let imageCount = 0;
   const json = JSON.stringify(value, (_key, item) => {
@@ -332,11 +341,17 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
   const retained = [];
   const retainedEntryIds = [];
   const recentRetainedEntryIds = [];
+  const textRetainedEntryIds = [];
   const droppedEntryIds = [];
   for (let index = 0; index < withoutOldMemory.length; index++) {
     const entryId = mappedEntryIds[index];
     if (entryId && coveredEntryIds.has(entryId) && !protectedIndexes.has(index)) {
       droppedEntryIds.push(entryId);
+      const textMessage = textOnlyMessage(withoutOldMemory[index]);
+      if (textMessage) {
+        retained.push(textMessage);
+        textRetainedEntryIds.push(entryId);
+      }
       continue;
     }
     retained.push(withoutOldMemory[index]);
@@ -404,6 +419,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     droppedEntryIds,
     retainedEntryIds,
     recentRetainedEntryIds,
+    textRetainedEntryIds,
     unmappedMessageIndexes,
     retainedUnmappedTailIndexes: unmappedMessageIndexes.filter(index => !unsafeUnmappedMessageIndexes.includes(index)),
     toolPairs: coverage?.toolPairs || [],
@@ -459,6 +475,8 @@ export function formatMemoryContextPreview(plan, maxIds = 20) {
     retainedEntryIds: limited(plan.retainedEntryIds),
     recentRetainedEntryCount: plan.recentRetainedEntryIds.length,
     recentRetainedEntryIds: limited(plan.recentRetainedEntryIds),
+    textRetainedEntryCount: plan.textRetainedEntryIds.length,
+    textRetainedEntryIds: limited(plan.textRetainedEntryIds),
     retainedUnmappedTailMessageIndexes: plan.retainedUnmappedTailIndexes,
     toolPairCount: plan.toolPairs.length,
     toolPairs: plan.toolPairs.slice(0, maxIds),
