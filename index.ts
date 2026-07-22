@@ -32,7 +32,7 @@ import { validateMemoryOutput } from "./memory/memory-validation.js";
 import { createMemoryCache } from "./memory/memory-cache.js";
 import { evaluateReflectionQuality, renderReflectionMarkdown } from "./memory/memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
-import { buildMemoryContextCoverage, buildMemoryContextText, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
+import { buildMemoryContextCoverage, buildMemoryContextText, buildTemporalTurnTimeline, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
 import { alignDurableItems, buildRecentUserRequests, buildSemanticCoverage, detectExplicitCorrection, explainDurableItems, normalizeDurableItem, reduceDurableItems, sanitizeDurableItemSources, textSupportsClaim, validateDurableItemAuthority } from "./memory/memory-quality.js";
 import { findPiSessionFile, provenanceEntryIds, readBoundedPiEntries } from "./memory/memory-pi-entries.js";
 import { abortableSleep as sleep, isAbortError } from "./memory/memory-lifecycle.js";
@@ -1375,6 +1375,11 @@ async function getContextScores(sessionId: string, pathKey: string, branch: Arra
       .map((range: any) => String(range?.observationScoreId || ""))
       .filter(Boolean)),
   );
+  const recentCoveredScoreIds = [v2Reflection, legacyReflection].flatMap(reflection =>
+    (Array.isArray(reflection?.metadata?.sourcePiRanges) ? reflection.metadata.sourcePiRanges : [])
+      .slice(-22)
+      .map((range: any) => String(range?.observationScoreId || ""))
+      .filter(Boolean));
   const traceRefs = await fetchTraceScoreRefsForSession(sessionId, signal);
   const newObservationScoreIds = traceRefs.flatMap(trace => [MEMORY_SCORE_VERSION, LEGACY_MEMORY_SCORE_VERSION].map(version => {
     const seed = version === LEGACY_MEMORY_SCORE_VERSION
@@ -1383,8 +1388,9 @@ async function getContextScores(sessionId: string, pathKey: string, branch: Arra
     const scoreId = deterministicUuid(seed);
     return trace.scores.includes(scoreId) && !coveredScoreIds.has(scoreId) ? scoreId : "";
   })).filter(Boolean);
-  const observations = newObservationScoreIds.length
-    ? await fetchScoresByIds(newObservationScoreIds, MEMORY_SCORE_NAME, signal)
+  const contextObservationScoreIds = unique([...recentCoveredScoreIds, ...newObservationScoreIds]);
+  const observations = contextObservationScoreIds.length
+    ? await fetchScoresByIds(contextObservationScoreIds, MEMORY_SCORE_NAME, signal)
     : [];
   const scores = [v2Reflection, legacyReflection, ...observations]
     .filter((score): score is MemoryScore => Boolean(score));
@@ -1406,6 +1412,10 @@ function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathK
   );
   const legacyMemory = buildActiveMemory(branchObservations, branchReflections, sessionId, pathKey, LEGACY_MEMORY_SCORE_VERSION);
   const episodicMemory = buildActiveMemory(replacementObservations, [], sessionId, pathKey, MEMORY_SCORE_VERSION);
+  const temporalObservationCandidates = branchObservations.filter(score =>
+    replacementEligibleObservation(score) || metadataString(score, "version") === LEGACY_MEMORY_SCORE_VERSION);
+  const temporalTurns = buildTemporalTurnTimeline(branch, temporalObservationCandidates, { maxTurns: 20 });
+  const temporalObservationScoreIds = new Set(temporalTurns.map(turn => turn.observationScoreId));
   const recentUserRequests = buildRecentUserRequests(branch, { maxMessages: 5, maxTokens: 2_000 });
   const payload = {
     currentPrompt,
@@ -1426,15 +1436,18 @@ function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathK
       coveredUntil: metadataString(legacyMemory.latestReflection, "coveredUntil") || null,
       fields: reflectionFields(legacyMemory.latestReflection),
     } : undefined,
-    observations: [...episodicMemory.newObservations, ...legacyMemory.newObservations].map(score => ({
-      scoreId: score.id,
-      traceId: score.traceId || metadataString(score, "traceId") || null,
-      generatedAt: generatedAt(score),
-      fields: observationFields(score),
-    })),
+    observations: [...episodicMemory.newObservations, ...legacyMemory.newObservations]
+      .filter(score => !temporalObservationScoreIds.has(score.id))
+      .map(score => ({
+        scoreId: score.id,
+        traceId: score.traceId || metadataString(score, "traceId") || null,
+        generatedAt: generatedAt(score),
+        fields: observationFields(score),
+      })),
   };
   return {
     payload,
+    temporalTurns,
     coverage: buildMemoryContextCoverage(memory.latestReflection, memory.newObservations, piSessionId, legacyMemory.latestReflection, legacyMemory.newObservations),
   };
 }
@@ -1588,6 +1601,7 @@ export default async function (pi: ExtensionAPI) {
         const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch as unknown as Array<Record<string, unknown>>, piMessageText(prompt as unknown as Record<string, unknown>));
         const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
         const plan = planMemoryContextReplacement(messages, branch as unknown as Array<Record<string, unknown>>, memoryText, state.coverage, undefined, {
+          temporalTurns: state.temporalTurns,
           maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.8) : undefined,
         });
         if (action === "explain") {
@@ -1772,6 +1786,7 @@ export default async function (pi: ExtensionAPI) {
       const state = buildContextMemoryState(scores, currentSessionId, ctx.cwd, currentPiSessionId, branch, piMessageText(prompt as unknown as Record<string, unknown>));
       const memoryText = buildMemoryContextText(state.payload, { maxChars: MEMORY_CONTEXT_MAX_CHARS });
       const plan = planMemoryContextReplacement(event.messages, branch, memoryText, state.coverage, undefined, {
+        temporalTurns: state.temporalTurns,
         maxReplacementTokens: ctx.model?.contextWindow ? Math.floor(ctx.model.contextWindow * 0.8) : undefined,
       });
       if (!plan.safe) {

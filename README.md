@@ -357,7 +357,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 ## ⚠️ Operational Limits
 
 - Version-1 reflections or tail observations without complete Pi provenance remain lookup-only. Complete branch-compatible v1 ranges support migration-free structural compatibility; v2 remains semantic authority.
-- Covered history retains exact text-only user and assistant messages; recent turns retain full raw messages and complete tool pairs. Older thinking, images, and tool payloads are removed from model-visible context.
+- Context replacement orders the latest reflection, up to 20 provenance-matched text-only user/assistant turns with each turn's observation, then two recent raw turns with complete tool pairs. Older thinking, images, and tool payloads are removed from model-visible context.
 - Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
 - Request throttling is coordinated within one Pi process; multiple concurrent Pi processes do not yet share a global rate limiter.
 - Pi auto-compaction behavior is unchanged.

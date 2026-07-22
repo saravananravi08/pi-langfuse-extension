@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildMemoryContextCoverage,
   buildMemoryContextText,
+  buildTemporalTurnTimeline,
   filterMemoryScoresForBranch,
   formatMemoryContextPreview,
   formatMemoryContextStatus,
@@ -31,10 +32,6 @@ const call1 = { role: 'assistant', content: [{ type: 'toolCall', id: 'call-1', n
 const result1 = { role: 'toolResult', toolCallId: 'call-1', content: [{ type: 'text', text: 'result' }], timestamp: 3 };
 const answer1 = { role: 'assistant', content: [{ type: 'text', text: 'old answer' }], timestamp: 4 };
 const user2 = { role: 'user', content: 'current user', timestamp: 5 };
-const oldTextHistory = [
-  { role: 'user', content: 'old user', timestamp: 1 },
-  { role: 'assistant', content: [{ type: 'text', text: 'old answer' }], timestamp: 4 },
-];
 const branch = [
   entry('u1', null, user1),
   entry('a1', 'u1', call1),
@@ -162,8 +159,27 @@ test('retains a trailing current user before its Pi entry becomes visible', () =
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch.slice(0, 4), 'memory', coverage, undefined, { recentTurnCount: 1 });
   assert.equal(plan.safe, true);
   assert.deepEqual(plan.retainedUnmappedTailIndexes, [4]);
-  assert.deepEqual(plan.textRetainedEntryIds, ['u1', 'a2']);
-  assert.deepEqual(plan.messages.slice(1), [...oldTextHistory, user2]);
+  assert.deepEqual(plan.messages.slice(1), [user2]);
+});
+
+test('aligns recent text-only turns with their observations in chronological order', () => {
+  const score = observation('score-1', provenance);
+  score.metadata.generatedAt = '2026-01-01T00:00:00.000Z';
+  score.metadata.episodeSummary = 'Old turn completed';
+  const temporalTurns = buildTemporalTurnTimeline(branch, [score], { maxTurns: 20 });
+  assert.equal(temporalTurns.length, 1);
+  assert.deepEqual(temporalTurns[0].textEntryIds, ['u1', 'a2']);
+
+  const coverage = buildMemoryContextCoverage(undefined, [score], 'pi-session');
+  const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2], branch, 'memory', coverage, undefined, {
+    recentTurnCount: 1,
+    temporalTurns,
+  });
+  assert.equal(plan.safe, true);
+  assert.equal(plan.temporalTurnCount, 1);
+  assert.deepEqual(plan.messages.slice(1).map(message => message.role), ['user', 'assistant', 'custom', 'user']);
+  assert.equal(plan.messages[3].customType, 'langfuse-memory-turn-observation');
+  assert.match(plan.messages[3].content, /Old turn completed/);
 });
 
 test('retains trailing parallel tool results while Pi session entries catch up', () => {
@@ -174,7 +190,7 @@ test('retains trailing parallel tool results while Pi session entries catch up',
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, call2, result2], currentBranch, 'memory', coverage, undefined, { recentTurnCount: 1 });
   assert.equal(plan.safe, true);
   assert.deepEqual(plan.retainedUnmappedTailIndexes, [6]);
-  assert.deepEqual(plan.messages.slice(1), [...oldTextHistory, user2, call2, result2]);
+  assert.deepEqual(plan.messages.slice(1), [user2, call2, result2]);
 });
 
 test('excludes binary image data from token estimates and reports images separately', () => {
@@ -199,7 +215,7 @@ test('does not require a result for a tool call from an errored assistant respon
   const coverage = buildMemoryContextCoverage(undefined, [observation('score-1', provenance)], 'pi-session');
   const plan = planMemoryContextReplacement([user1, call1, result1, answer1, user2, errored], currentBranch, 'memory', coverage, undefined, { recentTurnCount: 1 });
   assert.equal(plan.safe, true);
-  assert.deepEqual(plan.messages.slice(1), [...oldTextHistory, user2, errored]);
+  assert.deepEqual(plan.messages.slice(1), [user2, errored]);
 });
 
 test('retains a visible pending tool-call turn without disabling replacement', () => {

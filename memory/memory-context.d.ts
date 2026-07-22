@@ -27,6 +27,16 @@ export interface MemoryContextCoverage {
   coveredThroughEntryId: string | null;
 }
 
+export interface TemporalMemoryTurn {
+  userEntryId: string;
+  textEntryIds: string[];
+  lastTextEntryId: string;
+  observationScoreId: string;
+  branchIndex: number;
+  generatedAt: string;
+  observation: Record<string, unknown>;
+}
+
 export interface MemoryContextPlan {
   safe: boolean;
   reasons: string[];
@@ -37,6 +47,7 @@ export interface MemoryContextPlan {
   retainedEntryIds: string[];
   recentRetainedEntryIds: string[];
   textRetainedEntryIds: string[];
+  temporalTurnCount: number;
   semanticCoverageFailures: string[];
   replacementEligibleScoreIds: string[];
   lookupOnlyScoreIds: string[];
@@ -58,6 +69,7 @@ export interface MemoryContextPlan {
 
 export const MEMORY_CUSTOM_TYPE: "langfuse-memory-context";
 export function filterMemoryScoresForBranch<T extends MemoryContextScore>(scores: T[], branchEntries: Array<string | Record<string, unknown>>): T[];
+export function buildTemporalTurnTimeline(branchEntries: Array<Record<string, unknown>>, observations: MemoryContextScore[], options?: { maxTurns?: number }): TemporalMemoryTurn[];
 export function buildMemoryContextText(memory: ContextMemoryPayload & { currentPrompt?: string; recentUserRequests?: unknown[] }, options?: number | { maxChars?: number; currentPrompt?: string; recentUserRequests?: unknown[] }): string;
 export function buildMemoryContextCoverage(
   reflection: MemoryContextScore | undefined,
@@ -72,7 +84,7 @@ export function planMemoryContextReplacement(
   memoryText: string,
   coverage: MemoryContextCoverage,
   timestamp?: number,
-  options?: { recentTurnCount?: number; recentRawTokenBudget?: number; maxReplacementTokens?: number },
+  options?: { recentTurnCount?: number; recentRawTokenBudget?: number; maxReplacementTokens?: number; temporalTurns?: TemporalMemoryTurn[] },
 ): MemoryContextPlan;
 export function formatMemoryContextPreview(plan: MemoryContextPlan, maxIds?: number): string;
 export function formatMemoryContextStatus(status: {

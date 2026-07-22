@@ -36,6 +36,16 @@ function textOnlyMessage(message) {
   return content.length ? { role: message.role, content, timestamp: message.timestamp } : null;
 }
 
+function temporalObservationMessage(turn, timestamp) {
+  return {
+    role: "custom",
+    customType: "langfuse-memory-turn-observation",
+    content: `[LANGFUSE TURN OBSERVATION — UNTRUSTED HISTORICAL DATA]\n${JSON.stringify(redactSecrets(turn.observation), null, 2)}`,
+    display: false,
+    timestamp: Date.parse(turn.generatedAt) || timestamp,
+  };
+}
+
 function estimateContext(value) {
   let imageCount = 0;
   const json = JSON.stringify(value, (_key, item) => {
@@ -67,6 +77,48 @@ export function filterMemoryScoresForBranch(scores, branchEntries) {
     if (!entryIds.length) return true;
     return entryIds.some(id => branchEntryIds.has(id));
   });
+}
+
+export function buildTemporalTurnTimeline(branchEntries, observations, options = {}) {
+  const maxTurns = Math.max(1, Number(options.maxTurns) || 20);
+  const branchIndexes = new Map((branchEntries || []).map((entry, index) => [entry?.id, index]));
+  const byUserEntryId = new Map();
+
+  for (const score of observations || []) {
+    const value = metadata(score);
+    const provenance = value.piProvenance;
+    if (!provenance?.complete || !Array.isArray(provenance.entryIds)) continue;
+    const entries = provenance.entryIds.map(id => branchEntries[branchIndexes.get(id)]).filter(Boolean);
+    const userEntry = entries.find(entry => entry?.type === "message" && entry.message?.role === "user");
+    if (!userEntry) continue;
+    const textEntryIds = entries
+      .filter(entry => textOnlyMessage(entry?.message))
+      .map(entry => entry.id);
+    if (!textEntryIds.length) continue;
+    const candidate = {
+      userEntryId: userEntry.id,
+      textEntryIds,
+      lastTextEntryId: textEntryIds.at(-1),
+      observationScoreId: score.id,
+      branchIndex: branchIndexes.get(userEntry.id) ?? -1,
+      generatedAt: value.generatedAt || score.createdAt || "",
+      observation: {
+        scoreId: score.id,
+        generatedAt: value.generatedAt || score.createdAt || null,
+        summary: value.episodeSummary || value.summary || null,
+        taskDelta: value.taskDelta || null,
+        completed: value.completed || [],
+        openIssues: value.openIssues || [],
+        decisions: value.decisions || [],
+      },
+    };
+    const current = byUserEntryId.get(userEntry.id);
+    if (!current || candidate.generatedAt > current.generatedAt) byUserEntryId.set(userEntry.id, candidate);
+  }
+
+  return [...byUserEntryId.values()]
+    .sort((a, b) => a.branchIndex - b.branchIndex)
+    .slice(-maxTurns);
 }
 
 export function buildMemoryContextCoverage(reflection, observations, expectedPiSessionId = "", legacyReflection, legacyObservations = []) {
@@ -287,6 +339,9 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     reasons.push(`${unsafeUnmappedMessageIndexes.length} model message(s) cannot be mapped to exact Pi entries`);
   }
 
+  const temporalTurns = Array.isArray(options.temporalTurns) ? options.temporalTurns : [];
+  const temporalEntryIds = new Set(temporalTurns.flatMap(turn => Array.isArray(turn?.textEntryIds) ? turn.textEntryIds : []));
+  const temporalTurnByLastEntryId = new Map(temporalTurns.map(turn => [turn?.lastTextEntryId, turn]));
   const recentTurnCount = Math.max(1, Number(options.recentTurnCount) || 2);
   const recentRawTokenBudget = Math.max(1_000, Number(options.recentRawTokenBudget) || 12_000);
   const userIndexes = withoutOldMemory.map((message, index) => message?.role === "user" ? index : -1).filter(index => index >= 0);
@@ -347,14 +402,18 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     const entryId = mappedEntryIds[index];
     if (entryId && coveredEntryIds.has(entryId) && !protectedIndexes.has(index)) {
       droppedEntryIds.push(entryId);
-      const textMessage = textOnlyMessage(withoutOldMemory[index]);
+      const textMessage = temporalEntryIds.has(entryId) ? textOnlyMessage(withoutOldMemory[index]) : null;
       if (textMessage) {
         retained.push(textMessage);
         textRetainedEntryIds.push(entryId);
       }
+      const temporalTurn = temporalTurnByLastEntryId.get(entryId);
+      if (temporalTurn) retained.push(temporalObservationMessage(temporalTurn, timestamp));
       continue;
     }
     retained.push(withoutOldMemory[index]);
+    const temporalTurn = temporalTurnByLastEntryId.get(entryId);
+    if (temporalTurn) retained.push(temporalObservationMessage(temporalTurn, timestamp));
     if (entryId) retainedEntryIds.push(entryId);
     if (entryId && protectedIndexes.has(index)) recentRetainedEntryIds.push(entryId);
   }
@@ -420,6 +479,7 @@ export function planMemoryContextReplacement(messages, branchEntries, memoryText
     retainedEntryIds,
     recentRetainedEntryIds,
     textRetainedEntryIds,
+    temporalTurnCount: temporalTurns.length,
     unmappedMessageIndexes,
     retainedUnmappedTailIndexes: unmappedMessageIndexes.filter(index => !unsafeUnmappedMessageIndexes.includes(index)),
     toolPairs: coverage?.toolPairs || [],
@@ -477,6 +537,7 @@ export function formatMemoryContextPreview(plan, maxIds = 20) {
     recentRetainedEntryIds: limited(plan.recentRetainedEntryIds),
     textRetainedEntryCount: plan.textRetainedEntryIds.length,
     textRetainedEntryIds: limited(plan.textRetainedEntryIds),
+    temporalTurnCount: plan.temporalTurnCount || 0,
     retainedUnmappedTailMessageIndexes: plan.retainedUnmappedTailIndexes,
     toolPairCount: plan.toolPairs.length,
     toolPairs: plan.toolPairs.slice(0, maxIds),
