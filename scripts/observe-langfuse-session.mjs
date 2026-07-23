@@ -3,6 +3,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
+import { AuthStorage, ModelRegistry } from '@mariozechner/pi-coding-agent';
+import { completeSimple } from '@mariozechner/pi-ai';
 import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory/memory-prompts.js';
 import { validateMemoryOutput } from '../memory/memory-validation.js';
 import { auditObservationCoverage, auditPiProvenance, auditSemanticCoverage } from '../memory/memory-audit.js';
@@ -30,6 +32,9 @@ const backfill = Boolean(args.backfill);
 const includePreCoverage = Boolean(args['include-pre-coverage']);
 const auditMode = Boolean(args.audit) || backfill;
 const limit = args.limit ? Number(args.limit) : Infinity;
+const piProvider = String(args['pi-provider'] || '');
+const piModelId = String(args['pi-model'] || '');
+const piReasoning = String(args['pi-reasoning'] || 'low');
 
 if (!sessionId) fail('Missing session id');
 
@@ -39,15 +44,23 @@ OBSERVER_ENABLED = process.env.OBSERVER_ENABLED === 'false' || process.env.PI_LA
 OBSERVER_MODEL = process.env.OBSERVER_MODEL || process.env.PI_LANGFUSE_OBSERVER_MODEL || langfuse.observer?.model || '';
 OBSERVER_BASE_URL = process.env.OBSERVER_BASE_URL || process.env.PI_LANGFUSE_OBSERVER_BASE_URL || langfuse.observer?.baseUrl || (OBSERVER_API === 'openai' ? 'https://api.openai.com' : 'https://api.anthropic.com');
 OBSERVER_API_KEY = process.env.OBSERVER_API_KEY || process.env.PI_LANGFUSE_OBSERVER_API_KEY || langfuse.observer?.apiKey || (OBSERVER_API === 'openai' ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || '';
+let piModel;
+let piModelRegistry;
+if (piProvider || piModelId) {
+  if (!piProvider || !piModelId) fail('Pass both --pi-provider and --pi-model.');
+  piModelRegistry = ModelRegistry.create(AuthStorage.create());
+  piModel = piModelRegistry.find(piProvider, piModelId);
+  if (!piModel || !piModelRegistry.hasConfiguredAuth(piModel)) fail(`Pi model unavailable or unauthenticated: ${piProvider}/${piModelId}`);
+}
 if ((!auditMode || backfill) && !OBSERVER_ENABLED) fail('Observer disabled. Set observer.enabled=true or remove observer.enabled=false.');
-if ((!auditMode || backfill) && !OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
-if ((!auditMode || backfill) && !OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
+if ((!auditMode || backfill) && !piModel && !OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
+if ((!auditMode || backfill) && !piModel && !OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
 
 const langfuseAuth = `Basic ${Buffer.from(`${langfuse.publicKey}:${langfuse.secretKey}`).toString('base64')}`;
 
 console.log(`session=${sessionId}`);
-console.log(`observerApi=${OBSERVER_API}`);
-console.log(`model=${OBSERVER_MODEL}`);
+console.log(`observerApi=${piModel?.api || OBSERVER_API}`);
+console.log(`model=${piModel?.provider || ''}/${piModel?.id || OBSERVER_MODEL}`);
 console.log(`dryRun=${dryRun} force=${force} audit=${auditMode} backfill=${backfill} includePreCoverage=${includePreCoverage}`);
 
 let traces = await fetchAllTraces(sessionId);
@@ -280,6 +293,25 @@ async function observeTrace(trace, observations, timeline) {
 }
 
 async function observerComplete(system, user) {
+  if (piModel) {
+    const auth = await piModelRegistry.getApiKeyAndHeaders(piModel);
+    if (!auth.ok) throw new Error(auth.error);
+    const message = await completeSimple(piModel, {
+      systemPrompt: system,
+      messages: [{ role: 'user', content: user, timestamp: Date.now() }],
+    }, {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      maxTokens: 6000,
+      reasoning: piReasoning,
+      timeoutMs: 120000,
+      maxRetries: 1,
+    });
+    if (message.stopReason === 'error' || message.stopReason === 'aborted') throw new Error(message.errorMessage || message.stopReason);
+    const text = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n').trim();
+    if (!text) throw new Error('Pi observer model returned no text');
+    return text;
+  }
   const headers = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
     'Content-Type': 'application/json',
@@ -511,8 +543,10 @@ function buildScoreMetadata(trace, observations, memory, timeline, piProvenance,
     promptVersion: PROMPT_VERSION,
     scope: 'trace',
     source: 'pi-langfuse-memory',
-    observerApi: OBSERVER_API,
-    observerModel: OBSERVER_MODEL,
+    observerApi: piModel?.api || OBSERVER_API,
+    observerModel: piModel?.id || OBSERVER_MODEL,
+    observerFallback: Boolean(piModel),
+    primaryObserverModel: piModel ? OBSERVER_MODEL : null,
     traceId: trace.id,
     sessionId: trace.sessionId || null,
     traceTimestamp: trace.timestamp || null,

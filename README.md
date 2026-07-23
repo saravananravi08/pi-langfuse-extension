@@ -353,12 +353,19 @@ node scripts/reflect-langfuse-session.mjs <session-id> --path /project/cwd --lim
 
 Without `--force`, configured thresholds apply. `--dry-run` may call the reflector but never writes a score.
 
-Both scripts read the same `config.json`. One-off observer aliases are also supported:
+Both scripts read the same `config.json`. One-off observer aliases and authenticated Pi models are supported:
 
 ```bash
 OBSERVER_API=openai OBSERVER_BASE_URL=https://api.openai.com OBSERVER_API_KEY=... OBSERVER_MODEL=... \
   node scripts/observe-langfuse-session.mjs <session-id>
+
+node scripts/observe-langfuse-session.mjs <session-id> --backfill \
+  --pi-provider openai-codex --pi-model gpt-5.4-mini --pi-reasoning low
+node scripts/reflect-langfuse-session.mjs <session-id> --force \
+  --pi-provider openai-codex --pi-model gpt-5.4-mini --pi-reasoning low
 ```
+
+Pi-model mode resolves fresh credentials through Pi's auth storage and never prints or copies OAuth tokens.
 
 ## 🩺 Diagnostics
 

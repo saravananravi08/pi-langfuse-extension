@@ -3,6 +3,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
+import { AuthStorage, ModelRegistry } from '@mariozechner/pi-coding-agent';
+import { completeSimple } from '@mariozechner/pi-ai';
 import {
   REFLECTION_PROMPT_VERSION as PROMPT_VERSION,
   REFLECTION_SYSTEM_PROMPT,
@@ -35,6 +37,9 @@ const sessionId = normalizeSessionId(args.session || args._[0]);
 const dryRun = Boolean(args['dry-run']);
 const force = Boolean(args.force);
 const limit = args.limit ? positiveInteger(args.limit, 0) : Infinity;
+const piProvider = String(args['pi-provider'] || '');
+const piModelId = String(args['pi-model'] || '');
+const piReasoning = String(args['pi-reasoning'] || 'low');
 
 if (!sessionId) fail('Missing session id. Pass --session <id> or a positional session id.');
 
@@ -53,10 +58,18 @@ const minNewObservations = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MI
 const auth = `Basic ${Buffer.from(`${config.publicKey}:${config.secretKey}`).toString('base64')}`;
 let lfRequestQueue = Promise.resolve();
 class MemoryOutputValidationError extends Error {}
+let piModel;
+let piModelRegistry;
+if (piProvider || piModelId) {
+  if (!piProvider || !piModelId) fail('Pass both --pi-provider and --pi-model.');
+  piModelRegistry = ModelRegistry.create(AuthStorage.create());
+  piModel = piModelRegistry.find(piProvider, piModelId);
+  if (!piModel || !piModelRegistry.hasConfiguredAuth(piModel)) fail(`Pi model unavailable or unauthenticated: ${piProvider}/${piModelId}`);
+}
 
 if (!reflectionEnabled) fail('Reflection disabled. Set memory.reflection.enabled=true or PI_LANGFUSE_REFLECTION_ENABLED=true.');
-if (!observerModel) fail('Missing reflector model. Configure observer.model or OBSERVER_MODEL.');
-if (!observerApiKey) fail('Missing reflector API key. Configure observer.apiKey or OBSERVER_API_KEY.');
+if (!piModel && !observerModel) fail('Missing reflector model. Configure observer.model or OBSERVER_MODEL.');
+if (!piModel && !observerApiKey) fail('Missing reflector API key. Configure observer.apiKey or OBSERVER_API_KEY.');
 
 const scoreIds = await fetchScoreIdsForSession(sessionId);
 const [allObservations, allReflections] = await Promise.all([
@@ -270,6 +283,25 @@ function observerEndpoint() {
 }
 
 async function complete(system, user, maxTokens) {
+  if (piModel) {
+    const resolved = await piModelRegistry.getApiKeyAndHeaders(piModel);
+    if (!resolved.ok) throw new Error(resolved.error);
+    const message = await completeSimple(piModel, {
+      systemPrompt: system,
+      messages: [{ role: 'user', content: user, timestamp: Date.now() }],
+    }, {
+      apiKey: resolved.apiKey,
+      headers: resolved.headers,
+      maxTokens,
+      reasoning: piReasoning,
+      timeoutMs: 120000,
+      maxRetries: 1,
+    });
+    if (message.stopReason === 'error' || message.stopReason === 'aborted') throw new Error(message.errorMessage || message.stopReason);
+    const text = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n').trim();
+    if (!text) throw new Error('Pi reflector model returned no text');
+    return text;
+  }
   const headers = { Authorization: `Bearer ${observerApiKey}`, 'Content-Type': 'application/json' };
   if (observerApi === 'anthropic') headers['anthropic-version'] = '2023-06-01';
   const body = observerApi === 'openai'
@@ -428,8 +460,10 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     promptVersion: PROMPT_VERSION,
     scope: 'session',
     source: 'pi-langfuse-memory',
-    reflectorApi: observerApi,
-    reflectorModel: observerModel,
+    reflectorApi: piModel?.api || observerApi,
+    reflectorModel: piModel?.id || observerModel,
+    reflectorFallback: Boolean(piModel),
+    primaryReflectorModel: piModel ? observerModel : null,
     generation,
     sessionId: scope.sessionId,
     cwd: scope.pathKey || null,

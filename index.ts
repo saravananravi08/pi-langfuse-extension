@@ -722,7 +722,6 @@ function configureObserverFallback(ctx: ExtensionContext): void {
       apiKey: auth.apiKey,
       headers: auth.headers,
       maxTokens,
-      temperature,
       reasoning: OBSERVER_FALLBACK_REASONING,
       signal,
       timeoutMs: 120_000,
