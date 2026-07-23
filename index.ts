@@ -18,7 +18,8 @@ import { homedir } from "node:os";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { buildSessionContext, type ExtensionAPI, type SessionEntry } from "@mariozechner/pi-coding-agent";
+import { buildSessionContext, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@mariozechner/pi-coding-agent";
+import { completeSimple, type Api, type Model, type ThinkingLevel } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
 import {
   OBSERVER_PROMPT_VERSION,
@@ -55,12 +56,20 @@ import {
 // Configuration
 // ============================================
 
+interface ObserverFallbackConfig {
+  provider?: string;
+  model?: string;
+  reasoning?: ThinkingLevel;
+  cooldownMs?: number;
+}
+
 interface ObserverConfig {
   enabled?: boolean;
   api?: "anthropic" | "openai";
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+  fallback?: ObserverFallbackConfig;
 }
 
 interface ReflectionConfig {
@@ -97,7 +106,7 @@ function loadConfig(): Config {
         };
       }
     } catch (e) {
-      console.warn("📊 Langfuse: Failed to load config.json", e);
+      console.warn("📊 Langfuse: Invalid config.json; extension disabled.");
     }
   }
 
@@ -132,7 +141,7 @@ function logMemoryError(entry: Record<string, unknown>): void {
     appendMemoryErrorLog(MEMORY_ERROR_LOG_PATH, entry);
   } catch (error) {
     if (!memoryErrorLogWarningShown) {
-      console.warn(`📊 Langfuse: Failed to write memory error log ${MEMORY_ERROR_LOG_PATH}`, error);
+      console.warn("📊 Langfuse: Memory diagnostics unavailable.");
       memoryErrorLogWarningShown = true;
     }
   }
@@ -273,6 +282,19 @@ let memoryContextDisplay: {
 } = {};
 let modelCostTotal = 0;
 let lastMemoryContextErrorAt = 0;
+type LangfuseNoticeLevel = "info" | "warning" | "error";
+const LANGFUSE_NOTICE_STATUS = "langfuse-memory-notice";
+let langfuseUiNotify: ((message: string, level: LangfuseNoticeLevel) => void) | undefined;
+let langfuseNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+const langfuseNoticeTimes = new Map<string, number>();
+
+function notifyLangfuse(message: string, level: LangfuseNoticeLevel = "warning"): void {
+  const now = Date.now();
+  if (now - (langfuseNoticeTimes.get(message) || 0) < 60_000) return;
+  langfuseNoticeTimes.set(message, now);
+  if (langfuseUiNotify) langfuseUiNotify(message, level);
+  else console.warn(`📊 Langfuse: ${message}`);
+}
 const PI_SESSIONS_ROOT = join(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "sessions");
 const MEMORY_CONTEXT_STATUS = "langfuse-memory-context-usage";
 
@@ -345,6 +367,10 @@ const OBSERVER_ENABLED = process.env.PI_LANGFUSE_OBSERVER_ENABLED === "false" ? 
 const OBSERVER_MODEL = process.env.PI_LANGFUSE_OBSERVER_MODEL || config.observer?.model || "";
 const OBSERVER_BASE_URL = process.env.PI_LANGFUSE_OBSERVER_BASE_URL || config.observer?.baseUrl || (OBSERVER_API === "openai" ? "https://api.openai.com" : "https://api.anthropic.com");
 const OBSERVER_API_KEY = process.env.PI_LANGFUSE_OBSERVER_API_KEY || config.observer?.apiKey || (OBSERVER_API === "openai" ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || "";
+const OBSERVER_FALLBACK_PROVIDER = process.env.PI_LANGFUSE_OBSERVER_FALLBACK_PROVIDER || config.observer?.fallback?.provider || "";
+const OBSERVER_FALLBACK_MODEL = process.env.PI_LANGFUSE_OBSERVER_FALLBACK_MODEL || config.observer?.fallback?.model || "";
+const OBSERVER_FALLBACK_REASONING = (process.env.PI_LANGFUSE_OBSERVER_FALLBACK_REASONING || config.observer?.fallback?.reasoning || "low") as ThinkingLevel;
+const OBSERVER_FALLBACK_COOLDOWN_MS = positiveInteger(process.env.PI_LANGFUSE_OBSERVER_FALLBACK_COOLDOWN_MS || config.observer?.fallback?.cooldownMs, 300_000);
 const reflectionConfig = config.memory?.reflection;
 const REFLECTION_ENABLED = process.env.PI_LANGFUSE_REFLECTION_ENABLED
   ? process.env.PI_LANGFUSE_REFLECTION_ENABLED !== "false"
@@ -353,6 +379,18 @@ const REFLECTION_THRESHOLD_TOKENS = positiveInteger(process.env.PI_LANGFUSE_REFL
 const REFLECTION_MIN_NEW_TOKENS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS || reflectionConfig?.minNewObservationTokens, 8_000);
 const REFLECTION_MIN_NEW_OBSERVATIONS = positiveInteger(process.env.PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS || reflectionConfig?.minNewObservations, 5);
 const OBSERVER_REQUEST_MAX_ATTEMPTS = 8;
+const OBSERVER_FALLBACK_PRIMARY_ATTEMPTS = 2;
+
+interface ObserverCompletion {
+  text: string;
+  api: string;
+  model: string;
+  fallback: boolean;
+}
+
+type ObserverFallbackComplete = (system: string, user: string, maxTokens: number, label: string, temperature: number, diagnostics: Record<string, unknown>, signal?: AbortSignal) => Promise<ObserverCompletion>;
+let observerFallbackComplete: ObserverFallbackComplete | undefined;
+let observerPrimaryUnavailableUntil = 0;
 
 interface MemoryScore {
   id: string;
@@ -541,7 +579,7 @@ function buildObservationSteps(messages: ObservedAgentMessage[], existingSteps: 
   return [...steps.values()];
 }
 
-async function observerComplete(
+async function observerPrimaryComplete(
   system: string,
   user: string,
   maxTokens = 4000,
@@ -549,7 +587,8 @@ async function observerComplete(
   temperature = 0.1,
   diagnostics: Record<string, unknown> = {},
   signal?: AbortSignal,
-): Promise<string> {
+  maxAttempts = OBSERVER_REQUEST_MAX_ATTEMPTS,
+): Promise<ObserverCompletion> {
   const headers: Record<string, string> = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
     "Content-Type": "application/json",
@@ -582,7 +621,7 @@ async function observerComplete(
     ...diagnostics,
   };
   let lastError: unknown;
-  for (let attempt = 1; attempt <= OBSERVER_REQUEST_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     signal?.throwIfAborted();
     let response: Response;
     try {
@@ -599,11 +638,10 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "connection",
         attempt,
-        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
+        maxAttempts,
         ...requestErrorDetails(error),
       });
-      if (attempt === OBSERVER_REQUEST_MAX_ATTEMPTS) break;
-      console.warn(`📊 Langfuse: ${label} connection failed; retrying (${attempt}/${OBSERVER_REQUEST_MAX_ATTEMPTS}); details: ${MEMORY_ERROR_LOG_PATH}`);
+      if (attempt === maxAttempts) break;
       await sleep(Math.min(2 ** (attempt - 1), 60) * 1000, signal);
       continue;
     }
@@ -616,14 +654,13 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "http",
         attempt,
-        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
+        maxAttempts,
         status: response.status,
         retryable,
         retryDelayMs,
         responseChars: raw.length,
       });
-      if (retryable && attempt < OBSERVER_REQUEST_MAX_ATTEMPTS) {
-        console.warn(`📊 Langfuse: ${label} model ${response.status}; retrying (${attempt}/${OBSERVER_REQUEST_MAX_ATTEMPTS}); details: ${MEMORY_ERROR_LOG_PATH}`);
+      if (retryable && attempt < maxAttempts) {
         await sleep(retryDelayMs, signal);
         continue;
       }
@@ -638,7 +675,7 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "invalid-response-json",
         attempt,
-        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
+        maxAttempts,
         responseChars: raw.length,
         ...requestErrorDetails(error),
       });
@@ -655,15 +692,106 @@ async function observerComplete(
         ...requestDiagnostics,
         kind: "empty-response",
         attempt,
-        maxAttempts: OBSERVER_REQUEST_MAX_ATTEMPTS,
+        maxAttempts,
         responseChars: raw.length,
       });
       throw new Error(`${label} model returned no text`);
     }
-    return text.trim();
+    return { text: text.trim(), api: OBSERVER_API, model: OBSERVER_MODEL, fallback: false };
   }
 
-  throw new Error(`${label} model connection failed after ${OBSERVER_REQUEST_MAX_ATTEMPTS} attempts`, { cause: lastError });
+  throw new Error(`${label} model connection failed after ${maxAttempts} attempts`, { cause: lastError });
+}
+
+function configureObserverFallback(ctx: ExtensionContext): void {
+  observerFallbackComplete = undefined;
+  observerPrimaryUnavailableUntil = 0;
+  if (!OBSERVER_FALLBACK_PROVIDER || !OBSERVER_FALLBACK_MODEL) return;
+  const model = ctx.modelRegistry.find(OBSERVER_FALLBACK_PROVIDER, OBSERVER_FALLBACK_MODEL) as Model<Api> | undefined;
+  if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+    notifyLangfuse(`Memory fallback unavailable: ${OBSERVER_FALLBACK_PROVIDER}/${OBSERVER_FALLBACK_MODEL}.`);
+    return;
+  }
+  observerFallbackComplete = async (system, user, maxTokens, label, temperature, diagnostics, signal) => {
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth.ok) throw new Error(`${label} fallback authentication failed: ${auth.error}`);
+    const message = await completeSimple(model, {
+      systemPrompt: system,
+      messages: [{ role: "user", content: user, timestamp: Date.now() }],
+    }, {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      maxTokens,
+      temperature,
+      reasoning: OBSERVER_FALLBACK_REASONING,
+      signal,
+      timeoutMs: 120_000,
+      maxRetries: 1,
+      maxRetryDelayMs: 30_000,
+    });
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      throw new Error(`${label} fallback failed: ${message.errorMessage || message.stopReason}`);
+    }
+    const text = message.content.filter(part => part.type === "text").map(part => part.text).join("\n").trim();
+    if (!text) throw new Error(`${label} fallback returned no text`);
+    return { text, api: model.api, model: model.id, fallback: true };
+  };
+}
+
+async function observerComplete(
+  system: string,
+  user: string,
+  maxTokens = 4000,
+  label = "Observer",
+  temperature = 0.1,
+  diagnostics: Record<string, unknown> = {},
+  signal?: AbortSignal,
+): Promise<ObserverCompletion> {
+  const fallback = observerFallbackComplete;
+  if (!fallback || Date.now() >= observerPrimaryUnavailableUntil) {
+    try {
+      const completion = await observerPrimaryComplete(
+        system,
+        user,
+        maxTokens,
+        label,
+        temperature,
+        diagnostics,
+        signal,
+        fallback ? OBSERVER_FALLBACK_PRIMARY_ATTEMPTS : OBSERVER_REQUEST_MAX_ATTEMPTS,
+      );
+      observerPrimaryUnavailableUntil = 0;
+      return completion;
+    } catch (error) {
+      if (isAbortError(error) || !fallback) throw error;
+      observerPrimaryUnavailableUntil = Date.now() + OBSERVER_FALLBACK_COOLDOWN_MS;
+      logMemoryError({
+        stage: `${label.toLowerCase()}-fallback`,
+        kind: "primary-unavailable",
+        primaryModel: OBSERVER_MODEL,
+        fallbackProvider: OBSERVER_FALLBACK_PROVIDER,
+        fallbackModel: OBSERVER_FALLBACK_MODEL,
+        cooldownMs: OBSERVER_FALLBACK_COOLDOWN_MS,
+        ...requestErrorDetails(error),
+        ...diagnostics,
+      });
+      notifyLangfuse(`${label} fallback · ${OBSERVER_FALLBACK_MODEL}`);
+    }
+  }
+  try {
+    return await fallback(system, user, maxTokens, label, temperature, diagnostics, signal);
+  } catch (error) {
+    if (isAbortError(error)) throw error;
+    logMemoryError({
+      stage: `${label.toLowerCase()}-fallback`,
+      kind: "failed",
+      provider: OBSERVER_FALLBACK_PROVIDER,
+      model: OBSERVER_FALLBACK_MODEL,
+      ...requestErrorDetails(error),
+      ...diagnostics,
+    });
+    throw new Error(`${label} fallback failed`, { cause: error });
+  }
 }
 
 function buildTraceTimeline(snapshot: TraceSnapshot) {
@@ -734,14 +862,16 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
 }`;
 
   let parsed: Record<string, unknown> | undefined;
+  let completion: ObserverCompletion | undefined;
   let lastError: unknown;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const text = await observerComplete(OBSERVER_SYSTEM_PROMPT, user, 6000, "Observer", 0.1, {
+    const response = await observerComplete(OBSERVER_SYSTEM_PROMPT, user, 6000, "Observer", 0.1, {
       traceId: snapshot.traceId,
       sessionId: snapshot.sessionId,
       pathKey: snapshot.cwd,
       promptVersion: OBSERVER_PROMPT_VERSION,
     }, signal);
+    const text = response.text;
     let outputShape: Record<string, unknown> | undefined;
     try {
       if (detectDegenerateRepetition(text)) throw new Error("Observer output contains degenerate repetition");
@@ -750,6 +880,7 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
       const validationError = validateMemoryOutput(candidate, "observer");
       if (validationError) throw new Error(`Invalid observer schema: ${validationError}`);
       parsed = candidate;
+      completion = response;
       break;
     } catch (error) {
       lastError = error;
@@ -764,13 +895,12 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
         sessionId: snapshot.sessionId,
         pathKey: snapshot.cwd,
         promptVersion: OBSERVER_PROMPT_VERSION,
-        model: OBSERVER_MODEL,
+        model: response.model,
       });
       if (attempt === 2) throw error;
-      console.warn(`📊 Langfuse: Invalid observer output; retrying once; details: ${MEMORY_ERROR_LOG_PATH}`);
     }
   }
-  if (!parsed) throw lastError;
+  if (!parsed || !completion) throw lastError;
 
   const derivedFiles = deriveFileOperations(snapshot.steps);
   const filesRead = unique([...derivedFiles.filesRead, ...arrayOfStrings(parsed.filesRead)]);
@@ -866,8 +996,10 @@ async function generateTraceMemoryObservation(snapshot: TraceSnapshot, signal?: 
       promptVersion: OBSERVER_PROMPT_VERSION,
       scope: "trace",
       source: "pi-langfuse-memory",
-      observerApi: OBSERVER_API,
-      observerModel: OBSERVER_MODEL,
+      observerApi: completion.api,
+      observerModel: completion.model,
+      observerFallback: completion.fallback,
+      primaryObserverModel: OBSERVER_MODEL,
       traceId: snapshot.traceId,
       sessionId: snapshot.sessionId || null,
       traceTimestamp: snapshot.traceTimestamp,
@@ -1103,6 +1235,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
   let parsed: Record<string, unknown> | undefined;
   let renderedMarkdown = "";
   let qualityMetrics: Record<string, unknown> = {};
+  let reflectionCompletion: ObserverCompletion | undefined;
   let compressionAttempt = 0;
   let lastError: unknown;
   let correction = "";
@@ -1110,8 +1243,9 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     compressionAttempt = attempt;
     let responseChars = 0;
     let outputShape: Record<string, unknown> | undefined;
+    let attemptCompletion: ObserverCompletion | undefined;
     try {
-      const text = await observerComplete(
+      const response = await observerComplete(
         REFLECTION_SYSTEM_PROMPT,
         `${user}\n\nCompression guidance: ${compressionGuidance[attempt - 1] || "Use concise, dense language."}${correction}`,
         targetTokens,
@@ -1126,6 +1260,8 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         },
         signal,
       );
+      attemptCompletion = response;
+      const text = response.text;
       responseChars = text.length;
       if (detectDegenerateRepetition(text)) throw new MemoryOutputValidationError("Reflector output contains degenerate repetition");
       let candidate: Record<string, unknown>;
@@ -1175,6 +1311,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
       parsed = canonical;
       renderedMarkdown = markdown;
       qualityMetrics = quality.metrics;
+      reflectionCompletion = response;
       break;
     } catch (error) {
       if (!(error instanceof MemoryOutputValidationError) && !(error instanceof SyntaxError)) throw error;
@@ -1189,19 +1326,17 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
         sessionId: snapshot.sessionId,
         pathKey: snapshot.cwd,
         promptVersion: REFLECTION_PROMPT_VERSION,
-        model: OBSERVER_MODEL,
+        model: attemptCompletion?.model || OBSERVER_MODEL,
         targetTokens,
         activeTokens: memory.activeTokens,
         previousReflectionScoreId: previous?.id || null,
         sourceObservationScoreIds: memory.newObservations.map(score => score.id),
       });
       correction = `\nPrevious output was rejected: ${error instanceof Error ? error.message : error}. Correct that issue in the next output.`;
-      if (attempt < compressionGuidance.length) {
-        console.warn(`📊 Langfuse: Reflection validation failed; retrying compression (${attempt}/${compressionGuidance.length}); details: ${MEMORY_ERROR_LOG_PATH}`);
-      }
+
     }
   }
-  if (!parsed) throw lastError;
+  if (!parsed || !reflectionCompletion) throw lastError;
   const generation = memory.nextGeneration || Number(previous?.metadata?.generation || 0) + 1;
   const sourceObservationScoreIds = memory.newObservations.map(score => score.id);
   const sourceTraceIds = unique(memory.newObservations.map(score => score.traceId || metadataString(score, "traceId")));
@@ -1217,8 +1352,10 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
     promptVersion: REFLECTION_PROMPT_VERSION,
     scope: "session",
     source: "pi-langfuse-memory",
-    reflectorApi: OBSERVER_API,
-    reflectorModel: OBSERVER_MODEL,
+    reflectorApi: reflectionCompletion.api,
+    reflectorModel: reflectionCompletion.model,
+    reflectorFallback: reflectionCompletion.fallback,
+    primaryReflectorModel: OBSERVER_MODEL,
     generation,
     sessionId: snapshot.sessionId,
     cwd: snapshot.cwd || null,
@@ -1334,7 +1471,12 @@ function enqueueTraceMemoryObservation(snapshot: TraceSnapshot, signal: AbortSig
       sessionId: snapshot.sessionId,
       pathKey: snapshot.cwd,
     });
-    console.warn(`📊 Langfuse: Failed to update observational memory; details: ${MEMORY_ERROR_LOG_PATH}`, e);
+    const message = errorMessage(e);
+    notifyLangfuse(/reflect/i.test(message)
+      ? "Reflection failed · previous checkpoint retained"
+      : /observer|fallback/i.test(message)
+        ? "Observer unavailable · trace preserved"
+        : "Memory update failed · session preserved");
   }).finally(() => {
     if (memoryQueues.get(key) === task) memoryQueues.delete(key);
   });
@@ -1758,6 +1900,13 @@ export default async function (pi: ExtensionAPI) {
     }
     // Reset state for new session
     resetSessionState();
+    langfuseNoticeTimes.clear();
+    langfuseUiNotify = message => {
+      ctx.ui.setStatus(LANGFUSE_NOTICE_STATUS, `Memory: ${message}`);
+      if (langfuseNoticeTimer) clearTimeout(langfuseNoticeTimer);
+      langfuseNoticeTimer = setTimeout(() => ctx.ui.setStatus(LANGFUSE_NOTICE_STATUS, undefined), 10_000);
+    };
+    configureObserverFallback(ctx);
     modelCostTotal = (ctx.sessionManager.getEntries() as Array<{ type?: string; message?: { role?: string; usage?: { cost?: { total?: number } } } }>).reduce((total, entry) => {
       const cost = entry.type === "message" && entry.message?.role === "assistant" ? entry.message.usage?.cost?.total : 0;
       return total + (Number.isFinite(cost) ? Number(cost) : 0);
@@ -1822,7 +1971,7 @@ export default async function (pi: ExtensionAPI) {
           sessionId: currentSessionId,
           pathKey: ctx.cwd,
         });
-        console.warn(`📊 Langfuse: Memory context replacement disabled; details: ${MEMORY_ERROR_LOG_PATH}`, error);
+        notifyLangfuse("Context replacement disabled · full context retained");
         lastMemoryContextErrorAt = Date.now();
       }
       return;
@@ -1876,7 +2025,7 @@ export default async function (pi: ExtensionAPI) {
         sessionId: currentSessionId || undefined
       });
     } catch (e) {
-      console.warn("📊 Langfuse: Failed to create trace", e);
+      notifyLangfuse("Trace export failed");
     }
   });
 
@@ -1927,7 +2076,7 @@ export default async function (pi: ExtensionAPI) {
         lf.score({ name: "tool_success_rate", value: scores.tool_success_rate, traceId: currentTrace.id });
         lf.score({ name: "session_had_errors", value: scores.session_had_errors, traceId: currentTrace.id });
       } catch (e) {
-        console.warn("📊 Langfuse: Failed to send evaluation scores", e);
+        notifyLangfuse("Evaluation export failed");
       }
 
       const piBranch = ctx.sessionManager.getBranch() as unknown as Array<Record<string, unknown>>;
@@ -1944,7 +2093,7 @@ export default async function (pi: ExtensionAPI) {
           startEntryId: piTraceStartEntryId || null,
           branchLeafEntryId: ctx.sessionManager.getLeafId() || null,
         });
-        console.warn(`📊 Langfuse: Pi provenance incomplete; details: ${MEMORY_ERROR_LOG_PATH}`);
+        notifyLangfuse("Memory provenance incomplete · replacement blocked");
       }
       const memorySnapshot: TraceSnapshot = {
         traceId: currentTrace.id,
@@ -2014,7 +2163,7 @@ export default async function (pi: ExtensionAPI) {
         metadata: { tool: event.toolName },
       });
     } catch (e) {
-      console.warn("📊 Langfuse: Failed to create span", e);
+      notifyLangfuse("Tool span export failed");
     }
   });
 
@@ -2061,7 +2210,7 @@ export default async function (pi: ExtensionAPI) {
             traceId: currentTrace?.id 
           });
         } catch (e) {
-          console.warn("📊 Langfuse: Failed to send tool error score", e);
+          notifyLangfuse("Tool score export failed");
         }
       }
       
@@ -2173,7 +2322,7 @@ export default async function (pi: ExtensionAPI) {
           },
         });
       } catch (e) {
-        console.warn("📊 Langfuse: Failed to create generation", e);
+        notifyLangfuse("Generation export failed");
       }
       
       // NOTE: We no longer send token counts or cost as scores
@@ -2186,6 +2335,10 @@ export default async function (pi: ExtensionAPI) {
     memoryLifecycleController.abort(new DOMException("Pi session shut down", "AbortError"));
     memoryContextEnabled = false;
     resetMemoryContextWidget(ctx.ui);
+    ctx.ui.setStatus(LANGFUSE_NOTICE_STATUS, undefined);
+    if (langfuseNoticeTimer) clearTimeout(langfuseNoticeTimer);
+    langfuseNoticeTimer = undefined;
+    langfuseUiNotify = undefined;
     if (currentTrace) {
       if (currentTrace.update) {
         currentTrace.update({ metadata: { completed: true } });

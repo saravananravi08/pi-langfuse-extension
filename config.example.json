@@ -7,7 +7,13 @@
     "api": "anthropic",
     "baseUrl": "https://api.example.com/anthropic",
     "apiKey": "YOUR-OBSERVER-API-KEY",
-    "model": "your-observer-model"
+    "model": "your-observer-model",
+    "fallback": {
+      "provider": "openai-codex",
+      "model": "gpt-5.4-mini",
+      "reasoning": "low",
+      "cooldownMs": 300000
+    }
   },
   "memory": {
     "reflection": {

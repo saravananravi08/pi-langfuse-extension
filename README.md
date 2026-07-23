@@ -117,7 +117,13 @@ Copy [`config.example.json`](./config.example.json) to `config.json` in the inst
     "api": "anthropic",
     "baseUrl": "https://api.example.com/anthropic",
     "apiKey": "YOUR_OBSERVER_API_KEY",
-    "model": "YOUR_OBSERVER_MODEL"
+    "model": "YOUR_OBSERVER_MODEL",
+    "fallback": {
+      "provider": "openai-codex",
+      "model": "gpt-5.4-mini",
+      "reasoning": "low",
+      "cooldownMs": 300000
+    }
   },
   "memory": {
     "reflection": {
@@ -147,7 +153,9 @@ git, project: <project>/.pi/git/github.com/saravananravi08/pi-langfuse-extension
 
 `config.json` is gitignored and must never be committed.
 
-The observer supports Anthropic-compatible and OpenAI-compatible endpoints. Example OpenAI-compatible configuration:
+The observer supports Anthropic-compatible and OpenAI-compatible endpoints. Optional fallback models are resolved through Pi's model registry and existing auth; OAuth tokens are never copied into extension config. After two primary failures, memory generation uses the fallback directly for `cooldownMs`. Background retry details stay in the private JSONL log; the TUI shows only a temporary concise footer status.
+
+Example OpenAI-compatible configuration:
 
 ```json
 {
@@ -241,6 +249,10 @@ Tracing requires `publicKey`, `secretKey`, and `host`. Memory generation additio
 | `observer.baseUrl` | Provider default | Observer/reflector API base URL. |
 | `observer.apiKey` | Provider environment key | Observer/reflector API credential. |
 | `observer.model` | none | Observer and reflector model ID. |
+| `observer.fallback.provider` | none | Pi model-registry provider used after primary failure. |
+| `observer.fallback.model` | none | Authenticated Pi fallback model ID. |
+| `observer.fallback.reasoning` | `low` | Fallback reasoning level. |
+| `observer.fallback.cooldownMs` | `300000` | Time to bypass unhealthy primary after two failures. |
 | `memory.reflection.enabled` | `false` | Enable automatic session reflection. |
 | `memory.reflection.thresholdTokens` | `20000` | Minimum active structured-memory size. |
 | `memory.reflection.minNewObservationTokens` | `8000` | Minimum uncovered observation size. |
@@ -256,6 +268,10 @@ PI_LANGFUSE_OBSERVER_API=anthropic
 PI_LANGFUSE_OBSERVER_BASE_URL=https://api.example.com/anthropic
 PI_LANGFUSE_OBSERVER_API_KEY=...
 PI_LANGFUSE_OBSERVER_MODEL=...
+PI_LANGFUSE_OBSERVER_FALLBACK_PROVIDER=openai-codex
+PI_LANGFUSE_OBSERVER_FALLBACK_MODEL=gpt-5.4-mini
+PI_LANGFUSE_OBSERVER_FALLBACK_REASONING=low
+PI_LANGFUSE_OBSERVER_FALLBACK_COOLDOWN_MS=300000
 PI_LANGFUSE_REFLECTION_ENABLED=true
 PI_LANGFUSE_REFLECTION_THRESHOLD_TOKENS=20000
 PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS=8000
