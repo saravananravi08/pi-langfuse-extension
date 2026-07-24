@@ -310,7 +310,7 @@ Session score: memory_session_reflection
 └─ aggregated Pi entry ranges and tool pairs
 ```
 
-Active memory is scoped by Langfuse session ID and cwd/path key. Remote reads are cached for five minutes, updated immediately after local writes, and refreshed before reflection creation.
+Active memory is scoped by Langfuse session ID and cwd/path key. A persistent context mirror is stored at `~/.pi/agent/cache/langfuse-memory/<path-hash>/<session-id>.json`. Resume loads this validated local snapshot first, then refreshes Langfuse asynchronously. Files are atomically replaced with `0600` permissions and are rejected when host, project-key hash, session, path, schema, or score scope differs. Langfuse remains canonical; explicit refreshes and source lookups still use Langfuse.
 
 ## 🧰 Audit, Backfill, and Reflection Scripts
 

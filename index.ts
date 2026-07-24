@@ -31,6 +31,7 @@ import {
 } from "./memory/memory-prompts.js";
 import { validateMemoryOutput } from "./memory/memory-validation.js";
 import { createMemoryCache } from "./memory/memory-cache.js";
+import { createMemoryDiskCache } from "./memory/memory-disk-cache.js";
 import { evaluateReflectionQuality, normalizeReflectionTaskStatus, renderReflectionMarkdown } from "./memory/memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
 import { buildMemoryContextCoverage, buildMemoryContextText, buildTemporalTurnTimeline, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
@@ -268,8 +269,14 @@ let memoryCheckpointStepOffset = 0;
 let memoryCheckpointLastEntryId = "";
 const memoryQueues = new Map<string, Promise<void>>();
 const sessionMemoryCache = createMemoryCache(300_000);
+const memoryDiskCache = createMemoryDiskCache({
+  rootDir: resolve(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "cache", "langfuse-memory"),
+  host: config.host,
+  projectKey: config.publicKey,
+});
 let lookupScoresCache: { scores: MemoryScore[]; loadedAt: number } | undefined;
 const contextScoresCache = new Map<string, { scores: MemoryScore[]; loadedAt: number }>();
+const contextScoreRefreshes = new Map<string, Promise<MemoryScore[]>>();
 const lookupTraceCache = new Map<string, { value: Record<string, unknown>; loadedAt: number }>();
 let memoryContextEnabled = false;
 let memoryContextDisplay: {
@@ -1415,6 +1422,7 @@ Target rendered checkpoint size: at most ${targetTokens} estimated tokens.`;
 
   await writeMemoryScore(score, signal);
   sessionMemoryCache.setReflection(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
+  await persistMemoryScores(snapshot, [score]);
 }
 
 async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObservation: MemoryScore, signal?: AbortSignal): Promise<void> {
@@ -1435,6 +1443,19 @@ async function maybeWriteSessionReflection(snapshot: TraceSnapshot, currentObser
   await writeSessionReflection(snapshot, memory, signal);
 }
 
+async function persistMemoryScores(snapshot: TraceSnapshot, scores: MemoryScore[]): Promise<void> {
+  try {
+    await memoryDiskCache.merge({
+      sessionId: snapshot.sessionId,
+      piSessionId: snapshot.piProvenance?.piSessionId || undefined,
+      pathKey: snapshot.cwd,
+      branchLeafEntryId: snapshot.piBranchEntryIds.at(-1),
+    }, scores);
+  } catch (error) {
+    logMemoryError({ stage: "memory-disk-cache-write", error: errorMessage(error), sessionId: snapshot.sessionId, pathKey: snapshot.cwd });
+  }
+}
+
 async function writeMemoryScore(score: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
   await langfuseRequest("/api/public/scores", {
     method: "POST",
@@ -1452,6 +1473,7 @@ async function writeTraceMemoryObservation(snapshot: TraceSnapshot, signal?: Abo
   if (!score) return;
   await writeMemoryScore(score, signal);
   sessionMemoryCache.addObservation(memoryScopeKey(snapshot.sessionId, snapshot.cwd), score);
+  await persistMemoryScores(snapshot, [score]);
   if (!snapshot.interrupted && snapshot.segmentKind !== "checkpoint") await maybeWriteSessionReflection(snapshot, score, signal);
 }
 
@@ -1492,11 +1514,7 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
   return scores;
 }
 
-async function getContextScores(sessionId: string, pathKey: string, branch: Array<Record<string, unknown>>, refresh: boolean, signal?: AbortSignal): Promise<MemoryScore[]> {
-  const cacheKey = `${sessionId}:${pathKey}:${String(branch.at(-1)?.id || "")}`;
-  const cached = contextScoresCache.get(cacheKey);
-  if (!refresh && cached && Date.now() - cached.loadedAt < 300_000) return cached.scores;
-
+async function fetchContextScores(sessionId: string, pathKey: string, branch: Array<Record<string, unknown>>, cacheKey: string, signal?: AbortSignal): Promise<MemoryScore[]> {
   const params = new URLSearchParams({
     name: REFLECTION_SCORE_NAME,
     dataType: "CATEGORICAL",
@@ -1531,7 +1549,43 @@ async function getContextScores(sessionId: string, pathKey: string, branch: Arra
   const scores = [v2Reflection, legacyReflection, ...observations]
     .filter((score): score is MemoryScore => Boolean(score));
   contextScoresCache.set(cacheKey, { scores, loadedAt: Date.now() });
+  try {
+    await memoryDiskCache.save({
+      sessionId,
+      piSessionId: sessionId === currentSessionId ? currentPiSessionId : undefined,
+      pathKey,
+      branchLeafEntryId: String(branch.at(-1)?.id || ""),
+    }, scores);
+  } catch (error) {
+    logMemoryError({ stage: "memory-disk-cache-write", error: errorMessage(error), sessionId, pathKey });
+  }
   return scores;
+}
+
+function refreshContextScores(sessionId: string, pathKey: string, branch: Array<Record<string, unknown>>, cacheKey: string, signal?: AbortSignal): Promise<MemoryScore[]> {
+  const existing = contextScoreRefreshes.get(cacheKey);
+  if (existing) return existing;
+  const refresh = fetchContextScores(sessionId, pathKey, branch, cacheKey, signal)
+    .finally(() => contextScoreRefreshes.delete(cacheKey));
+  contextScoreRefreshes.set(cacheKey, refresh);
+  return refresh;
+}
+
+async function getContextScores(sessionId: string, pathKey: string, branch: Array<Record<string, unknown>>, refresh: boolean, signal?: AbortSignal): Promise<MemoryScore[]> {
+  const cacheKey = `${sessionId}:${pathKey}:${String(branch.at(-1)?.id || "")}`;
+  const cached = contextScoresCache.get(cacheKey);
+  if (!refresh && cached && Date.now() - cached.loadedAt < 300_000) return cached.scores;
+  if (refresh) return refreshContextScores(sessionId, pathKey, branch, cacheKey, signal);
+
+  const local = await memoryDiskCache.load({ sessionId, pathKey });
+  if (local?.scores.length && filterMemoryScoresForBranch(local.scores, branch).length) {
+    contextScoresCache.set(cacheKey, { scores: local.scores, loadedAt: Date.now() });
+    void refreshContextScores(sessionId, pathKey, branch, cacheKey, memoryLifecycleController.signal).catch(error => {
+      if (!isAbortError(error)) logMemoryError({ stage: "memory-disk-cache-refresh", error: errorMessage(error), sessionId, pathKey });
+    });
+    return local.scores;
+  }
+  return refreshContextScores(sessionId, pathKey, branch, cacheKey, signal);
 }
 
 function buildContextMemoryState(scores: MemoryScore[], sessionId: string, pathKey: string, piSessionId: string, branch: Array<Record<string, unknown>>, currentPrompt = "") {
