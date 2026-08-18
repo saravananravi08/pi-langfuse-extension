@@ -10,6 +10,7 @@ import { validateMemoryOutput } from '../memory/memory-validation.js';
 import { auditObservationCoverage, auditPiProvenance, auditSemanticCoverage } from '../memory/memory-audit.js';
 import { buildPiTraceProvenance } from '../memory/memory-provenance.js';
 import { findPiSessionFile } from '../memory/memory-pi-entries.js';
+import { normalizeObservationV2, normalizeScoreV3, sessionObservationBounds, traceFromRootObservation } from '../memory/langfuse-v4-api.js';
 import { buildSemanticCoverage, detectExplicitCorrection, normalizeDurableItem, prepareMetadataReplacement, reduceDurableItems, sanitizeDurableItemSources, textSupportsClaim, validateDurableItemAuthority } from '../memory/memory-quality.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
@@ -65,11 +66,11 @@ console.log(`dryRun=${dryRun} force=${force} audit=${auditMode} backfill=${backf
 
 let traces = await fetchAllTraces(sessionId);
 if (args.trace) traces = traces.filter(trace => trace.id === String(args.trace));
+const traceIds = new Set(traces.map(trace => trace.id));
+const observationScores = (await fetchScoresByName(SCORE_NAME, [...traceIds])).filter(score => traceIds.has(score.traceId || score.metadata?.traceId));
 console.log(`traces=${traces.length}`);
 
 if (auditMode) {
-  const traceIds = new Set(traces.map(trace => trace.id));
-  const observationScores = (await fetchScoresByName(SCORE_NAME)).filter(score => traceIds.has(score.traceId || score.metadata?.traceId));
   const currentObservationScores = observationScores.filter(score => score.metadata?.version === VERSION);
   const audit = auditObservationCoverage(traces, observationScores, {
     scoreName: SCORE_NAME,
@@ -92,8 +93,8 @@ let failed = 0;
 
 for (const trace of traces.slice(0, limit)) {
   try {
-    const fullTrace = await lfGet(`/api/public/traces/${encodeURIComponent(trace.id)}`);
-    const existing = fullTrace.scores?.find(s => s.name === SCORE_NAME && s.metadata?.version === VERSION);
+    const fullTrace = trace;
+    const existing = observationScores.find(score => (score.traceId || score.metadata?.traceId) === trace.id && score.metadata?.version === VERSION);
     if (existing && !force) {
       skipped++;
       console.log(`skip existing ${trace.timestamp} ${trace.id}`);
@@ -164,39 +165,65 @@ function observerEndpoint() {
 }
 
 async function fetchAllTraces(sessionId) {
-  const all = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ sessionId, page: String(page), limit: '100', orderBy: 'timestamp.asc', fields: 'core,io,scores,metrics' });
-    const res = await lfGet(`/api/public/traces?${params}`);
-    all.push(...(res.data || []));
-    if (!res.meta || page >= res.meta.totalPages) break;
-  }
-  return all.filter(t => t.name !== 'memory:session-state');
+  const roots = [];
+  let cursor = '';
+  const bounds = sessionObservationBounds(sessionId);
+  do {
+    const params = new URLSearchParams({
+      ...bounds,
+      limit: '1000',
+      fields: 'core,basic,time,io,metadata,metrics,trace_context',
+      filter: JSON.stringify([
+        { type: 'string', column: 'sessionId', operator: '=', value: sessionId },
+        { type: 'boolean', column: 'isRootObservation', operator: '=', value: true },
+      ]),
+    });
+    if (cursor) params.set('cursor', cursor);
+    const response = await lfGet(`/api/public/v2/observations?${params}`);
+    roots.push(...(response.data || []).map(normalizeObservationV2));
+    cursor = response.meta?.cursor || '';
+  } while (cursor);
+  return roots.map(traceFromRootObservation)
+    .filter(trace => trace.name !== 'memory:session-state')
+    .sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
 }
 
-async function fetchScoresByName(name) {
+async function fetchScoresByName(name, traceIds) {
+  if (!traceIds.length) return [];
   const scores = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ name, dataType: 'CATEGORICAL', page: String(page), limit: '100' });
-    const response = await lfGet(`/api/public/v2/scores?${params}`);
-    scores.push(...(response.data || []));
-    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
+  for (let offset = 0; offset < traceIds.length; offset += 50) {
+    let cursor = '';
+    do {
+      const params = new URLSearchParams({
+        name,
+        dataType: 'CATEGORICAL',
+        traceId: traceIds.slice(offset, offset + 50).join(','),
+        limit: '100',
+        fields: 'details,subject',
+      });
+      if (cursor) params.set('cursor', cursor);
+      const response = await lfGet(`/api/public/v3/scores?${params}`);
+      scores.push(...(response.data || []).map(normalizeScoreV3));
+      cursor = response.meta?.cursor || '';
+    } while (cursor);
   }
   return scores;
 }
 
 async function fetchAllObservations(traceId) {
   const all = [];
+  const bounds = sessionObservationBounds(sessionId);
   let cursor;
   do {
     const params = new URLSearchParams({
       traceId,
+      ...bounds,
       limit: '1000',
       fields: 'core,basic,time,io,metadata,model,usage',
     });
     if (cursor) params.set('cursor', cursor);
     const res = await lfGet(`/api/public/v2/observations?${params}`);
-    all.push(...(res.data || []));
+    all.push(...(res.data || []).map(normalizeObservationV2));
     cursor = res.meta?.cursor;
   } while (cursor);
   return all.sort((a, b) => String(a.startTime || '').localeCompare(String(b.startTime || '')));

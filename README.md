@@ -99,9 +99,11 @@ Pi packages execute with full system access. Review third-party package source b
 
 ## 🚀 Quick Start
 
+Requires Node.js 20+ and Langfuse Cloud or a self-hosted Langfuse v4 server. Tracing uses the GA JS/TS SDK v5 OpenTelemetry path; memory reads use Observations API v2 and Scores API v3.
+
 ### 1. Create Langfuse keys
 
-Create project API keys in [Langfuse Cloud](https://cloud.langfuse.com) or your self-hosted Langfuse instance.
+Create project API keys in [Langfuse Cloud](https://cloud.langfuse.com) or your self-hosted Langfuse v4 instance.
 
 ### 2. Create `config.json`
 
@@ -284,15 +286,16 @@ Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.
 ## 🗃️ Langfuse Data Model
 
 ```text
-Trace: pi-agent
-├─ sessionId: Pi session ID
-├─ input/output: user and assistant messages
-├─ metadata: model, provider, cwd
-├─ Generation: llm-response
+Logical trace: pi-agent
+├─ Root observation: pi-agent
+│  ├─ sessionId: Pi session ID
+│  ├─ input/output: user and assistant messages
+│  └─ metadata: model, provider, cwd, completion state
+├─ Generation observation: llm-response
 │  ├─ model and provider
 │  ├─ input/output tokens
 │  └─ input/output/total cost
-├─ Span: tool:<name>
+├─ Tool observation: tool:<name>
 │  ├─ arguments and result
 │  └─ error state
 └─ Score: memory_trace_observation
@@ -309,6 +312,8 @@ Session score: memory_session_reflection
 ├─ source trace IDs
 └─ aggregated Pi entry ranges and tool pairs
 ```
+
+Trace name, session ID, cwd, model, and provider are propagated to every child observation. Overall user input and final assistant output live on the root observation; deprecated trace-level input/output is not emitted. `LANGFUSE_TRACING_ENVIRONMENT` and `LANGFUSE_RELEASE` configure deployment attributes.
 
 Active memory is scoped by Langfuse session ID and cwd/path key. A persistent context mirror is stored at `~/.pi/agent/cache/langfuse-memory/<path-hash>/<session-id>.json`. Resume loads this validated local snapshot first, then refreshes Langfuse asynchronously. Files are atomically replaced with `0600` permissions and are rejected when host, project-key hash, session, path, schema, or score scope differs. Langfuse remains canonical; explicit refreshes and source lookups still use Langfuse.
 
@@ -385,6 +390,7 @@ The file is created with `0600` permissions. Records contain safe request, valid
 - Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
 - Request throttling is coordinated within one Pi process; multiple concurrent Pi processes do not yet share a global rate limiter.
 - Pi auto-compaction behavior is unchanged.
+- Traces are buffered by the OpenTelemetry processor, force-flushed after each completed Pi turn, and shut down gracefully with the Pi session. Process termination that bypasses `session_shutdown` can still lose buffered spans.
 - Imported extension modules may remain cached after `/reload`; use a full restart when testing code changes.
 
 ## 🛠️ Troubleshooting
@@ -435,7 +441,9 @@ Open an issue before large architectural changes. Never commit `config.json`, AP
 
 ## 📚 Dependencies
 
-- [`langfuse`](https://www.npmjs.com/package/langfuse) — Langfuse SDK.
+- [`@langfuse/tracing`](https://www.npmjs.com/package/@langfuse/tracing) — Langfuse JS/TS SDK v5 observation API.
+- [`@langfuse/otel`](https://www.npmjs.com/package/@langfuse/otel) — Langfuse OpenTelemetry span processor.
+- [`@opentelemetry/sdk-node`](https://www.npmjs.com/package/@opentelemetry/sdk-node) — Node.js OpenTelemetry lifecycle.
 - [`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — Pi extension API.
 
 ## 📄 License

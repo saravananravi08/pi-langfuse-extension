@@ -17,6 +17,7 @@ import { alignDurableItems, reduceDurableItems } from '../memory/memory-quality.
 import { aggregatePiReflectionProvenance } from '../memory/memory-provenance.js';
 import { findPiSessionFile } from '../memory/memory-pi-entries.js';
 import { filterMemoryScoresForBranch } from '../memory/memory-context.js';
+import { normalizeScoreV3, sessionObservationBounds } from '../memory/langfuse-v4-api.js';
 import {
   estimateTokens,
   generatedAt,
@@ -71,10 +72,10 @@ if (!reflectionEnabled) fail('Reflection disabled. Set memory.reflection.enabled
 if (!piModel && !observerModel) fail('Missing reflector model. Configure observer.model or OBSERVER_MODEL.');
 if (!piModel && !observerApiKey) fail('Missing reflector API key. Configure observer.apiKey or OBSERVER_API_KEY.');
 
-const scoreIds = await fetchScoreIdsForSession(sessionId);
+const traceIds = await fetchTraceIdsForSession(sessionId);
 const [allObservations, allReflections] = await Promise.all([
-  fetchScoresByIds(scoreIds, OBSERVATION_SCORE_NAME),
-  fetchScoresByName(REFLECTION_SCORE_NAME),
+  fetchScoresByName(OBSERVATION_SCORE_NAME, traceIds),
+  fetchScoresByName(REFLECTION_SCORE_NAME, traceIds),
 ]);
 const sessionObservations = allObservations
   .filter(score => metadataString(score, 'version') === VERSION
@@ -194,34 +195,45 @@ function loadConfig() {
   return { ...value, host: value.host || 'https://cloud.langfuse.com' };
 }
 
-async function fetchScoreIdsForSession(id) {
-  const ids = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ sessionId: id, page: String(page), limit: '100', fields: 'core,scores' });
-    const response = await lfGet(`/api/public/traces?${params}`);
-    for (const trace of response.data || []) ids.push(...(trace.scores || []));
-    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
-  }
-  return unique(ids);
+async function fetchTraceIdsForSession(id) {
+  const traceIds = [];
+  const bounds = sessionObservationBounds(id);
+  let cursor = '';
+  do {
+    const params = new URLSearchParams({
+      ...bounds,
+      limit: '1000',
+      fields: 'core',
+      filter: JSON.stringify([
+        { type: 'string', column: 'sessionId', operator: '=', value: id },
+        { type: 'boolean', column: 'isRootObservation', operator: '=', value: true },
+      ]),
+    });
+    if (cursor) params.set('cursor', cursor);
+    const response = await lfGet(`/api/public/v2/observations?${params}`);
+    traceIds.push(...(response.data || []).map(observation => observation.traceId).filter(Boolean));
+    cursor = response.meta?.cursor || '';
+  } while (cursor);
+  return unique(traceIds);
 }
 
-async function fetchScoresByIds(ids, name) {
+async function fetchScoresByName(name, traceIds) {
   const scores = [];
-  for (let offset = 0; offset < ids.length; offset += 50) {
-    const params = new URLSearchParams({ name, dataType: 'CATEGORICAL', limit: '100', scoreIds: ids.slice(offset, offset + 50).join(',') });
-    const response = await lfGet(`/api/public/v2/scores?${params}`);
-    scores.push(...(response.data || []));
-  }
-  return scores;
-}
-
-async function fetchScoresByName(name) {
-  const scores = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ name, dataType: 'CATEGORICAL', page: String(page), limit: '100' });
-    const response = await lfGet(`/api/public/v2/scores?${params}`);
-    scores.push(...(response.data || []));
-    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
+  for (let offset = 0; offset < traceIds.length; offset += 50) {
+    let cursor = '';
+    do {
+      const params = new URLSearchParams({
+        name,
+        dataType: 'CATEGORICAL',
+        traceId: traceIds.slice(offset, offset + 50).join(','),
+        limit: '100',
+        fields: 'details,subject',
+      });
+      if (cursor) params.set('cursor', cursor);
+      const response = await lfGet(`/api/public/v3/scores?${params}`);
+      scores.push(...(response.data || []).map(normalizeScoreV3));
+      cursor = response.meta?.cursor || '';
+    } while (cursor);
   }
   return scores;
 }

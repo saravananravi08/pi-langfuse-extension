@@ -32,6 +32,7 @@ import {
 import { validateMemoryOutput } from "./memory/memory-validation.js";
 import { createMemoryCache } from "./memory/memory-cache.js";
 import { createMemoryDiskCache } from "./memory/memory-disk-cache.js";
+import { normalizeObservationV2, normalizeScoreV3, sessionObservationBounds, traceFromRootObservation } from "./memory/langfuse-v4-api.js";
 import { evaluateReflectionQuality, normalizeReflectionTaskStatus, renderReflectionMarkdown } from "./memory/memory-reflection.js";
 import { formatMemoryResult, redactSecrets, searchMemoryScores } from "./memory/memory-lookup.js";
 import { buildMemoryContextCoverage, buildMemoryContextText, buildTemporalTurnTimeline, filterMemoryScoresForBranch, formatMemoryContextPreview, formatMemoryContextStatus, planMemoryContextReplacement } from "./memory/memory-context.js";
@@ -149,57 +150,90 @@ function logMemoryError(entry: Record<string, unknown>): void {
 }
 
 // ============================================
-// Langfuse Client (lazy-loaded via dynamic import)
+// Langfuse v5 OpenTelemetry runtime
 // ============================================
 
-interface LangfuseSpan {
+interface LangfuseObservation {
   id: string;
-  end(body?: { metadata?: Record<string, unknown>; isError?: boolean; output?: unknown }): void;
+  traceId: string;
+  update(attributes: Record<string, unknown>): LangfuseObservation;
+  end(): void;
+  startObservation(name: string, attributes?: Record<string, unknown>, options?: { asType?: string }): LangfuseObservation;
 }
 
-interface LangfuseGeneration {
-  id: string;
-  end(body?: { metadata?: Record<string, unknown>; usage?: unknown; output?: unknown; costDetails?: unknown }): void;
+interface LangfuseRuntime {
+  processor: { forceFlush(): Promise<void> };
+  sdk: { shutdown(): Promise<void> };
+  startObservation(name: string, attributes?: Record<string, unknown>, options?: { asType?: string }): LangfuseObservation;
+  propagateAttributes<T>(attributes: Record<string, unknown>, callback: () => T): T;
 }
 
-interface LangfuseClient {
-  trace(body?: { name: string; metadata?: Record<string, unknown>; input?: unknown; output?: unknown; sessionId?: string }): {
-    id: string;
-    update(body?: { metadata?: Record<string, unknown>; output?: unknown; input?: unknown }): void;
-  };
-  span(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown }): LangfuseSpan;
-  generation(body: { name: string; traceId: string; metadata?: Record<string, unknown>; input?: unknown; output?: unknown; usage?: unknown; model?: string; costDetails?: unknown }): LangfuseGeneration;
-  score(body: { id?: string; name: string; value: number | string; traceId?: string; observationId?: string; dataType?: "NUMERIC" | "BOOLEAN" | "CATEGORICAL"; comment?: string; metadata?: Record<string, unknown> }): void;
-  shutdownAsync(): Promise<void>;
-}
+let langfuseRuntime: LangfuseRuntime | null = null;
+let langfuseRuntimePromise: Promise<LangfuseRuntime> | null = null;
 
-let client: LangfuseClient | null = null;
-
-async function getClient(): Promise<LangfuseClient> {
-  if (!client) {
-    const lib = await import("langfuse") as {
-      Langfuse: new (options: { publicKey: string; secretKey?: string; baseUrl?: string }) => LangfuseClient;
-    };
-    client = new lib.Langfuse({
-      publicKey: config.publicKey,
-      secretKey: config.secretKey,
-      baseUrl: config.host,
+async function getLangfuseRuntime(): Promise<LangfuseRuntime> {
+  if (langfuseRuntime) return langfuseRuntime;
+  if (!langfuseRuntimePromise) {
+    langfuseRuntimePromise = Promise.all([
+      import("@langfuse/tracing"),
+      import("@langfuse/otel"),
+      import("@opentelemetry/sdk-node"),
+    ]).then(([tracing, otel, sdk]) => {
+      const processor = new otel.LangfuseSpanProcessor({
+        publicKey: config.publicKey,
+        secretKey: config.secretKey,
+        baseUrl: config.host,
+        environment: process.env.LANGFUSE_TRACING_ENVIRONMENT,
+        release: process.env.LANGFUSE_RELEASE,
+      });
+      const nodeSdk = new sdk.NodeSDK({ spanProcessors: [processor] });
+      nodeSdk.start();
+      langfuseRuntime = {
+        processor,
+        sdk: nodeSdk,
+        startObservation: tracing.startObservation as LangfuseRuntime["startObservation"],
+        propagateAttributes: tracing.propagateAttributes as LangfuseRuntime["propagateAttributes"],
+      };
+      return langfuseRuntime;
+    }).catch(error => {
+      langfuseRuntimePromise = null;
+      throw error;
     });
   }
-  return client;
+  return langfuseRuntimePromise;
+}
+
+function tracePropagationAttributes(cwd = currentCwd): Record<string, unknown> {
+  const metadata = Object.fromEntries(Object.entries({ cwd, model: currentModel, provider: currentProvider })
+    .filter(([, value]) => Boolean(value))
+    .map(([key, value]) => [key, String(value).slice(0, 200)]));
+  return {
+    traceName: "pi-agent",
+    sessionId: currentSessionId || undefined,
+    metadata,
+  };
+}
+
+async function flushLangfuse(): Promise<void> {
+  if (langfuseRuntime) await langfuseRuntime.processor.forceFlush();
+}
+
+async function shutdownLangfuse(): Promise<void> {
+  if (!langfuseRuntime) return;
+  const runtime = langfuseRuntime;
+  langfuseRuntime = null;
+  langfuseRuntimePromise = null;
+  await runtime.sdk.shutdown();
 }
 
 // ============================================
 // State
 // ============================================
 
-interface TraceData {
-  id: string;
-  update?: (body?: { metadata?: Record<string, unknown>; output?: unknown; input?: unknown }) => void;
-}
+type TraceData = LangfuseObservation;
 
 interface SpanData {
-  span: LangfuseSpan;
+  span: LangfuseObservation;
   toolName: string;
 }
 
@@ -1127,40 +1161,48 @@ async function langfuseGet(path: string, signal?: AbortSignal): Promise<Record<s
   return raw ? JSON.parse(raw) : {};
 }
 
-async function fetchTraceScoreRefsForSession(sessionId: string, signal?: AbortSignal): Promise<Array<{ id: string; scores: string[] }>> {
-  const traces: Array<{ id: string; scores: string[] }> = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ sessionId, page: String(page), limit: "100", fields: "core,scores" });
-    const response = await langfuseGet(`/api/public/traces?${params}`, signal) as { data?: Array<{ id?: string; scores?: string[] }>; meta?: { totalPages?: number } };
-    for (const trace of response.data || []) {
-      if (trace.id) traces.push({ id: trace.id, scores: trace.scores || [] });
-    }
-    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
-  }
-  return traces;
+async function fetchTraceIdsForSession(sessionId: string, signal?: AbortSignal): Promise<string[]> {
+  const traceIds: string[] = [];
+  const bounds = sessionObservationBounds(sessionId);
+  let cursor = "";
+  do {
+    const params = new URLSearchParams({
+      ...bounds,
+      limit: "1000",
+      fields: "core",
+      filter: JSON.stringify([
+        { type: "string", column: "sessionId", operator: "=", value: sessionId },
+        { type: "boolean", column: "isRootObservation", operator: "=", value: true },
+      ]),
+    });
+    if (cursor) params.set("cursor", cursor);
+    const response = await langfuseGet(`/api/public/v2/observations?${params}`, signal) as {
+      data?: Array<{ traceId?: string }>;
+      meta?: { cursor?: string };
+    };
+    traceIds.push(...(response.data || []).map(observation => observation.traceId || "").filter(Boolean));
+    cursor = response.meta?.cursor || "";
+  } while (cursor);
+  return unique(traceIds);
 }
 
-async function fetchScoreIdsForSession(sessionId: string, signal?: AbortSignal): Promise<string[]> {
-  return unique((await fetchTraceScoreRefsForSession(sessionId, signal)).flatMap(trace => trace.scores));
-}
-
-async function fetchScoresByIds(ids: string[], name: string, signal?: AbortSignal): Promise<MemoryScore[]> {
+async function fetchScoresByName(name: string, signal?: AbortSignal, traceIds?: string[]): Promise<MemoryScore[]> {
+  if (traceIds && !traceIds.length) return [];
   const scores: MemoryScore[] = [];
-  for (let offset = 0; offset < ids.length; offset += 50) {
-    const params = new URLSearchParams({ name, dataType: "CATEGORICAL", limit: "100", scoreIds: ids.slice(offset, offset + 50).join(",") });
-    const response = await langfuseGet(`/api/public/v2/scores?${params}`, signal) as { data?: MemoryScore[] };
-    scores.push(...(response.data || []));
-  }
-  return scores;
-}
-
-async function fetchScoresByName(name: string, signal?: AbortSignal): Promise<MemoryScore[]> {
-  const scores: MemoryScore[] = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ name, dataType: "CATEGORICAL", page: String(page), limit: "100" });
-    const response = await langfuseGet(`/api/public/v2/scores?${params}`, signal) as { data?: MemoryScore[]; meta?: { totalPages?: number } };
-    scores.push(...(response.data || []));
-    if (!response.meta?.totalPages || page >= response.meta.totalPages) break;
+  const chunks = traceIds ? Array.from({ length: Math.ceil(traceIds.length / 50) }, (_, index) => traceIds.slice(index * 50, index * 50 + 50)) : [undefined];
+  for (const traceIdChunk of chunks) {
+    let cursor = "";
+    do {
+      const params = new URLSearchParams({ name, dataType: "CATEGORICAL", limit: "100", fields: "details,subject" });
+      if (traceIdChunk) params.set("traceId", traceIdChunk.join(","));
+      if (cursor) params.set("cursor", cursor);
+      const response = await langfuseGet(`/api/public/v3/scores?${params}`, signal) as {
+        data?: Array<Record<string, unknown>>;
+        meta?: { cursor?: string };
+      };
+      scores.push(...(response.data || []).map(score => normalizeScoreV3(score) as unknown as MemoryScore));
+      cursor = response.meta?.cursor || "";
+    } while (cursor);
   }
   return scores;
 }
@@ -1170,10 +1212,10 @@ async function getActiveSessionMemory(snapshot: TraceSnapshot, currentObservatio
   sessionMemoryCache.addObservation(scopeKey, currentObservation);
 
   if (forceRefresh || sessionMemoryCache.needsRefresh(scopeKey)) {
-    const scoreIds = await fetchScoreIdsForSession(snapshot.sessionId, signal);
+    const traceIds = await fetchTraceIdsForSession(snapshot.sessionId, signal);
     const [observations, reflections] = await Promise.all([
-      fetchScoresByIds(scoreIds, MEMORY_SCORE_NAME, signal),
-      fetchScoresByName(REFLECTION_SCORE_NAME, signal),
+      fetchScoresByName(MEMORY_SCORE_NAME, signal, traceIds),
+      fetchScoresByName(REFLECTION_SCORE_NAME, signal, traceIds),
     ]);
     sessionMemoryCache.mergeRemote(
       scopeKey,
@@ -1456,13 +1498,17 @@ async function persistMemoryScores(snapshot: TraceSnapshot, scores: MemoryScore[
   }
 }
 
-async function writeMemoryScore(score: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+async function writeLangfuseScore(score: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
   await langfuseRequest("/api/public/scores", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(score),
     signal,
   });
+}
+
+async function writeMemoryScore(score: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+  await writeLangfuseScore(score, signal);
   lookupScoresCache = undefined;
   contextScoresCache.clear();
 }
@@ -1515,17 +1561,10 @@ async function getLookupScores(refresh: boolean, signal?: AbortSignal): Promise<
 }
 
 async function fetchContextScores(sessionId: string, pathKey: string, branch: Array<Record<string, unknown>>, cacheKey: string, signal?: AbortSignal): Promise<MemoryScore[]> {
-  const params = new URLSearchParams({
-    name: REFLECTION_SCORE_NAME,
-    dataType: "CATEGORICAL",
-    sessionId,
-    page: "1",
-    limit: "10",
-    orderBy: "createdAt.desc",
-  });
-  const response = await langfuseGet(`/api/public/v2/scores?${params}`, signal) as { data?: MemoryScore[] };
+  const traceIds = await fetchTraceIdsForSession(sessionId, signal);
   const compatibleReflections = filterMemoryScoresForBranch(
-    (response.data || []).filter(score => sameMemoryScope(score, sessionId, pathKey, metadataString(score, "version"))),
+    (await fetchScoresByName(REFLECTION_SCORE_NAME, signal, traceIds))
+      .filter(score => sameMemoryScope(score, sessionId, pathKey, metadataString(score, "version"))),
     branch,
   );
   const v2Reflection = latestReflection(compatibleReflections.filter(score => metadataString(score, "version") === MEMORY_SCORE_VERSION));
@@ -1535,17 +1574,14 @@ async function fetchContextScores(sessionId: string, pathKey: string, branch: Ar
       .map((range: any) => String(range?.observationScoreId || ""))
       .filter(Boolean)),
   );
-  const traceRefs = await fetchTraceScoreRefsForSession(sessionId, signal);
-  const newObservationScoreIds = traceRefs.flatMap(trace => [MEMORY_SCORE_VERSION, LEGACY_MEMORY_SCORE_VERSION].map(version => {
-    const seed = version === LEGACY_MEMORY_SCORE_VERSION
-      ? `${MEMORY_SCORE_NAME}:${version}:${trace.id}`
-      : `${MEMORY_SCORE_NAME}:${version}:${trace.id}:final:0`;
-    const scoreId = deterministicUuid(seed);
-    return trace.scores.includes(scoreId) && !coveredScoreIds.has(scoreId) ? scoreId : "";
-  })).filter(Boolean);
-  const observations = newObservationScoreIds.length
-    ? await fetchScoresByIds(newObservationScoreIds, MEMORY_SCORE_NAME, signal)
-    : [];
+  const coveredUntil = new Map([
+    [MEMORY_SCORE_VERSION, metadataString(v2Reflection, "coveredUntil")],
+    [LEGACY_MEMORY_SCORE_VERSION, metadataString(legacyReflection, "coveredUntil")],
+  ]);
+  const observations = (await fetchScoresByName(MEMORY_SCORE_NAME, signal, traceIds))
+    .filter(score => sameMemoryScope(score, sessionId, pathKey, metadataString(score, "version")))
+    .filter(score => !coveredScoreIds.has(score.id))
+    .filter(score => generatedAt(score) > (coveredUntil.get(metadataString(score, "version")) || ""));
   const scores = [v2Reflection, legacyReflection, ...observations]
     .filter((score): score is MemoryScore => Boolean(score));
   contextScoresCache.set(cacheKey, { scores, loadedAt: Date.now() });
@@ -1650,23 +1686,27 @@ async function getLookupTrace(traceId: string, refresh: boolean, signal?: AbortS
   const cached = lookupTraceCache.get(traceId);
   if (!refresh && cached && Date.now() - cached.loadedAt < 300_000) return cached.value;
 
-  const trace = await langfuseGet(`/api/public/traces/${encodeURIComponent(traceId)}`, signal);
   const observations: Array<Record<string, unknown>> = [];
   let cursor = "";
   do {
     const params = new URLSearchParams({
       traceId,
+      fromStartTime: "2000-01-01T00:00:00.000Z",
+      toStartTime: new Date(Date.now() + 86_400_000).toISOString(),
       limit: "1000",
-      fields: "core,basic,time,io,metadata,model,usage",
+      fields: "core,basic,time,io,metadata,model,usage,trace_context",
     });
     if (cursor) params.set("cursor", cursor);
     const response = await langfuseGet(`/api/public/v2/observations?${params}`, signal) as {
       data?: Array<Record<string, unknown>>;
       meta?: { cursor?: string };
     };
-    observations.push(...(response.data || []));
+    observations.push(...(response.data || []).map(normalizeObservationV2));
     cursor = response.meta?.cursor || "";
   } while (cursor);
+  const root = observations.find(observation => observation.isRootObservation === true)
+    || observations.find(observation => !observation.parentObservationId);
+  const trace = root ? traceFromRootObservation(root) : {};
 
   const value = redactSecrets({
     traceId,
@@ -1716,7 +1756,7 @@ async function maybeEnqueueMemoryCheckpoint(ctx: { sessionManager: { getBranch()
     logMemoryError({
       stage: "memory-checkpoint-provenance",
       errors: piProvenance.errors,
-      traceId: currentTrace.id,
+      traceId: currentTrace.traceId,
       sessionId: currentSessionId,
       startEntryId,
       endEntryId,
@@ -1726,7 +1766,7 @@ async function maybeEnqueueMemoryCheckpoint(ctx: { sessionManager: { getBranch()
 
   memoryCheckpointIndex++;
   const snapshot: TraceSnapshot = {
-    traceId: currentTrace.id,
+    traceId: currentTrace.traceId,
     traceTimestamp: currentTraceTimestamp,
     sessionId: currentSessionId,
     cwd: currentCwd || ctx.cwd,
@@ -2050,7 +2090,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("before_agent_start", async (event, ctx) => {
     currentTraceParentEntryId = ctx.sessionManager.getLeafId() || "";
     try {
-      const lf = await getClient();
+      const runtime = await getLangfuseRuntime();
       const cwd = event.systemPromptOptions?.cwd || process.cwd();
       currentUserPrompt = event.prompt;
       currentTraceTimestamp = new Date().toISOString();
@@ -2066,17 +2106,15 @@ export default async function (pi: ExtensionAPI) {
         currentProvider = ctx.model.provider || '';
       }
       
-      // Create trace with user input and session ID
-      currentTrace = lf.trace({ 
-        name: "pi-agent", 
+      // Root observation carries the overall turn input/output in Langfuse v4.
+      currentTrace = runtime.propagateAttributes(tracePropagationAttributes(cwd), () => runtime.startObservation("pi-agent", {
         input: event.prompt,
-        metadata: { 
+        metadata: {
           cwd,
           model: currentModel,
-          provider: currentProvider
+          provider: currentProvider,
         },
-        sessionId: currentSessionId || undefined
-      });
+      }));
     } catch (e) {
       notifyLangfuse("Trace export failed");
     }
@@ -2105,13 +2143,14 @@ export default async function (pi: ExtensionAPI) {
       // Compute evaluation scores
       const scores = computeEvaluationScores();
       
-      currentTrace.update?.({ 
+      currentTrace.update({
         output: output || undefined,
         metadata: { 
           completed: !interrupted,
           interrupted,
           stopReason: lastAssistant?.stopReason || null,
           totalTools: toolCallCount,
+          cwd: currentCwd,
           model: currentModel,
           provider: currentProvider,
           ...scores
@@ -2120,14 +2159,13 @@ export default async function (pi: ExtensionAPI) {
       
       // Send evaluation scores to Langfuse
       try {
-        const lf = await getClient();
-        
-        // Trace-level evaluation scores
-        lf.score({ name: "tool_call_count", value: scores.tool_call_count, traceId: currentTrace.id });
-        lf.score({ name: "turn_count", value: scores.turn_count, traceId: currentTrace.id });
-        lf.score({ name: "total_tool_errors", value: scores.total_tool_errors, traceId: currentTrace.id });
-        lf.score({ name: "tool_success_rate", value: scores.tool_success_rate, traceId: currentTrace.id });
-        lf.score({ name: "session_had_errors", value: scores.session_had_errors, traceId: currentTrace.id });
+        // Attach evaluation scores to the root observation, not deprecated trace I/O.
+        await Promise.all(Object.entries(scores).map(([name, value]) => writeLangfuseScore({
+          name,
+          value,
+          traceId: currentTrace!.traceId,
+          observationId: currentTrace!.id,
+        })));
       } catch (e) {
         notifyLangfuse("Evaluation export failed");
       }
@@ -2139,7 +2177,7 @@ export default async function (pi: ExtensionAPI) {
         logMemoryError({
           stage: "pi-provenance",
           errors: piProvenance.errors,
-          traceId: currentTrace.id,
+          traceId: currentTrace.traceId,
           sessionId: currentSessionId,
           piSessionId: currentPiSessionId,
           parentEntryId: currentTraceParentEntryId || null,
@@ -2149,7 +2187,7 @@ export default async function (pi: ExtensionAPI) {
         notifyLangfuse("Memory provenance incomplete · replacement blocked");
       }
       const memorySnapshot: TraceSnapshot = {
-        traceId: currentTrace.id,
+        traceId: currentTrace.traceId,
         traceTimestamp: currentTraceTimestamp,
         sessionId: currentSessionId,
         cwd: currentCwd,
@@ -2167,17 +2205,23 @@ export default async function (pi: ExtensionAPI) {
         segmentIndex: 0,
       };
       enqueueTraceMemoryObservation(memorySnapshot, memoryLifecycleController.signal);
-      
+      for (const { span } of activeSpans.values()) {
+        span.update({ level: interrupted ? "ERROR" : "WARNING", statusMessage: "Tool observation ended with parent turn" });
+        span.end();
+      }
+      activeSpans.clear();
+      currentTrace.end();
+      try {
+        await flushLangfuse();
+      } catch {
+        notifyLangfuse("Trace export failed");
+      }
       currentTrace = null;
     }
     
     // Reset for next session
     resetSessionState();
     
-    if (client) {
-      await client.shutdownAsync();
-      client = null;
-    }
   });
 
   // Track tool calls and create spans
@@ -2185,7 +2229,8 @@ export default async function (pi: ExtensionAPI) {
     if (!currentTrace) return;
 
     try {
-      const lf = await getClient();
+      const runtime = await getLangfuseRuntime();
+      const trace = currentTrace;
       
       // Increment tool call counter
       toolCallCount++;
@@ -2199,12 +2244,10 @@ export default async function (pi: ExtensionAPI) {
         }
       }
       
-      const span = lf.span({
-        name: `tool:${event.toolName}`,
-        traceId: currentTrace.id,
+      const span = runtime.propagateAttributes(tracePropagationAttributes(), () => trace.startObservation(`tool:${event.toolName}`, {
         input: inputStr,
-        metadata: { tool: event.toolName }
-      });
+        metadata: { tool: event.toolName },
+      }, { asType: "tool" }));
       
       activeSpans.set(event.toolCallId, { span, toolName: event.toolName });
       traceSteps.push({
@@ -2240,10 +2283,12 @@ export default async function (pi: ExtensionAPI) {
         }
       }
       
-      span.end({ 
-        isError: event.isError,
-        output: outputStr || undefined
+      span.update({
+        output: outputStr || undefined,
+        level: event.isError ? "ERROR" : "DEFAULT",
+        statusMessage: event.isError ? outputStr || "Tool failed" : undefined,
       });
+      span.end();
 
       const step = traceSteps.find(step => step.id === event.toolCallId);
       if (step) {
@@ -2255,12 +2300,12 @@ export default async function (pi: ExtensionAPI) {
       if (event.isError) {
         errorCount++;
         try {
-          const lf = await getClient();
           // Per-tool error score (observation level)
-          lf.score({ 
-            name: "tool_is_error", 
-            value: 1, 
-            traceId: currentTrace?.id 
+          await writeLangfuseScore({
+            name: "tool_is_error",
+            value: 1,
+            traceId: span.traceId,
+            observationId: span.id,
           });
         } catch (e) {
           notifyLangfuse("Tool score export failed");
@@ -2319,7 +2364,8 @@ export default async function (pi: ExtensionAPI) {
 
     if (usage) {
       try {
-        const lf = await getClient();
+        const runtime = await getLangfuseRuntime();
+        const trace = currentTrace;
         
         // Extract output text
         let outputText = "";
@@ -2332,33 +2378,26 @@ export default async function (pi: ExtensionAPI) {
         
         // Create generation for the LLM response with model info
         // Note: usage and costDetails go in the generation observation, NOT as scores
-        const gen = lf.generation({
-          name: "llm-response",
-          traceId: currentTrace.id,
+        const gen = runtime.propagateAttributes(tracePropagationAttributes(), () => trace.startObservation("llm-response", {
           input: currentUserPrompt.slice(0, 500),
           output: outputText.slice(0, 1000),
           model: modelId,
           metadata: {
-            provider: provider,
+            provider,
             inputTokens: usage.input || 0,
             outputTokens: usage.output || 0,
             cachedTokens: usage.cacheRead || 0,
           },
-          usage: {
+          usageDetails: {
             input: usage.input || 0,
             output: usage.output || 0,
-            total: usage.totalTokens || (usage.input || 0) + (usage.output || 0)
+            cache_read_input_tokens: usage.cacheRead || 0,
+            cache_write_input_tokens: usage.cacheWrite || 0,
+            total: usage.totalTokens || (usage.input || 0) + (usage.output || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0),
           },
-          costDetails: cost ? { total: cost.total, input: cost.input, output: cost.output } : undefined
-        });
-        gen.end({ 
           costDetails: cost ? { total: cost.total, input: cost.input, output: cost.output } : undefined,
-          usage: {
-            input: usage.input || 0,
-            output: usage.output || 0,
-            total: usage.totalTokens || (usage.input || 0) + (usage.output || 0)
-          }
-        });
+        }, { asType: "generation" }));
+        gen.end();
         traceSteps.push({
           id: gen.id,
           type: "generation",
@@ -2393,14 +2432,14 @@ export default async function (pi: ExtensionAPI) {
     langfuseNoticeTimer = undefined;
     langfuseUiNotify = undefined;
     if (currentTrace) {
-      if (currentTrace.update) {
-        currentTrace.update({ metadata: { completed: true } });
-      }
+      currentTrace.update({ metadata: { completed: false, interrupted: true } });
+      currentTrace.end();
       currentTrace = null;
     }
-    if (client) {
-      await client.shutdownAsync();
-      client = null;
+    try {
+      await shutdownLangfuse();
+    } catch {
+      notifyLangfuse("Trace export failed");
     }
     resetSessionState();
     currentPiSessionId = "";
