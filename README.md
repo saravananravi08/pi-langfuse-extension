@@ -1,43 +1,113 @@
-# @ravan08/pi-langfuse
+# Pi Langfuse Observability + Memory
 
 [![npm version](https://img.shields.io/npm/v/@ravan08/pi-langfuse.svg)](https://www.npmjs.com/package/@ravan08/pi-langfuse)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Langfuse observability extension for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent). Sends traces to [Langfuse](https://langfuse.com) for monitoring tokens, costs, latency, and tool calls.
+Langfuse integration for [Pi Coding Agent](https://github.com/mariozechner/pi-coding-agent) combining production-grade tracing with optional observational memory. It records Pi turns, model usage, cost, and tool calls; generates structured trace observations; consolidates long sessions into reflections; and can safely replace covered model-visible history with compact memory.
 
-![Langfuse Trace Screenshot](./docs/screenshot1.jpg)
+**Stored Pi session history is never deleted or rewritten.** Memory context replacement is opt-in and blocks rather than guessing when exact Pi-entry provenance cannot be verified.
 
-## Why Langfuse?
+![Langfuse trace view](./docs/screenshot1.jpg)
 
-Langfuse provides open-source observability for LLM applications. This extension allows you to **trace**, **monitor**, and **debug** your Pi sessions with production-grade detail, helping you understand exactly how your agent is performing, what it's costing you, and where it might be failing.
+## 🔭 What It Does
 
-## Features
+### 📊 Observability
 
-- **Hierarchical Tracing**: Maps user prompts to per-turn spans and nested tool executions for deep visibility.
-- **LLM Metadata**: Automatically records model name, provider, token usage, and API costs per turn.
-- **Tool Observability**: Detailed logs for every tool call, including arguments, results, and error states.
-- **Session Correlation**: Groups all prompts from the same Pi session into a single Langfuse session.
-- **Cost Tracking**: Records input/output/total costs in USD per generation.
-- **Token Usage**: Tracks input and output tokens per turn.
-- **Trace Memory Scores**: Optionally generates compact Mastra-style trace observations and writes them back as Langfuse score metadata.
+- Maps each Pi turn to a Langfuse trace.
+- Records model, provider, latency, token usage, and cost.
+- Captures nested tool calls, arguments, results, and errors.
+- Groups traces by Pi session and working directory.
 
-## Quick Install
+### 🧠 Observational Memory
 
-### Via npm (recommended)
+- Creates asynchronous episodic `memory_trace_observation` scores with exact user requests, question/answer pairs, corrections, durable items, and Pi provenance.
+- Consolidates active observations into append-only canonical `memory_session_reflection` scores.
+- Keeps exact recent user requests as deterministic working memory.
+- Reduces durable state by authority: user corrections > user state > verified results > assistant proposals.
+- Retrieves prompt-relevant episodes automatically instead of injecting every observation.
+- Creates safe in-turn checkpoints after 20 completed tool calls, 8k new textual tokens, or 70% context usage.
+- Exposes scoped recall through the `langfuse_memory_lookup` tool.
+- Optionally replaces structurally and semantically covered model-visible history through `/memory-context on`.
+- Records exact Pi session entries and complete tool-call/result pairs as provenance.
+- Provides read-only audits, controlled backfill, redacted diagnostics, and bounded source retrieval.
+
+## 🧠 Memory Flow
+
+```text
+Pi agent turn
+   │
+   ├─ Langfuse trace
+   │    ├─ LLM generation
+   │    └─ tool spans
+   │
+   └─ memory_trace_observation score
+              │
+              ├─ latest uncovered observations
+              └─ threshold reached
+                        │
+                        ▼
+             memory_session_reflection score
+                        │
+                        ▼
+              active memory + scoped lookup
+                        │
+                        ▼
+       optional provenance-safe model context
+```
+
+Observations and reflections are Langfuse scores, not additions to raw trace events. Reflections are append-only; the current reflection is selected by highest `generation`, then `generatedAt`.
+
+## 🛡️ Safety Guarantees
+
+- Pi's stored JSONL session history remains unchanged.
+- Context replacement affects only messages sent to the model.
+- Covered ranges must belong to the current Pi session and active branch.
+- Observations from abandoned sibling branches remain available for lookup but are excluded from active context and reflection inputs.
+- Entry ranges must be complete, contiguous, non-overlapping, and exactly mapped.
+- Semantic coverage must preserve every user request, correction, and question before raw messages become replaceable.
+- The latest two raw user turns are retained where they fit; oversized turns keep the exact request and newest complete tail.
+- A latest branch-compatible v1 reflection and deterministic v1 observations after it may replace only exact, complete Pi-provenance ranges. V2 ranges win on overlap; v1 semantic details remain lower-priority context, and recent exact turns are retained.
+- Tool calls and results remain complete pairs.
+- Calls emitted by errored or aborted assistant responses are accepted only when proven unexecuted.
+- Current trailing user messages and pending parallel tool results are retained safely.
+- Invalid or incomplete provenance disables replacement immediately.
+- In-turn checkpoints start near 70% of the selected model window. Validated replacement may use up to 80%, leaving headroom for continued work and Pi compaction.
+- Lookup output and diagnostic logs redact secret-like values.
+- Session changes and shutdown abort queued or running memory work.
+
+## 📦 Install
+
+### Stable npm package
+
 ```bash
 pi install npm:@ravan08/pi-langfuse
 ```
 
-### Via git
+### Git repository
+
 ```bash
 pi install git:github.com/saravananravi08/pi-langfuse-extension
 ```
 
-## Configuration
+The provenance-safe lookup and context-replacement work is currently being tested on `feature/provenance-memory-context` and has not been published to npm yet. To test that exact build:
 
-Get your keys from [Langfuse Cloud](https://cloud.langfuse.com) → Settings → API Keys.
+```bash
+pi install git:github.com/saravananravi08/pi-langfuse-extension@feature/provenance-memory-context
+```
 
-Create `config.json` in the extension directory:
+Pi packages execute with full system access. Review third-party package source before installing.
+
+## 🚀 Quick Start
+
+Requires Node.js 20+ and Langfuse Cloud or a self-hosted Langfuse v4 server. Tracing uses the GA JS/TS SDK v5 OpenTelemetry path; memory reads use Observations API v2 and Scores API v3.
+
+### 1. Create Langfuse keys
+
+Create project API keys in [Langfuse Cloud](https://cloud.langfuse.com) or your self-hosted Langfuse v4 instance.
+
+### 2. Create `config.json`
+
+Copy [`config.example.json`](./config.example.json) to `config.json` in the installed package directory, then set your credentials and observer model:
 
 ```json
 {
@@ -48,162 +118,334 @@ Create `config.json` in the extension directory:
     "enabled": true,
     "api": "anthropic",
     "baseUrl": "https://api.example.com/anthropic",
-    "apiKey": "observer-api-key",
-    "model": "observer-model-id"
+    "apiKey": "YOUR_OBSERVER_API_KEY",
+    "model": "YOUR_OBSERVER_MODEL",
+    "fallback": {
+      "provider": "openai-codex",
+      "model": "gpt-5.4-mini",
+      "reasoning": "low",
+      "cooldownMs": 300000
+    }
+  },
+  "memory": {
+    "reflection": {
+      "enabled": true,
+      "thresholdTokens": 20000,
+      "minNewObservationTokens": 8000,
+      "minNewObservations": 5
+    }
   }
 }
 ```
 
-`observer` is optional. When enabled, the extension creates a `memory_trace_observation` score for each completed trace. Set `"enabled": false` or omit `observer.model`/`observer.apiKey` to disable trace memory scoring. The observer endpoint can be Anthropic-compatible or OpenAI-compatible:
+Install paths depend on package source, Pi scope, and Node installation. Use `pi list` to confirm the source. For a global npm install, find npm's actual package root with:
+
+```bash
+npm root -g
+```
+
+Place `config.json` beside this package's `index.ts`. Typical locations are:
+
+```text
+npm, global:  <npm-root>/@ravan08/pi-langfuse/config.json
+npm, project: <project>/.pi/npm/@ravan08/pi-langfuse/config.json
+git, global:  ~/.pi/agent/git/github.com/saravananravi08/pi-langfuse-extension/config.json
+git, project: <project>/.pi/git/github.com/saravananravi08/pi-langfuse-extension/config.json
+```
+
+`config.json` is gitignored and must never be committed.
+
+The observer supports Anthropic-compatible and OpenAI-compatible endpoints. Optional fallback models are resolved through Pi's model registry and existing auth; OAuth tokens are never copied into extension config. After two primary failures, memory generation uses the fallback directly for `cooldownMs`. Background retry details stay in the private JSONL log; the TUI shows only a temporary concise footer status.
+
+Example OpenAI-compatible configuration:
 
 ```json
 {
   "observer": {
+    "enabled": true,
     "api": "openai",
     "baseUrl": "https://api.openai.com",
     "apiKey": "YOUR_OBSERVER_API_KEY",
-    "model": "gpt-4.1-mini"
+    "model": "YOUR_OBSERVER_MODEL"
   }
 }
 ```
 
-Environment variables override config values:
+### 3. Fully restart Pi
+
+A full process restart is required after extension module changes. `/reload` may retain imported modules in Node's cache.
+
+### 4. Run a turn and verify memory
 
 ```bash
-PI_LANGFUSE_OBSERVER_ENABLED=false
-PI_LANGFUSE_OBSERVER_API=anthropic
-PI_LANGFUSE_OBSERVER_BASE_URL=https://api.example.com/anthropic
-PI_LANGFUSE_OBSERVER_API_KEY=...
-PI_LANGFUSE_OBSERVER_MODEL=...
+pi "inspect this project and summarize its architecture"
 ```
 
-For npm install, find the extension at:
-```
-~/.pi/agent/npm/@ravan08/pi-langfuse/index.ts
+After the turn completes, Langfuse should contain a `pi-agent` trace and, when the observer is enabled, a `memory_trace_observation` score. In interactive Pi:
+
+```text
+/memory-context preview
+/memory-context on
 ```
 
-## Usage
+`preview` shows the exact replacement plan without changing model context. `on` succeeds only when all safety checks pass.
 
-### Run pi with tracing enabled
+## 🧭 Usage
+
+### Automatic tracing
+
+Pi auto-loads the extension. Normal prompts require no special command:
 
 ```bash
 pi "your prompt"
 ```
 
-Pi auto-loads the extension. All sessions will be traced to Langfuse.
+### Memory context commands
 
-## Trace Model
-
-```
-Trace (name: "pi-agent")
-├── Session ID: <pi-session-id>
-├── Metadata: model, provider, cwd
-└── Span (name: "tool:<name>")
-    └── Input/Output logs
-
-Generation (name: "llm-response")
-├── Model: active pi model
-├── Usage: input/output tokens
-└── Cost: input/output/total USD
-
-Score (name: "memory_trace_observation")
-├── Value: observed
-├── Comment: short memory summary
-└── Metadata: observations, files, tools, decisions, completed work, open issues
+```text
+/memory-context preview          Show structural/semantic coverage, retained entries, tool pairs, and token estimates
+/memory-context explain <topic>  Show winning/superseded durable state and exact provenance
+/memory-context on               Enable provenance-gated model-visible context replacement
+/memory-context off              Restore full Pi model context
+/memory-context status           Show current setting
+/memory-context                  Toggle on/off
 ```
 
-## What Gets Tracked
+While replacement is active, Pi shows compact status such as:
 
-### Trace Level
-- `input` - User prompt
-- `output` - Assistant response
-- `sessionId` - Pi session identifier
-- `metadata` - Model, provider, cwd
+```text
+Memory 24.9%/272k · est 7.1k · $1.235
+```
 
-### Generation Observations (LLM Calls)
-- `model` - Model identifier (e.g., "MiniMax-M2.7")
-- `usage` - Token counts (input/output/total)
-- `costDetails` - Cost breakdown in USD
+The percentage is actual provider input usage against the selected model's context window. `est` is the estimated textual replacement-message size. Cost is cumulative main-model cost reported by the provider; OAuth subscription models show `$0.000 (sub)`, matching Pi, and cost is omitted when neither pricing nor subscription status is available. Binary image data is excluded and reported separately, for example `est 7.1k + 2 images`, because image token accounting varies by provider and model.
 
-### Span Observations (Tool Calls)
-- `name` - Tool name (e.g., "tool:bash")
-- `input` - Tool parameters (JSON)
-- `output` - Tool result
-- `metadata.isError` - Whether tool failed
+### Scoped memory lookup
 
-### Memory Trace Score
-- `name` - `memory_trace_observation`
-- `value` - `observed`
-- `comment` - Short summary
-- `metadata.observationsMarkdown` - Dense observation bullets using 🔴/🟡/🟢/✅ markers
-- `metadata.currentTask` - Current task/status after the trace
-- `metadata.filesTouched` - Important files/paths
-- `metadata.toolsUsed` - Tool names used in the trace
-- `metadata.decisions` - Key decisions/rationale
-- `metadata.completed` - Finished outcomes
-- `metadata.openIssues` - Remaining issues/blockers
+Pi can call `langfuse_memory_lookup` when exact older decisions, files, errors, symbols, IDs, or source traces are needed.
 
-## Langfuse Dashboard
+```js
+langfuse_memory_lookup({
+  query: "authentication migration decision",
+  scope: "path",
+  includeSource: true,
+  includePiEntries: true
+})
+```
 
-After running, check your Langfuse project for:
+Scopes:
 
-1. **Traces** - All pi agent runs with I/O
-2. **Sessions** - Traces grouped by session ID
-3. **Observations** - Tool calls and LLM generations
-4. **Scores** - Evaluation metrics and trace memory observations
-5. **Model Usage** - Usage breakdown by model
+- `session` — current session and cwd; default.
+- `path` — sessions sharing the selected cwd/path key.
+- `all` — all available memory scores.
 
-## Backfill Existing Sessions
+Exact `traceId` and `scoreId` filters are supported. `includeSource` returns bounded details for at most two source traces. `includePiEntries` returns at most 50 exact, redacted Pi entries per matched session.
 
-Use the included script to generate memory scores for older traces:
+## ⚙️ Configuration
+
+Tracing requires `publicKey`, `secretKey`, and `host`. Memory generation additionally requires an observer API key and model.
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `observer.enabled` | `true` | Generate trace observation scores when model config exists. |
+| `observer.api` | `anthropic` | `anthropic` or `openai` compatible request format. |
+| `observer.baseUrl` | Provider default | Observer/reflector API base URL. |
+| `observer.apiKey` | Provider environment key | Observer/reflector API credential. |
+| `observer.model` | none | Observer and reflector model ID. |
+| `observer.fallback.provider` | none | Pi model-registry provider used after primary failure. |
+| `observer.fallback.model` | none | Authenticated Pi fallback model ID. |
+| `observer.fallback.reasoning` | `low` | Fallback reasoning level. |
+| `observer.fallback.cooldownMs` | `300000` | Time to bypass unhealthy primary after two failures. |
+| `memory.reflection.enabled` | `false` | Enable automatic session reflection. |
+| `memory.reflection.thresholdTokens` | `20000` | Minimum active structured-memory size. |
+| `memory.reflection.minNewObservationTokens` | `8000` | Minimum uncovered observation size. |
+| `memory.reflection.minNewObservations` | `5` | Minimum uncovered observation count. |
+
+All three reflection thresholds must pass. Token estimates count every structured reflector field, not only rendered Markdown.
+
+Environment variables override file configuration:
 
 ```bash
-node scripts/observe-langfuse-session.mjs 2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7
+PI_LANGFUSE_OBSERVER_ENABLED=true
+PI_LANGFUSE_OBSERVER_API=anthropic
+PI_LANGFUSE_OBSERVER_BASE_URL=https://api.example.com/anthropic
+PI_LANGFUSE_OBSERVER_API_KEY=...
+PI_LANGFUSE_OBSERVER_MODEL=...
+PI_LANGFUSE_OBSERVER_FALLBACK_PROVIDER=openai-codex
+PI_LANGFUSE_OBSERVER_FALLBACK_MODEL=gpt-5.4-mini
+PI_LANGFUSE_OBSERVER_FALLBACK_REASONING=low
+PI_LANGFUSE_OBSERVER_FALLBACK_COOLDOWN_MS=300000
+PI_LANGFUSE_REFLECTION_ENABLED=true
+PI_LANGFUSE_REFLECTION_THRESHOLD_TOKENS=20000
+PI_LANGFUSE_REFLECTION_MIN_NEW_TOKENS=8000
+PI_LANGFUSE_REFLECTION_MIN_NEW_OBSERVATIONS=5
+PI_LANGFUSE_MEMORY_ERROR_LOG=~/.pi/agent/logs/langfuse-memory-errors.jsonl
 ```
 
-Useful flags:
+Prompts are centralized in [`memory/memory-prompts.js`](./memory/memory-prompts.js). `observer-v3` and `reflection-v5` outputs must pass structured schema, authority, semantic-coverage, retention, duplication, and contradiction checks. Reflection Markdown is rendered deterministically within the computed target (maximum 10k estimated tokens), while complete canonical fields remain in Langfuse metadata. Default injected memory is bounded to approximately 10k estimated textual tokens.
+
+## 🗃️ Langfuse Data Model
+
+```text
+Logical trace: pi-agent
+├─ Root observation: pi-agent
+│  ├─ sessionId: Pi session ID
+│  ├─ input/output: user and assistant messages
+│  └─ metadata: model, provider, cwd, completion state
+├─ Generation observation: llm-response
+│  ├─ model and provider
+│  ├─ input/output tokens
+│  └─ input/output/total cost
+├─ Tool observation: tool:<name>
+│  ├─ arguments and result
+│  └─ error state
+└─ Score: memory_trace_observation
+   ├─ exact user requests and question/answer pairs
+   ├─ corrections, durable items, task delta, files, and tools
+   ├─ replacementEligible + semanticCoverage
+   └─ exact pi-entry-v1 provenance
+
+Session score: memory_session_reflection
+├─ generation and coveredUntil
+├─ canonical durable state with authority/status/source IDs
+├─ active/superseded decisions and constraints
+├─ source observation/reflection score IDs
+├─ source trace IDs
+└─ aggregated Pi entry ranges and tool pairs
+```
+
+Trace name, session ID, cwd, model, and provider are propagated to every child observation. Overall user input and final assistant output live on the root observation; deprecated trace-level input/output is not emitted. `LANGFUSE_TRACING_ENVIRONMENT` and `LANGFUSE_RELEASE` configure deployment attributes.
+
+Active memory is scoped by Langfuse session ID and cwd/path key. A persistent context mirror is stored at `~/.pi/agent/cache/langfuse-memory/<path-hash>/<session-id>.json`. Resume loads this validated local snapshot first, then refreshes Langfuse asynchronously. Files are atomically replaced with `0600` permissions and are rejected when host, project-key hash, session, path, schema, or score scope differs. Langfuse remains canonical; explicit refreshes and source lookups still use Langfuse.
+
+## 🧰 Audit, Backfill, and Reflection Scripts
+
+### Read-only audit
+
+```bash
+node scripts/observe-langfuse-session.mjs <session-id> --audit
+```
+
+`--audit` does not write. It reports missing observations, historical pre-coverage traces, incomplete or invalid Pi provenance, semantic-coverage failures, active decision conflicts, duplicate scores, overlapping entries, deterministic-ID mismatches, and prompt versions.
+
+### Controlled observation backfill
+
+```bash
+node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill --dry-run
+node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill
+node scripts/observe-langfuse-session.mjs <session-id> --audit --backfill --include-pre-coverage
+```
+
+Backfill writes only eligible traces that map uniquely to complete Pi provenance. `--include-pre-coverage` explicitly includes older historical traces.
+
+Additional controls:
 
 ```bash
 node scripts/observe-langfuse-session.mjs <session-id> --dry-run --limit 1
+node scripts/observe-langfuse-session.mjs <session-id> --trace <trace-id> --audit --backfill
 node scripts/observe-langfuse-session.mjs <session-id> --force
 ```
 
-The script reads the same `config.json`. Short env aliases are also supported for one-off runs:
+Version-2 migration is append-only. Use `--trace` for a targeted repair or `--include-pre-coverage` for an explicitly reviewed historical migration.
+
+### Reflection inspection or generation
+
+```bash
+node scripts/reflect-langfuse-session.mjs <session-id>
+node scripts/reflect-langfuse-session.mjs <session-id> --dry-run
+node scripts/reflect-langfuse-session.mjs <session-id> --force --dry-run
+node scripts/reflect-langfuse-session.mjs <session-id> --path /project/cwd --limit 10
+```
+
+Without `--force`, configured thresholds apply. `--dry-run` may call the reflector but never writes a score.
+
+Both scripts read the same `config.json`. One-off observer aliases and authenticated Pi models are supported:
 
 ```bash
 OBSERVER_API=openai OBSERVER_BASE_URL=https://api.openai.com OBSERVER_API_KEY=... OBSERVER_MODEL=... \
   node scripts/observe-langfuse-session.mjs <session-id>
+
+node scripts/observe-langfuse-session.mjs <session-id> --backfill \
+  --pi-provider openai-codex --pi-model gpt-5.4-mini --pi-reasoning low
+node scripts/reflect-langfuse-session.mjs <session-id> --force \
+  --pi-provider openai-codex --pi-model gpt-5.4-mini --pi-reasoning low
 ```
 
-## Architecture
+Pi-model mode resolves fresh credentials through Pi's auth storage and never prints or copies OAuth tokens.
 
-For a deep dive into the tracing model and data flow, see [docs/architecture.md](./docs/architecture.md).
+## 🩺 Diagnostics
 
-## Troubleshooting
+Memory failures are appended to:
 
-**No traces appearing?**
-- Verify API keys are correct in `config.json`
-- Check Langfuse project is active
-- Ensure API keys have write permissions
+```text
+~/.pi/agent/logs/langfuse-memory-errors.jsonl
+```
 
-**Extension not loading?**
-- Run `pi list` to check installed packages
-- Try restarting pi
+The file is created with `0600` permissions. Records contain safe request, validation, scope, and provenance details but never raw observer or reflector model output. Use `PI_LANGFUSE_MEMORY_ERROR_LOG` to override the path.
 
-**Model/cost not showing?**
-- Not all providers expose cost info
-- Check Langfuse traces API for raw observation data
+## ⚠️ Operational Limits
 
-**No memory_trace_observation score?**
-- Add `observer` config or set `PI_LANGFUSE_OBSERVER_*` environment variables
-- Reload pi after changing config
-- Check logs for observer API errors
+- Version-1 reflections or tail observations without complete Pi provenance remain lookup-only. Complete branch-compatible v1 ranges support migration-free structural compatibility; v2 remains semantic authority.
+- Context replacement orders the latest reflection and 20 recent text turns, reducing toward 10 whole turns when needed. Only observations not already covered by the reflection are inserted after their matching turns. Every retained completed tool pair uses deterministic bounded payloads; only the active uncheckpointed tail and exact errors remain raw. Older thinking, images, and tool payloads are removed from model-visible context.
+- `langfuse_memory_lookup` model output is capped at 12,000 characters by default or 24,000 with explicit source/Pi-entry retrieval; internal tool details contain only bounded accounting metadata.
+- Context replacement intentionally fails closed on ambiguous branches, mappings, or tool pairs.
+- Request throttling is coordinated within one Pi process; multiple concurrent Pi processes do not yet share a global rate limiter.
+- Pi auto-compaction behavior is unchanged.
+- Traces are buffered by the OpenTelemetry processor, force-flushed after each completed Pi turn, and shut down gracefully with the Pi session. Process termination that bypasses `session_shutdown` can still lose buffered spans.
+- Imported extension modules may remain cached after `/reload`; use a full restart when testing code changes.
 
-## Dependencies
+## 🛠️ Troubleshooting
 
-- [langfuse](https://www.npmjs.com/package/langfuse) - Langfuse SDK
-- [@mariozechner/pi-coding-agent](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) - Pi extension API
+### No traces
 
-## License
+- Verify Langfuse keys and `host`.
+- Confirm the extension appears in `pi list`.
+- Fully restart Pi.
+
+### No `memory_trace_observation`
+
+- Set `observer.enabled=true`.
+- Configure `observer.model` and `observer.apiKey`.
+- Final observation runs asynchronously after `agent_end`; long turns can also emit non-overlapping in-turn checkpoints.
+- Transient `408`, `429`, and `5xx` responses retry up to eight times with bounded exponential or provider-directed backoff.
+- If all retries fail, run the read-only audit, then controlled `--backfill` after the provider recovers.
+- Inspect the private diagnostic log.
+
+### No `memory_session_reflection`
+
+- Set `memory.reflection.enabled=true`.
+- Confirm all three thresholds pass.
+- Run `scripts/reflect-langfuse-session.mjs <session-id>` for status.
+
+### Memory context is blocked
+
+- Run `/memory-context preview` and inspect the exact reason.
+- Run the session audit for incomplete, invalid, or overlapping provenance.
+- Do not bypass the gate; retain full Pi context until provenance is valid.
+
+### Model cost is missing
+
+Not every provider reports pricing data. Token usage may still be available.
+
+## 🤝 Contributing
+
+Contributions are welcome.
+
+1. Fork the repository.
+2. Create a focused feature or fix branch.
+3. Install dependencies with `npm install`.
+4. Make the smallest relevant change and add or update tests.
+5. Run `npm test`.
+6. Submit a pull request describing the problem, solution, and verification.
+
+Open an issue before large architectural changes. Never commit `config.json`, API keys, private session data, or files under `documents/`.
+
+## 📚 Dependencies
+
+- [`@langfuse/tracing`](https://www.npmjs.com/package/@langfuse/tracing) — Langfuse JS/TS SDK v5 observation API.
+- [`@langfuse/otel`](https://www.npmjs.com/package/@langfuse/otel) — Langfuse OpenTelemetry span processor.
+- [`@opentelemetry/sdk-node`](https://www.npmjs.com/package/@opentelemetry/sdk-node) — Node.js OpenTelemetry lifecycle.
+- [`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — Pi extension API.
+
+## 📄 License
 
 MIT

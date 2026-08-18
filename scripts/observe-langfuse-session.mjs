@@ -1,59 +1,41 @@
 #!/usr/bin/env node
 import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import crypto from 'node:crypto';
+import { AuthStorage, ModelRegistry } from '@mariozechner/pi-coding-agent';
+import { completeSimple } from '@mariozechner/pi-ai';
+import { OBSERVER_PROMPT_VERSION as PROMPT_VERSION, OBSERVER_SYSTEM_PROMPT } from '../memory/memory-prompts.js';
+import { validateMemoryOutput } from '../memory/memory-validation.js';
+import { auditObservationCoverage, auditPiProvenance, auditSemanticCoverage } from '../memory/memory-audit.js';
+import { buildPiTraceProvenance } from '../memory/memory-provenance.js';
+import { findPiSessionFile } from '../memory/memory-pi-entries.js';
+import { normalizeObservationV2, normalizeScoreV3, sessionObservationBounds, traceFromRootObservation } from '../memory/langfuse-v4-api.js';
+import { buildSemanticCoverage, detectExplicitCorrection, normalizeDurableItem, prepareMetadataReplacement, reduceDurableItems, sanitizeDurableItemSources, textSupportsClaim, validateDurableItemAuthority } from '../memory/memory-quality.js';
 
 const DEFAULT_SESSION_ID = '2026-07-17T05-14-22-976Z_019f6e7f-477f-711f-abfc-69e15e5624f7';
 const SCORE_NAME = 'memory_trace_observation';
-const VERSION = 'v1';
+const VERSION = 'v2';
 let OBSERVER_API = 'anthropic';
 let OBSERVER_ENABLED = true;
 let OBSERVER_MODEL = '';
 let OBSERVER_BASE_URL = '';
 let OBSERVER_API_KEY = '';
-const OBSERVER_PROMPT = `You are the memory consciousness of an AI coding assistant. Your observations may become the ONLY information the assistant has about this trace later.
-
-Extract dense trace-level observations from a coding-agent trace. Preserve what matters for continuing work after raw tool calls are removed.
-
-Use priority levels inside observationsMarkdown:
-- 🔴 High: explicit user request, unresolved goal, critical context, important decision
-- 🟡 Medium: project details, tool results, files inspected/changed, learned information
-- 🟢 Low: minor detail or uncertainty
-- ✅ Completed: concrete task/question/subtask resolved
-
-Guidelines adapted from Mastra Observational Memory:
-- Be specific enough for a future coding agent to act on.
-- Add 1-8 observations for the trace.
-- Use terse dense language.
-- Do not list every tool call. Group repeated reads/searches/commands by purpose and outcome.
-- If tools were called, observe what was called, why, and what was learned.
-- Preserve file paths and line numbers when available.
-- Capture user words closely when important.
-- Track completion explicitly with ✅ when a concrete outcome is done.
-- Capture state changes: if later evidence supersedes earlier info in the same trace, state the latest state.
-- Keep exact errors, commands, file paths, and tests when useful.
-
-Return ONLY valid JSON. No markdown fence. Shape:
-{
-  "observationsMarkdown": "Date: Jul 17, 2026\\n* 🔴 (14:30) ...\\n* 🟡 (14:31) ...\\n* ✅ ...",
-  "currentTask": "short current task/status after this trace",
-  "summary": "one short paragraph",
-  "filesTouched": ["path/or/file.ts"],
-  "toolsUsed": ["bash", "read", "edit"],
-  "decisions": ["decision/rationale"],
-  "completed": ["completed outcome"],
-  "openIssues": ["remaining issue/blocker"]
-}
-
-Do not include suggestedResponse.`;
-const LANGFUSE_CONFIG = process.env.LANGFUSE_CONFIG || join(homedir(), '.pi', 'agent', 'extensions', 'langfuse', 'config.json');
+let piSessionData;
+const AGENT_ROOT = process.env.PI_CODING_AGENT_DIR || resolve(homedir(), '.pi', 'agent');
+const LANGFUSE_CONFIG = process.env.LANGFUSE_CONFIG || join(AGENT_ROOT, 'extensions', 'langfuse', 'config.json');
 
 const args = parseArgs(process.argv.slice(2));
 const sessionId = normalizeSessionId(args.session || args._[0] || DEFAULT_SESSION_ID);
 const dryRun = Boolean(args['dry-run']);
 const force = Boolean(args.force);
+const backfill = Boolean(args.backfill);
+const includePreCoverage = Boolean(args['include-pre-coverage']);
+const auditMode = Boolean(args.audit) || backfill;
 const limit = args.limit ? Number(args.limit) : Infinity;
+const piProvider = String(args['pi-provider'] || '');
+const piModelId = String(args['pi-model'] || '');
+const piReasoning = String(args['pi-reasoning'] || 'low');
 
 if (!sessionId) fail('Missing session id');
 
@@ -63,19 +45,47 @@ OBSERVER_ENABLED = process.env.OBSERVER_ENABLED === 'false' || process.env.PI_LA
 OBSERVER_MODEL = process.env.OBSERVER_MODEL || process.env.PI_LANGFUSE_OBSERVER_MODEL || langfuse.observer?.model || '';
 OBSERVER_BASE_URL = process.env.OBSERVER_BASE_URL || process.env.PI_LANGFUSE_OBSERVER_BASE_URL || langfuse.observer?.baseUrl || (OBSERVER_API === 'openai' ? 'https://api.openai.com' : 'https://api.anthropic.com');
 OBSERVER_API_KEY = process.env.OBSERVER_API_KEY || process.env.PI_LANGFUSE_OBSERVER_API_KEY || langfuse.observer?.apiKey || (OBSERVER_API === 'openai' ? process.env.OPENAI_API_KEY : process.env.ANTHROPIC_API_KEY) || '';
-if (!OBSERVER_ENABLED) fail('Observer disabled. Set observer.enabled=true or remove observer.enabled=false.');
-if (!OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
-if (!OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
+let piModel;
+let piModelRegistry;
+if (piProvider || piModelId) {
+  if (!piProvider || !piModelId) fail('Pass both --pi-provider and --pi-model.');
+  piModelRegistry = ModelRegistry.create(AuthStorage.create());
+  piModel = piModelRegistry.find(piProvider, piModelId);
+  if (!piModel || !piModelRegistry.hasConfiguredAuth(piModel)) fail(`Pi model unavailable or unauthenticated: ${piProvider}/${piModelId}`);
+}
+if ((!auditMode || backfill) && !OBSERVER_ENABLED) fail('Observer disabled. Set observer.enabled=true or remove observer.enabled=false.');
+if ((!auditMode || backfill) && !piModel && !OBSERVER_MODEL) fail('Missing observer model. Set observer.model in config.json or OBSERVER_MODEL.');
+if ((!auditMode || backfill) && !piModel && !OBSERVER_API_KEY) fail('Missing observer API key. Set observer.apiKey in config.json or OBSERVER_API_KEY.');
 
 const langfuseAuth = `Basic ${Buffer.from(`${langfuse.publicKey}:${langfuse.secretKey}`).toString('base64')}`;
 
 console.log(`session=${sessionId}`);
-console.log(`observerApi=${OBSERVER_API}`);
-console.log(`model=${OBSERVER_MODEL}`);
-console.log(`dryRun=${dryRun} force=${force}`);
+console.log(`observerApi=${piModel?.api || OBSERVER_API}`);
+console.log(`model=${piModel?.provider || ''}/${piModel?.id || OBSERVER_MODEL}`);
+console.log(`dryRun=${dryRun} force=${force} audit=${auditMode} backfill=${backfill} includePreCoverage=${includePreCoverage}`);
 
-const traces = await fetchAllTraces(sessionId);
+let traces = await fetchAllTraces(sessionId);
+if (args.trace) traces = traces.filter(trace => trace.id === String(args.trace));
+const traceIds = new Set(traces.map(trace => trace.id));
+const observationScores = (await fetchScoresByName(SCORE_NAME, [...traceIds])).filter(score => traceIds.has(score.traceId || score.metadata?.traceId));
 console.log(`traces=${traces.length}`);
+
+if (auditMode) {
+  const currentObservationScores = observationScores.filter(score => score.metadata?.version === VERSION);
+  const audit = auditObservationCoverage(traces, observationScores, {
+    scoreName: SCORE_NAME,
+    version: VERSION,
+    expectedScoreId: traceId => deterministicUuid(`${SCORE_NAME}:${VERSION}:${traceId}:final:0`),
+  });
+  console.log(JSON.stringify({ sessionId, ...audit, piProvenance: auditPiProvenance(currentObservationScores), semantic: auditSemanticCoverage(currentObservationScores) }, null, 2));
+  if (!backfill) process.exit(0);
+  const missing = new Set([
+    ...audit.eligibleMissingTraceIds,
+    ...(includePreCoverage ? audit.preCoverageTraceIds : []),
+  ]);
+  if (!force) traces = traces.filter(trace => missing.has(trace.id));
+  console.log(`backfillEligible=${traces.length}`);
+}
 
 let processed = 0;
 let skipped = 0;
@@ -83,8 +93,8 @@ let failed = 0;
 
 for (const trace of traces.slice(0, limit)) {
   try {
-    const fullTrace = await lfGet(`/api/public/traces/${encodeURIComponent(trace.id)}`);
-    const existing = fullTrace.scores?.find(s => s.name === SCORE_NAME && s.metadata?.version === VERSION);
+    const fullTrace = trace;
+    const existing = observationScores.find(score => (score.traceId || score.metadata?.traceId) === trace.id && score.metadata?.version === VERSION);
     if (existing && !force) {
       skipped++;
       console.log(`skip existing ${trace.timestamp} ${trace.id}`);
@@ -93,11 +103,14 @@ for (const trace of traces.slice(0, limit)) {
 
     const observations = await fetchAllObservations(trace.id);
     const sourceObservations = observations.filter(o => !String(o.name || '').startsWith('memory:'));
-    const timeline = buildTimeline(fullTrace, sourceObservations);
+    const piProvenance = mapTracePiProvenance(fullTrace);
+    if (backfill && !piProvenance?.complete) throw new Error('cannot deterministically map trace to complete Pi provenance');
+    const timeline = buildTimeline(fullTrace, sourceObservations, piProvenance);
     const memory = await observeTrace(fullTrace, sourceObservations, timeline);
-    const metadata = buildScoreMetadata(fullTrace, sourceObservations, memory, timeline);
     const comment = firstLine(memory.summary || stripXml(memory.observationsMarkdown) || 'Trace observed');
-    const scoreId = deterministicUuid(`${SCORE_NAME}:${VERSION}:${trace.id}`);
+    const scoreId = deterministicUuid(`${SCORE_NAME}:${VERSION}:${trace.id}:final:0`);
+    let metadata = buildScoreMetadata(fullTrace, sourceObservations, memory, timeline, piProvenance, scoreId);
+    if (existing?.metadata) metadata = prepareMetadataReplacement(metadata, existing.metadata);
 
     if (dryRun) {
       console.log(`dry ${trace.timestamp} ${trace.id}`);
@@ -126,7 +139,7 @@ function parseArgs(argv) {
       out[k] = v.join('=');
     } else {
       const k = a.slice(2);
-      if (['dry-run', 'force'].includes(k)) out[k] = true;
+      if (['dry-run', 'force', 'audit', 'backfill', 'include-pre-coverage'].includes(k)) out[k] = true;
       else out[k] = argv[++i];
     }
   }
@@ -152,24 +165,67 @@ function observerEndpoint() {
 }
 
 async function fetchAllTraces(sessionId) {
-  const all = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ sessionId, page: String(page), limit: '100', orderBy: 'timestamp.asc', fields: 'core,io,scores,metrics' });
-    const res = await lfGet(`/api/public/traces?${params}`);
-    all.push(...(res.data || []));
-    if (!res.meta || page >= res.meta.totalPages) break;
+  const roots = [];
+  let cursor = '';
+  const bounds = sessionObservationBounds(sessionId);
+  do {
+    const params = new URLSearchParams({
+      ...bounds,
+      limit: '1000',
+      fields: 'core,basic,time,io,metadata,metrics,trace_context',
+      filter: JSON.stringify([
+        { type: 'string', column: 'sessionId', operator: '=', value: sessionId },
+        { type: 'boolean', column: 'isRootObservation', operator: '=', value: true },
+      ]),
+    });
+    if (cursor) params.set('cursor', cursor);
+    const response = await lfGet(`/api/public/v2/observations?${params}`);
+    roots.push(...(response.data || []).map(normalizeObservationV2));
+    cursor = response.meta?.cursor || '';
+  } while (cursor);
+  return roots.map(traceFromRootObservation)
+    .filter(trace => trace.name !== 'memory:session-state')
+    .sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+}
+
+async function fetchScoresByName(name, traceIds) {
+  if (!traceIds.length) return [];
+  const scores = [];
+  for (let offset = 0; offset < traceIds.length; offset += 50) {
+    let cursor = '';
+    do {
+      const params = new URLSearchParams({
+        name,
+        dataType: 'CATEGORICAL',
+        traceId: traceIds.slice(offset, offset + 50).join(','),
+        limit: '100',
+        fields: 'details,subject',
+      });
+      if (cursor) params.set('cursor', cursor);
+      const response = await lfGet(`/api/public/v3/scores?${params}`);
+      scores.push(...(response.data || []).map(normalizeScoreV3));
+      cursor = response.meta?.cursor || '';
+    } while (cursor);
   }
-  return all.filter(t => t.name !== 'memory:session-state');
+  return scores;
 }
 
 async function fetchAllObservations(traceId) {
   const all = [];
-  for (let page = 1; ; page++) {
-    const params = new URLSearchParams({ traceId, page: String(page), limit: '100' });
-    const res = await lfGet(`/api/public/observations?${params}`);
-    all.push(...(res.data || []));
-    if (!res.meta || page >= res.meta.totalPages) break;
-  }
+  const bounds = sessionObservationBounds(sessionId);
+  let cursor;
+  do {
+    const params = new URLSearchParams({
+      traceId,
+      ...bounds,
+      limit: '1000',
+      fields: 'core,basic,time,io,metadata,model,usage',
+    });
+    if (cursor) params.set('cursor', cursor);
+    const res = await lfGet(`/api/public/v2/observations?${params}`);
+    all.push(...(res.data || []).map(normalizeObservationV2));
+    cursor = res.meta?.cursor;
+  } while (cursor);
   return all.sort((a, b) => String(a.startTime || '').localeCompare(String(b.startTime || '')));
 }
 
@@ -195,36 +251,94 @@ async function writeScore({ traceId, scoreId, comment, metadata }) {
   }, 'Langfuse score write');
 }
 
-function buildTimeline(trace, observations) {
+function buildTimeline(trace, observations, piProvenance) {
   const lines = [];
   lines.push(`Trace ${trace.id}`);
   lines.push(`Session: ${trace.sessionId || ''}`);
   lines.push(`Time: ${trace.timestamp || ''}`);
   lines.push(`CWD: ${trace.metadata?.cwd || ''}`);
   lines.push(`Model: ${trace.metadata?.provider || ''}/${trace.metadata?.model || ''}`);
-  lines.push(`User: ${stringifyValue(trace.input, 2000)}`);
-  if (trace.output) lines.push(`Final assistant output: ${stringifyValue(trace.output, 2000)}`);
+  lines.push(`Pi user entry IDs: ${(piProvenance?.userEntryIds || []).join(', ')}`);
+  lines.push(`Pi assistant entry IDs: ${(piProvenance?.assistantEntryIds || []).join(', ')}`);
+  lines.push(`Pi tool-result entry IDs: ${(piProvenance?.toolResultEntryIds || []).join(', ')}`);
+  lines.push(`User: ${stringifyValue(trace.input, 8000)}`);
+  if (trace.output) lines.push(`Final assistant output: ${stringifyValue(trace.output, 8000)}`);
   lines.push('');
   lines.push('Steps:');
   for (const o of observations) {
     const time = o.startTime ? new Date(o.startTime).toISOString() : '';
     const label = `${o.type || ''} ${o.name || ''}`.trim();
     lines.push(`- ${time} ${label}`);
-    if (o.input != null) lines.push(`  input: ${stringifyValue(o.input, 1200).replace(/\n/g, '\n  ')}`);
-    if (o.output != null) lines.push(`  output: ${stringifyValue(o.output, 1600).replace(/\n/g, '\n  ')}`);
+    if (o.input != null) lines.push(`  input: ${stringifyValue(o.input, 8000).replace(/\n/g, '\n  ')}`);
+    if (o.output != null) lines.push(`  output: ${stringifyValue(o.output, 40000).replace(/\n/g, '\n  ')}`);
     if (o.metadata && Object.keys(o.metadata).length) lines.push(`  metadata: ${stringifyValue(o.metadata, 600)}`);
   }
   return lines.join('\n');
 }
 
 async function observeTrace(trace, observations, timeline) {
-  const system = OBSERVER_PROMPT;
-  const user = `## New Message History to Observe\n\n${timeline}\n\n---\n\nExtract trace-level memory observations. Do not include <suggested-response>. Output only valid JSON with keys: observationsMarkdown, currentTask, summary, filesTouched, toolsUsed, decisions, completed, openIssues.`;
-  const text = await observerComplete(system, user);
-  return parseObserverJson(text);
+  const system = OBSERVER_SYSTEM_PROMPT;
+  const user = `<trace-data>\n${timeline}\n</trace-data>\n\nExtract trace-level memory and return ONLY valid JSON with this shape:
+{
+  "observationsMarkdown": "Date: <date from trace>\\n* 🔴 (<time>) ...",
+  "summary": "one short paragraph",
+  "goal": ["user goal"],
+  "constraints": ["requirement or preference"],
+  "currentTask": "current task/status after this trace",
+  "taskStatus": "active | waiting_for_user | blocked | complete",
+  "completed": ["verified completed outcome"],
+  "inProgress": ["unfinished work"],
+  "openIssues": ["remaining issue or blocker"],
+  "decisions": ["decision and rationale"],
+  "nextSteps": ["next action"],
+  "criticalContext": ["detail required to continue"],
+  "filesRead": ["path inspected"],
+  "filesModified": ["path changed"],
+  "filesCreated": ["path created"],
+  "filesDeleted": ["path deleted"],
+  "toolsUsed": ["tool name"],
+  "userRequests": [{"entryId":"exact Pi user entry ID","exactText":"exact user text","normalizedIntent":"short intent","status":"answered | pending | corrected | superseded"}],
+  "questionsAnswered": [{"questionEntryId":"Pi user entry ID","question":"exact question","answerEntryId":"Pi assistant entry ID","answer":"concise answer"}],
+  "corrections": [{"topic":"stable topic","oldUnderstanding":"old state","newUnderstanding":"new user state","sourceEntryId":"Pi user entry ID"}],
+  "taskDelta": {"before":"state before","actions":["action"],"verifiedResults":["result"],"after":"state after"},
+  "commitments": [{"content":"commitment","sourceEntryIds":["Pi entry ID"]}],
+  "durableItems": [{"kind":"request | decision | constraint | fact | task | question | commitment","topic":"stable topic","content":"canonical state","status":"active | completed | superseded | revoked | proposed","authority":"user | verified-result | assistant-proposal","sourceEntryIds":["Pi entry ID"]}],
+  "evidence": [{"itemId":"item ID","sourceEntryIds":["Pi entry ID"]}]
+}`;
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const text = await observerComplete(system, user);
+    try {
+      if (detectDegenerateRepetition(text)) throw new Error('Observer output contains degenerate repetition');
+      return parseObserverJson(text);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 2) console.warn('invalid observer output; retrying once');
+    }
+  }
+  throw lastError;
 }
 
 async function observerComplete(system, user) {
+  if (piModel) {
+    const auth = await piModelRegistry.getApiKeyAndHeaders(piModel);
+    if (!auth.ok) throw new Error(auth.error);
+    const message = await completeSimple(piModel, {
+      systemPrompt: system,
+      messages: [{ role: 'user', content: user, timestamp: Date.now() }],
+    }, {
+      apiKey: auth.apiKey,
+      headers: auth.headers,
+      maxTokens: 6000,
+      reasoning: piReasoning,
+      timeoutMs: 120000,
+      maxRetries: 1,
+    });
+    if (message.stopReason === 'error' || message.stopReason === 'aborted') throw new Error(message.errorMessage || message.stopReason);
+    const text = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n').trim();
+    if (!text) throw new Error('Pi observer model returned no text');
+    return text;
+  }
   const headers = {
     Authorization: `Bearer ${OBSERVER_API_KEY}`,
     'Content-Type': 'application/json',
@@ -265,18 +379,49 @@ async function observerComplete(system, user) {
 
 function parseObserverJson(text) {
   const jsonText = extractJson(text);
-  const parsed = JSON.parse(jsonText);
+  const parsed = normalizeObserverStringArrays(JSON.parse(jsonText));
+  const validationError = validateMemoryOutput(parsed, 'observer');
+  if (validationError) throw new Error(`Invalid observer schema: ${validationError}`);
   return {
-    observationsMarkdown: String(parsed.observationsMarkdown || '').trim(),
+    observationsMarkdown: String(parsed.observationsMarkdown).trim(),
+    summary: String(parsed.summary).trim(),
+    goal: arrayOfStrings(parsed.goal),
+    constraints: arrayOfStrings(parsed.constraints),
     currentTask: String(parsed.currentTask || '').trim(),
-    summary: String(parsed.summary || '').trim(),
-    filesTouched: arrayOfStrings(parsed.filesTouched),
-    toolsUsed: arrayOfStrings(parsed.toolsUsed),
-    decisions: arrayOfStrings(parsed.decisions),
+    taskStatus: normalizeTaskStatus(parsed.taskStatus),
     completed: arrayOfStrings(parsed.completed),
+    inProgress: arrayOfStrings(parsed.inProgress),
     openIssues: arrayOfStrings(parsed.openIssues),
+    decisions: arrayOfStrings(parsed.decisions),
+    nextSteps: arrayOfStrings(parsed.nextSteps),
+    criticalContext: arrayOfStrings(parsed.criticalContext),
+    filesRead: arrayOfStrings(parsed.filesRead),
+    filesModified: arrayOfStrings(parsed.filesModified),
+    filesCreated: arrayOfStrings(parsed.filesCreated),
+    filesDeleted: arrayOfStrings(parsed.filesDeleted),
+    toolsUsed: arrayOfStrings(parsed.toolsUsed),
+    userRequests: parsed.userRequests,
+    questionsAnswered: parsed.questionsAnswered,
+    corrections: parsed.corrections,
+    taskDelta: parsed.taskDelta,
+    commitments: parsed.commitments,
+    durableItems: parsed.durableItems,
+    evidence: parsed.evidence,
     rawModelOutput: text,
   };
+}
+
+function normalizeObserverStringArrays(parsed) {
+  const fields = ['goal', 'constraints', 'completed', 'inProgress', 'openIssues', 'decisions', 'nextSteps', 'criticalContext', 'filesRead', 'filesModified', 'filesCreated', 'filesDeleted', 'toolsUsed'];
+  for (const field of fields) {
+    if (!Array.isArray(parsed?.[field])) continue;
+    parsed[field] = parsed[field].map(item => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return '';
+      return String(item.content || item.text || item.decision || item.description || item.path || item.name || item.value || '').trim();
+    }).filter(Boolean);
+  }
+  return parsed;
 }
 
 function extractJson(text) {
@@ -288,21 +433,32 @@ function extractJson(text) {
   return text.slice(start, end + 1);
 }
 
-async function fetchTextWithRetry(url, options, label, attempts = 5) {
+async function fetchTextWithRetry(url, options, label, attempts = 8) {
   let lastText = '';
+  let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const res = await fetch(url, options);
+    let res;
+    try {
+      res = await fetch(url, options);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await sleep(Math.min(2 ** (attempt - 1), 60) * 1000);
+        continue;
+      }
+      break;
+    }
     const text = await res.text();
     lastText = text;
     if (res.ok) return text;
-    if ((res.status === 429 || res.status >= 500) && attempt < attempts) {
-      const retryAfter = Number(res.headers.get('retry-after')) || parseRetryAfter(text) || attempt * 2;
-      await sleep(Math.min(retryAfter, 30) * 1000);
+    if ((res.status === 408 || res.status === 429 || res.status >= 500) && attempt < attempts) {
+      const retryAfter = Number(res.headers.get('retry-after')) || parseRetryAfter(text) || Math.min(2 ** (attempt - 1), 60);
+      await sleep(Math.min(retryAfter, 120) * 1000);
       continue;
     }
     throw new Error(`${label} ${res.status}: ${text.slice(0, 1000)}`);
   }
-  throw new Error(`${label} failed: ${lastText.slice(0, 1000)}`);
+  throw new Error(`${label} failed after ${attempts} attempts: ${lastText.slice(0, 1000)}`, { cause: lastError });
 }
 
 function parseRetryAfter(text) {
@@ -313,13 +469,111 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function buildScoreMetadata(trace, observations, memory, timeline) {
+function mapTracePiProvenance(trace) {
+  if (!piSessionData) piSessionData = loadPiSessionData();
+  if (!piSessionData) return undefined;
+  const traceInput = textValue(trace.input);
+  const traceOutput = textValue(trace.output);
+  const traceTime = Date.parse(trace.timestamp || '');
+  const ranges = new Map();
+
+  for (const branch of piSessionData.branches) {
+    for (let i = 0; i < branch.length; i++) {
+      const entry = branch[i];
+      if (entry.type !== 'message' || entry.message?.role !== 'user' || textValue(entry.message.content) !== traceInput) continue;
+      const entryTime = Date.parse(entry.timestamp || '');
+      if (Number.isFinite(traceTime) && Number.isFinite(entryTime) && Math.abs(traceTime - entryTime) > 10_000) continue;
+      let end = i + 1;
+      if (traceOutput) {
+        while (end < branch.length) {
+          const candidate = branch[end];
+          end++;
+          if (candidate.type === 'message' && candidate.message?.role === 'assistant' && textValue(candidate.message.content) === traceOutput) break;
+        }
+        const finalAssistant = branch[end - 1];
+        if (finalAssistant?.type !== 'message' || finalAssistant.message?.role !== 'assistant' || textValue(finalAssistant.message.content) !== traceOutput) continue;
+      } else {
+        while (end < branch.length && !(branch[end].type === 'message' && branch[end].message?.role === 'user')) end++;
+      }
+      const range = branch.slice(i, end);
+      ranges.set(range.map(item => item.id).join(':'), range);
+    }
+  }
+
+  if (ranges.size !== 1) return undefined;
+  const range = [...ranges.values()][0];
+  const result = buildPiTraceProvenance(range, range[0]?.id, piSessionData.piSessionId);
+  return result.errors.length === 0 ? result.provenance : undefined;
+}
+
+function loadPiSessionData() {
+  const sessionFile = findPiSessionFile(join(AGENT_ROOT, 'sessions'), sessionId);
+  if (!sessionFile) return undefined;
+  const lines = readFileSync(sessionFile, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const header = lines.find(entry => entry.type === 'session');
+  const entries = lines.filter(entry => entry.type !== 'session' && entry.id);
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const parentIds = new Set(entries.map(entry => entry.parentId).filter(Boolean));
+  const leaves = entries.filter(entry => !parentIds.has(entry.id));
+  const branches = leaves.map(leaf => {
+    const branch = [];
+    for (let entry = leaf; entry; entry = entry.parentId ? byId.get(entry.parentId) : undefined) branch.unshift(entry);
+    return branch;
+  });
+  return { piSessionId: header?.id || null, branches };
+}
+
+function textValue(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) return value.filter(part => part?.type === 'text' && part.text).map(part => part.text).join('\n').trim();
+  return '';
+}
+
+function buildScoreMetadata(trace, observations, memory, timeline, piProvenance, scoreId) {
+  const derivedFiles = deriveFileOperations(observations);
+  const filesRead = unique([...derivedFiles.filesRead, ...memory.filesRead]);
+  const filesModified = unique([...derivedFiles.filesModified, ...memory.filesModified]);
+  const generatedAt = new Date().toISOString();
+  const exactText = textValue(trace.input);
+  const userEntryId = piProvenance?.userEntryId || '';
+  const userRequests = userEntryId ? [{ entryId: userEntryId, exactText, normalizedIntent: memory.userRequests.find(item => item.entryId === userEntryId)?.normalizedIntent || exactText, status: trace.metadata?.completed === false ? 'pending' : 'answered' }] : [];
+  const answerEntryId = piProvenance?.assistantEntryIds?.at(-1) || '';
+  const questionsAnswered = answerEntryId && trace.output && /\?|^(?:what|why|how|when|where|who|which|can|could|would|should|is|are|do|does|did)\b/i.test(exactText)
+    ? [{ questionEntryId: userEntryId, question: exactText, answerEntryId, answer: clamp(textValue(trace.output), 8000) }]
+    : [];
+  const extractedCorrection = memory.corrections.find(item => item.sourceEntryId === userEntryId && textSupportsClaim(exactText, item.newUnderstanding));
+  const relatedItem = memory.durableItems.find(item => item?.authority === 'user'
+    && Array.isArray(item.sourceEntryIds) && item.sourceEntryIds.includes(userEntryId)
+    && textSupportsClaim(exactText, item.content));
+  const corrections = userEntryId && detectExplicitCorrection(exactText) ? [{
+    topic: String(extractedCorrection?.topic || relatedItem?.topic || (/refresh/i.test(exactText) ? 'refresh-work' : exactText.slice(0, 120))),
+    oldUnderstanding: String(extractedCorrection?.oldUnderstanding || ''),
+    newUnderstanding: exactText,
+    authority: 'user', sourceEntryId: userEntryId,
+  }] : [];
+  const modelItems = memory.durableItems
+    .map(item => normalizeDurableItem(item, { sourceScoreIds: [scoreId], updatedAt: generatedAt }))
+    .map(item => sanitizeDurableItemSources(item, piProvenance))
+    .filter(item => item && validateDurableItemAuthority(item, piProvenance)
+      && (item.authority !== 'user' || (item.sourceEntryIds.includes(userEntryId) && textSupportsClaim(exactText, item.content))));
+  const requestItems = userRequests.map(request => normalizeDurableItem({
+    id: `request-${request.entryId}`, kind: 'request', topic: request.normalizedIntent.slice(0, 160), content: request.exactText,
+    status: request.status === 'pending' ? 'active' : 'completed', authority: 'user', sourceEntryIds: [request.entryId],
+  }, { sourceScoreIds: [scoreId], updatedAt: generatedAt })).filter(Boolean);
+  const correctionItems = corrections.map(correction => normalizeDurableItem({
+    kind: 'decision', topic: correction.topic, content: correction.newUnderstanding, status: 'active', authority: 'user', sourceEntryIds: [correction.sourceEntryId],
+  }, { sourceScoreIds: [scoreId], updatedAt: generatedAt })).filter(Boolean);
+  const durableItems = reduceDurableItems([], [...modelItems, ...requestItems, ...correctionItems]).items;
+  const semantic = buildSemanticCoverage({ userRequests, questionsAnswered, corrections, provenance: piProvenance, valid: trace.metadata?.completed !== false });
   return trimMetadata({
     version: VERSION,
+    promptVersion: PROMPT_VERSION,
     scope: 'trace',
     source: 'pi-langfuse-memory',
-    observerApi: OBSERVER_API,
-    observerModel: OBSERVER_MODEL,
+    observerApi: piModel?.api || OBSERVER_API,
+    observerModel: piModel?.id || OBSERVER_MODEL,
+    observerFallback: Boolean(piModel),
+    primaryObserverModel: piModel ? OBSERVER_MODEL : null,
     traceId: trace.id,
     sessionId: trace.sessionId || null,
     traceTimestamp: trace.timestamp || null,
@@ -328,18 +582,68 @@ function buildScoreMetadata(trace, observations, memory, timeline) {
     model: trace.metadata?.model || null,
     provider: trace.metadata?.provider || null,
     observationsMarkdown: memory.observationsMarkdown,
-    currentTask: memory.currentTask,
+    episodeSummary: memory.summary,
     summary: memory.summary,
-    filesTouched: memory.filesTouched,
-    toolsUsed: memory.toolsUsed.length ? memory.toolsUsed : unique(observations.map(o => o.metadata?.tool || (String(o.name || '').startsWith('tool:') ? String(o.name).slice(5) : '')).filter(Boolean)),
-    decisions: memory.decisions,
+    goal: memory.goal,
+    constraints: memory.constraints,
+    currentTask: memory.currentTask,
+    taskStatus: memory.taskStatus,
     completed: memory.completed,
+    inProgress: memory.inProgress,
     openIssues: memory.openIssues,
+    decisions: memory.decisions,
+    nextSteps: memory.nextSteps,
+    criticalContext: memory.criticalContext,
+    filesRead,
+    filesModified,
+    filesCreated: memory.filesCreated,
+    filesDeleted: memory.filesDeleted,
+    filesTouched: unique([...filesRead, ...filesModified, ...memory.filesCreated, ...memory.filesDeleted]),
+    toolsUsed: memory.toolsUsed.length ? memory.toolsUsed : unique(observations.map(o => o.metadata?.tool || (String(o.name || '').startsWith('tool:') ? String(o.name).slice(5) : '')).filter(Boolean)),
+    userRequests,
+    questionsAnswered,
+    corrections,
+    taskDelta: memory.taskDelta,
+    commitments: memory.commitments,
+    durableItems,
+    evidence: memory.evidence,
+    memoryStatus: 'ready',
+    ...semantic,
+    segmentKind: 'final',
+    segmentIndex: 0,
     sourceObservationIds: observations.map(o => o.id).filter(Boolean),
     sourceObservationCount: observations.length,
     timelinePreview: clamp(timeline, 6000),
-    generatedAt: new Date().toISOString(),
+    generatedAt,
+    piProvenanceVersion: piProvenance?.version || null,
+    piProvenanceStatus: piProvenance?.complete ? 'complete' : 'incomplete',
+    piSessionId: piProvenance?.piSessionId || null,
+    piUserEntryId: piProvenance?.userEntryId || null,
+    piFirstEntryId: piProvenance?.firstEntryId || null,
+    piLastEntryId: piProvenance?.lastEntryId || null,
+    piEntryIds: piProvenance?.entryIds || [],
+    piMessageEntryIds: piProvenance?.messageEntryIds || [],
+    piToolPairs: piProvenance?.toolPairs || [],
+    piUnexecutedToolCallIds: piProvenance?.unexecutedToolCallIds || [],
+    piProvenance,
   });
+}
+
+function deriveFileOperations(observations) {
+  const filesRead = [];
+  const filesModified = [];
+  for (const observation of observations) {
+    const tool = observation.metadata?.tool || String(observation.name || '').replace(/^tool:/, '');
+    let input = observation.input;
+    if (typeof input === 'string') {
+      try { input = JSON.parse(input); } catch {}
+    }
+    const path = input && typeof input === 'object' ? input.path : undefined;
+    if (typeof path !== 'string' || !path) continue;
+    if (tool === 'read') filesRead.push(path);
+    if (tool === 'edit' || tool === 'write') filesModified.push(path);
+  }
+  return { filesRead: unique(filesRead), filesModified: unique(filesModified) };
 }
 
 function trimMetadata(metadata) {
@@ -371,6 +675,27 @@ function stripXml(s) {
 
 function firstLine(s) {
   return String(s || '').split('\n').map(x => x.trim()).find(Boolean) || 'Trace observed';
+}
+
+function normalizeTaskStatus(value) {
+  return ['active', 'waiting_for_user', 'blocked', 'complete'].includes(String(value)) ? String(value) : 'active';
+}
+
+function detectDegenerateRepetition(text) {
+  if (text.length < 2000) return false;
+  const windows = new Map();
+  const size = 200;
+  const step = Math.max(1, Math.floor(text.length / 50));
+  let duplicates = 0;
+  let total = 0;
+  for (let i = 0; i + size <= text.length; i += step) {
+    const window = text.slice(i, i + size);
+    const count = (windows.get(window) || 0) + 1;
+    windows.set(window, count);
+    if (count > 1) duplicates++;
+    total++;
+  }
+  return (total > 5 && duplicates / total > 0.4) || text.split('\n').some(line => line.length > 50_000);
 }
 
 function arrayOfStrings(v) {
